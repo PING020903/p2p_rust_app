@@ -1,0 +1,22 @@
+# Cargo 配置文件
+
+# 构建目标配置
+[build]
+# 默认 target（如果不设置，则使用宿主平台）
+# target = "x86_64-pc-windows-msvc"
+
+# WASM 特定配置
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--export-table"]
+
+# Windows MSVC 配置
+[target.x86_64-pc-windows-msvc]
+# 可以在这里添加 Windows 特定的编译选项
+
+# 其他有用的配置
+[net]
+# 网络配置（如果需要）
+
+[term]
+# 终端输出配置
+verbose = false

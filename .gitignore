@@ -1,0 +1,18 @@
+# 默认忽略一切，仅白名单放行需要上传的内容
+/*
+
+# 白名单
+!/.gitignore
+!/README.md
+!/LICENSE
+!/Cargo.toml
+!/Cargo.lock
+!/.cargo/
+!/source/
+!/tests/
+!/.opencode/
+!/wish/
+
+# .opencode 下仅保留 skills
+/.opencode/*
+!/.opencode/skills/
