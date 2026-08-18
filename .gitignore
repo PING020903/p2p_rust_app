@@ -11,6 +11,8 @@
 !/.cargo/
 !/source/
 !/tests/
+# 真实测试凭据不入库：从 tests/users.template.txt 复制创建
+/tests/users.txt
 !/.opencode/
 !/wish/
 

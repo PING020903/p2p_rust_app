@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -7,6 +8,47 @@ use std::time::{Duration, Instant};
 const CYCLES_GRACEFUL: usize = 15;
 const CYCLES_KILL: usize = 5;
 const WAIT: Duration = Duration::from_secs(20);
+
+struct Creds {
+    name: String,
+    birthday: String,
+    gender: String,
+    password: String,
+}
+
+/// 从 tests/users.txt 读取 user1/user2 的凭据。
+/// 文件格式：`userN-name / userN-age / userN-sex / userN-password` 键值行，
+/// age 值允许带 "(YYYY-MM-DD)" 格式提示，解析时剥离。
+fn load_creds() -> (Creds, Creds) {
+    let path = format!("{}/tests/users.txt", env!("CARGO_MANIFEST_DIR"));
+    let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!("读取 {path} 失败: {e}（请复制 tests/users.template.txt 为 tests/users.txt 并填写）")
+    });
+    let mut fields: HashMap<String, String> = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            fields.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    let take = |user: &str, field: &str| -> String {
+        fields
+            .get(&format!("{user}-{field}"))
+            .unwrap_or_else(|| panic!("users.txt 缺少 {user}-{field}"))
+            .clone()
+    };
+    let strip_hint = |v: String| v.split('(').next().unwrap_or("").trim().to_string();
+    let cred = |user: &str| Creds {
+        name: take(user, "name"),
+        birthday: strip_hint(take(user, "age")),
+        gender: take(user, "sex"),
+        password: take(user, "password"),
+    };
+    (cred("user1"), cred("user2"))
+}
 
 struct Node {
     child: Child,
@@ -104,42 +146,57 @@ fn random_msg(seed: u64) -> String {
         .collect()
 }
 
-/// 启动节点并进入聊天，返回 127.0.0.1 监听地址行（含 /p2p/ 节点ID）
-fn spawn_into_chat(bin: &str) -> (Node, String) {
+/// 按登录流程依次喂四项信息（测试环境 stdin 为管道，密码走行读取）
+fn login(node: &mut Node, creds: &Creds) {
+    node.send(&creds.name);
+    node.send(&creds.birthday);
+    node.send(&creds.gender);
+    node.send(&creds.password);
+    node.wait_for(
+        &format!("登录成功: {}", creds.name),
+        Duration::from_secs(30),
+    );
+}
+
+/// 启动节点并登录进入聊天，返回 127.0.0.1 监听地址行（含 /p2p/ 节点ID）
+fn spawn_into_chat(bin: &str, creds: &Creds) -> (Node, String) {
     let mut node = Node::spawn(bin);
     node.wait_for("=== 主菜单 ===", Duration::from_secs(10));
-    let listen = enter_chat(&mut node);
+    node.send("4");
+    login(&mut node, creds);
+    let listen = node.wait_for("监听地址: /ip4/127.0.0.1", Duration::from_secs(20));
     (node, listen)
 }
 
-/// 在已有节点上进入（或重新进入）聊天
-fn enter_chat(node: &mut Node) -> String {
+/// 在已有节点上重新进入聊天（重新登录）
+fn enter_chat(node: &mut Node, creds: &Creds) -> String {
     node.send("4");
+    login(node, creds);
     node.wait_for("监听地址: /ip4/127.0.0.1", Duration::from_secs(20))
 }
 
-/// 场景1：基础聊天——连接、Hello、双向收发、12 秒静默保活、Bye 优雅退出
+/// 场景1：基础聊天——登录、连接、带名字的 Hello、双向收发、12 秒静默保活、Bye 优雅退出
 fn basic_chat_scenario() {
     let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let (cred_a, cred_b) = load_creds();
     println!("=== 场景1: 基础聊天 ===");
 
     println!("=== 启动节点 A ===");
-    let (mut a, a_listen) = spawn_into_chat(bin);
+    let (mut a, a_listen) = spawn_into_chat(bin, &cred_a);
     let a_addr = listen_addr(&a_listen);
     let a_id = parse_peer_id(&a_listen);
-    println!("=== 节点 A 地址: {a_addr} ===");
 
     println!("=== 启动节点 B ===");
-    let (mut b, b_listen) = spawn_into_chat(bin);
+    let (mut b, b_listen) = spawn_into_chat(bin, &cred_b);
     let b_id = parse_peer_id(&b_listen);
     b.send(&format!("/dial {a_addr}"));
 
     a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
     b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
 
-    println!("=== 上线通知（Hello）===");
-    a.wait_for("对方已上线", WAIT);
-    b.wait_for("对方已上线", WAIT);
+    println!("=== 上线通知（Hello 携带角色名）===");
+    a.wait_for(&format!("对方已上线: {}", cred_b.name), WAIT);
+    b.wait_for(&format!("对方已上线: {}", cred_a.name), WAIT);
 
     println!("=== B -> A 发消息 ===");
     b.send("你好，我是节点B");
@@ -162,12 +219,50 @@ fn basic_chat_scenario() {
     b.kill();
 }
 
-/// 场景2：B 主动下线/上线循环，每轮发送 ≤64 字节随机消息
+/// 场景2：B 退出后重新登录（同一凭据身份不变），A 按角色名呼叫
+fn chat_by_name_scenario() {
+    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let (cred_a, cred_b) = load_creds();
+    println!("=== 场景2: 按角色名呼叫 ===");
+
+    let (mut a, a_listen) = spawn_into_chat(bin, &cred_a);
+    let a_addr = listen_addr(&a_listen);
+    let a_id = parse_peer_id(&a_listen);
+
+    let (mut b, b_listen) = spawn_into_chat(bin, &cred_b);
+    let b_id = parse_peer_id(&b_listen);
+    b.send(&format!("/dial {a_addr}"));
+    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+    a.wait_for(&format!("对方已上线: {}", cred_b.name), WAIT);
+
+    println!("=== B 优雅退出后重新登录（同一凭据，身份不变）===");
+    b.send("/q");
+    a.wait_for("对方已正常退出", WAIT);
+    enter_chat(&mut b, &cred_b);
+
+    println!("=== 等待 mDNS 重新发现 B 的新地址 ===");
+    thread::sleep(Duration::from_secs(8));
+
+    println!("=== A 按角色名呼叫 B ===");
+    a.send(&format!("/chat {}", cred_b.name));
+    a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
+    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+    b.wait_for(&format!("对方已上线: {}", cred_a.name), WAIT);
+
+    a.send("按名呼叫后的消息");
+    b.wait_for("[对方] 按名呼叫后的消息", WAIT);
+
+    a.kill();
+    b.kill();
+}
+
+/// 场景3：B 主动下线/上线循环，每轮发送 ≤64 字节随机消息
 fn graceful_offline_online_scenario() {
     let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
-    println!("=== 场景2: 主动上下线循环 x{CYCLES_GRACEFUL} ===");
+    let (cred_a, cred_b) = load_creds();
+    println!("=== 场景3: 主动上下线循环 x{CYCLES_GRACEFUL} ===");
 
-    let (mut a, a_listen) = spawn_into_chat(bin);
+    let (mut a, a_listen) = spawn_into_chat(bin, &cred_a);
     let a_addr = listen_addr(&a_listen);
     let a_id = parse_peer_id(&a_listen);
 
@@ -176,7 +271,7 @@ fn graceful_offline_online_scenario() {
 
     for i in 0..CYCLES_GRACEFUL {
         println!("=== 第 {} 轮: 主动上线 ===", i + 1);
-        let b_listen = enter_chat(&mut b);
+        let b_listen = enter_chat(&mut b, &cred_b);
         let b_id = parse_peer_id(&b_listen);
         b.send(&format!("/dial {a_addr}"));
         b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
@@ -197,12 +292,13 @@ fn graceful_offline_online_scenario() {
     b.kill();
 }
 
-/// 场景3：kill 进程模拟掉线（无 Bye），隔一段时间后重新上线
+/// 场景4：kill 进程模拟掉线（无 Bye），隔一段时间后重新上线
 fn kill_offline_online_scenario() {
     let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
-    println!("=== 场景3: kill 掉线循环 x{CYCLES_KILL} ===");
+    let (cred_a, cred_b) = load_creds();
+    println!("=== 场景4: kill 掉线循环 x{CYCLES_KILL} ===");
 
-    let (mut a, a_listen) = spawn_into_chat(bin);
+    let (mut a, a_listen) = spawn_into_chat(bin, &cred_a);
     let a_addr = listen_addr(&a_listen);
     let a_id = parse_peer_id(&a_listen);
 
@@ -211,7 +307,7 @@ fn kill_offline_online_scenario() {
 
     for i in 0..CYCLES_KILL {
         println!("=== 第 {} 轮: 上线 ===", i + 1);
-        let b_listen = enter_chat(&mut b);
+        let b_listen = enter_chat(&mut b, &cred_b);
         let b_id = parse_peer_id(&b_listen);
         b.send(&format!("/dial {a_addr}"));
         b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
@@ -240,8 +336,9 @@ fn kill_offline_online_scenario() {
 
 #[test]
 fn p2p_chat_e2e_suite() {
-    // 三场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
+    // 四场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
     basic_chat_scenario();
+    chat_by_name_scenario();
     graceful_offline_online_scenario();
     kill_offline_online_scenario();
 }

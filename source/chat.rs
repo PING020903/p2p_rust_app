@@ -1,14 +1,16 @@
 use colored::Colorize;
 use futures::StreamExt;
 use libp2p::{
-    mdns, multiaddr::Protocol, noise, ping,
+    identity::Keypair, mdns, multiaddr::Protocol, noise, ping,
     request_response::{self, ProtocolSupport},
     swarm::SwarmEvent,
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::io::{IsTerminal, Write};
 use std::net::Ipv6Addr;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncBufReadExt;
@@ -19,7 +21,7 @@ use crate::cmd_tree::{CmdError, CmdTree, ROOT};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Control {
     Heartbeat,
-    Hello,
+    Hello(String),
     Bye,
 }
 
@@ -41,6 +43,11 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 const BYE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Argon2id 派生参数（v1 常量：参数是角色 ID 的一部分，改动将导致所有 ID 变更）
+const ARGON2_M_KIB: u32 = 19456;
+const ARGON2_T: u32 = 2;
+const ARGON2_P: u32 = 1;
+
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct NodeBehaviour {
     mdns: mdns::tokio::Behaviour,
@@ -52,6 +59,8 @@ enum ChatAction {
     None,
     Quit,
     Dial(Multiaddr),
+    Chat(String),
+    List,
 }
 
 struct ChatCtx {
@@ -139,6 +148,19 @@ fn build_tree() -> CmdTree<ChatCtx> {
         }
     });
     tree.set_help(dial, "连接对方节点，参数为对方的监听地址");
+    let chat = tree.register(ROOT, "chat", |ctx, args| {
+        if args.is_empty() {
+            eprintln!(
+                "{}",
+                "用法: /chat <完整角色名 或 完整节点ID>（/list 查看已登记节点）".yellow()
+            );
+            return;
+        }
+        ctx.action = ChatAction::Chat(args.join(" "));
+    });
+    tree.set_help(chat, "按完整角色名或完整节点ID发起 1v1 聊天");
+    let list = tree.register(ROOT, "list", |ctx, _| ctx.action = ChatAction::List);
+    tree.set_help(list, "列出已登记节点与状态");
     let quit = tree.register(ROOT, "quit", |ctx, _| ctx.action = ChatAction::Quit);
     tree.set_help(quit, "退出聊天");
     let q = tree.register(ROOT, "q", |ctx, _| ctx.action = ChatAction::Quit);
@@ -168,6 +190,131 @@ fn dial_next_reconnect(
     }
 }
 
+fn normalize_birthday(raw: &str) -> Result<String, String> {
+    let parts: Vec<&str> = raw.trim().split('-').collect();
+    if parts.len() != 3 {
+        return Err("生日格式应为 YYYY-MM-DD，如 1990-01-01".into());
+    }
+    let (y, m, d): (u32, u32, u32) = (
+        parts[0]
+            .parse()
+            .map_err(|_| "年份应为数字".to_string())?,
+        parts[1]
+            .parse()
+            .map_err(|_| "月份应为数字".to_string())?,
+        parts[2]
+            .parse()
+            .map_err(|_| "日期应为数字".to_string())?,
+    );
+    if !(1900..=2100).contains(&y) {
+        return Err(format!("年份 {y} 超出范围 1900-2100"));
+    }
+    if !(1..=12).contains(&m) {
+        return Err(format!("月份 {m} 超出范围 1-12"));
+    }
+    if !(1..=31).contains(&d) {
+        return Err(format!("日期 {d} 超出范围 1-31"));
+    }
+    Ok(format!("{y:04}-{m:02}-{d:02}"))
+}
+
+fn normalize_gender(raw: &str) -> Result<char, String> {
+    match raw.trim() {
+        "男" | "M" | "m" => Ok('M'),
+        "女" | "F" | "f" => Ok('F'),
+        "保密" | "O" | "o" => Ok('O'),
+        other => Err(format!("性别须为 男/M、女/F 或 保密/O，当前: {other}")),
+    }
+}
+
+/// 角色身份派生：salt = SHA-256(姓名|生日|性别)，seed = Argon2id(密码, salt)，
+/// 再由 32 字节种子确定性生成 Ed25519 密钥对。同样的信息在任何机器登录都得到同一 ID。
+fn derive_identity(
+    name: &str,
+    birthday: &str,
+    gender: char,
+    password: &str,
+) -> Result<Keypair, String> {
+    let salt: [u8; 32] =
+        Sha256::digest(format!("{name}|{birthday}|{gender}").as_bytes()).into();
+    let params = argon2::Params::new(ARGON2_M_KIB, ARGON2_T, ARGON2_P, Some(32))
+        .map_err(|e| format!("Argon2 参数错误: {e}"))?;
+    let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let mut seed = [0u8; 32];
+    argon2
+        .hash_password_into(password.as_bytes(), &salt, &mut seed)
+        .map_err(|e| format!("密钥派生失败: {e}"))?;
+    Keypair::ed25519_from_bytes(seed).map_err(|e| format!("生成密钥失败: {e}"))
+}
+
+/// 角色登录：收集四项信息并派生身份。交互终端下密码不回显（rpassword）；
+/// stdin 被管道接管时（测试/脚本）退回普通行读取。输入不合法循环重问。
+async fn login(
+    stdin: &mut tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>,
+    interactive: bool,
+) -> Result<(Keypair, String), Box<dyn Error>> {
+    loop {
+        print!("姓名: ");
+        std::io::stdout().flush()?;
+        let name = match stdin.next_line().await? {
+            Some(l) => l.trim().to_string(),
+            None => return Err("输入结束，无法登录".into()),
+        };
+        if name.is_empty() || name.len() > 64 {
+            eprintln!("{}", "姓名不能为空且不超过 64 字节".yellow());
+            continue;
+        }
+        print!("生日 (YYYY-MM-DD): ");
+        std::io::stdout().flush()?;
+        let birthday_raw = match stdin.next_line().await? {
+            Some(l) => l,
+            None => return Err("输入结束，无法登录".into()),
+        };
+        let birthday = match normalize_birthday(&birthday_raw) {
+            Ok(b) => b,
+            Err(reason) => {
+                eprintln!("{}", reason.yellow());
+                continue;
+            }
+        };
+        print!("性别 (男/M 女/F 保密/O): ");
+        std::io::stdout().flush()?;
+        let gender_raw = match stdin.next_line().await? {
+            Some(l) => l,
+            None => return Err("输入结束，无法登录".into()),
+        };
+        let gender = match normalize_gender(&gender_raw) {
+            Ok(g) => g,
+            Err(reason) => {
+                eprintln!("{}", reason.yellow());
+                continue;
+            }
+        };
+        let password = if interactive {
+            rpassword::prompt_password("密码: ")?
+        } else {
+            print!("密码: ");
+            std::io::stdout().flush()?;
+            match stdin.next_line().await? {
+                Some(l) => l,
+                None => return Err("输入结束，无法登录".into()),
+            }
+        };
+        if password.is_empty() || password.len() > 128 {
+            eprintln!("{}", "密码不能为空且不超过 128 字节".yellow());
+            continue;
+        }
+        println!("{}", "正在派生角色身份...".dimmed());
+        match derive_identity(&name, &birthday, gender, &password) {
+            Ok(kp) => return Ok((kp, name)),
+            Err(reason) => {
+                eprintln!("{}", reason.red());
+                continue;
+            }
+        }
+    }
+}
+
 pub fn run() {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -184,7 +331,18 @@ pub fn run() {
 }
 
 async fn run_node() -> Result<(), Box<dyn Error>> {
-    let mut swarm = SwarmBuilder::with_new_identity()
+    let interactive = std::io::stdin().is_terminal();
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+
+    println!("{}", "[角色登录]".green());
+    let (keypair, my_name) = login(&mut stdin, interactive).await?;
+    let local_id = keypair.public().to_peer_id();
+    println!(
+        "{}",
+        format!("登录成功: {my_name} (节点ID {local_id})").green()
+    );
+
+    let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -197,7 +355,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                 mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?,
                 ping: ping::Behaviour::default(),
                 chat: request_response::cbor::Behaviour::new(
-                    [(StreamProtocol::new("/chat/3.0.0"), ProtocolSupport::Full)],
+                    [(StreamProtocol::new("/chat/4.0.0"), ProtocolSupport::Full)],
                     request_response::Config::default(),
                 ),
             })
@@ -208,9 +366,10 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
     swarm.listen_on(listen_addr)?;
     let mut v6_listen_issued = false;
 
-    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
-    let mut peer: Option<PeerId> = None;
+    let mut active: Option<PeerId> = None;
+    let mut conn_count: HashMap<PeerId, u32> = HashMap::new();
+    let mut names: HashMap<PeerId, String> = HashMap::new();
     let mut dialing: HashSet<PeerId> = HashSet::new();
     let mut known_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
     let mut reconnect_peer: Option<PeerId> = None;
@@ -226,7 +385,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
 
     println!(
         "{}",
-        "命令以 / 开头（/help 查看详情，/dial 不带参数可查看地址格式），其余输入作为消息发送".dimmed()
+        "命令以 / 开头（/help 查看详情，/list 查看节点，/chat <角色> 发起聊天），其余输入作为消息发送给当前聊天对象".dimmed()
     );
 
     loop {
@@ -251,7 +410,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                     }
                     match ctx.action {
                         ChatAction::Quit => {
-                            if let Some(p) = peer {
+                            if let Some(p) = active {
                                 let req_id = swarm.behaviour_mut().chat.send_request(
                                     &p,
                                     ChatRequest(ChatPayload::Control(Control::Bye)),
@@ -330,11 +489,77 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                         }
+                        ChatAction::Chat(target) => {
+                            let resolved = names
+                                .iter()
+                                .find(|(_, n)| n.as_str() == target)
+                                .map(|(p, _)| *p)
+                                .or_else(|| target.parse::<PeerId>().ok());
+                            match resolved {
+                                Some(p) => match known_addrs.get(&p) {
+                                    Some(addrs) if !addrs.is_empty() => {
+                                        println!(
+                                            "{}",
+                                            format!("正在连接 {target}...").cyan()
+                                        );
+                                        active = Some(p);
+                                        reconnect_peer = Some(p);
+                                        reconnect_pending = addrs.clone();
+                                        dial_next_reconnect(
+                                            &mut swarm,
+                                            &mut dialing,
+                                            &mut reconnect_peer,
+                                            &mut reconnect_pending,
+                                        );
+                                    }
+                                    _ => eprintln!(
+                                        "{}",
+                                        "该节点暂无已知地址（局域网未发现），可让对方上线后用 /list 查看".yellow()
+                                    ),
+                                },
+                                None => eprintln!(
+                                    "{}",
+                                    format!(
+                                        "未知角色: {target}（须为完整角色名或完整节点ID，/list 查看）"
+                                    )
+                                    .yellow()
+                                ),
+                            }
+                        }
+                        ChatAction::List => {
+                            if known_addrs.is_empty() {
+                                println!(
+                                    "{}",
+                                    "暂无已登记节点（等待 mDNS 发现或用 /dial 直连）".dimmed()
+                                );
+                            } else {
+                                println!("{}", "=== 已登记节点 ===".cyan());
+                                let mut entries: Vec<(String, &PeerId, usize)> = known_addrs
+                                    .iter()
+                                    .map(|(p, addrs)| (p.to_string(), p, addrs.len()))
+                                    .collect();
+                                entries.sort();
+                                for (id_str, p, addr_n) in entries {
+                                    let who = names
+                                        .get(p)
+                                        .map(String::as_str)
+                                        .unwrap_or("未知");
+                                    let state = if active == Some(*p) {
+                                        "当前聊天"
+                                    } else if conn_count.contains_key(p) {
+                                        "已连接"
+                                    } else {
+                                        "离线"
+                                    };
+                                    println!("  {who}  {id_str}  [{state}]  地址数 {addr_n}");
+                                }
+                            }
+                        }
                         ChatAction::None => {}
                     }
                     continue;
                 }
-                match peer {
+                match active {
                     Some(p) => {
                         swarm.behaviour_mut().chat.send_request(
                             &p,
@@ -346,7 +571,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                 }
             }
             _ = heartbeat.tick() => {
-                if let Some(p) = peer {
+                if let Some(p) = active {
                     if !bye_peers.contains(&p) {
                         if last_rx.is_some_and(|t| t.elapsed() > HEARTBEAT_TIMEOUT) {
                             println!(
@@ -400,13 +625,18 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                             reconnect_peer = None;
                             reconnect_pending.clear();
                         }
-                        peer = Some(peer_id);
+                        *conn_count.entry(peer_id).or_insert(0) += 1;
+                        if active.is_none() {
+                            active = Some(peer_id);
+                        }
                         last_rx = Some(Instant::now());
                         println!("{}", format!("已连接对端: {peer_id}").green());
                         if greeted.insert(peer_id) {
                             swarm.behaviour_mut().chat.send_request(
                                 &peer_id,
-                                ChatRequest(ChatPayload::Control(Control::Hello)),
+                                ChatRequest(ChatPayload::Control(Control::Hello(
+                                    my_name.clone(),
+                                ))),
                             );
                         }
                     }
@@ -428,8 +658,9 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                         if num_established == 0 {
                             dialing.remove(&peer_id);
                             greeted.remove(&peer_id);
-                            if peer == Some(peer_id) {
-                                peer = None;
+                            conn_count.remove(&peer_id);
+                            if active == Some(peer_id) {
+                                active = None;
                                 last_rx = None;
                                 if bye_peers.contains(&peer_id) {
                                     println!("{}", "对方已正常退出，不进行重连".dimmed());
@@ -450,6 +681,8 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
                             }
+                        } else {
+                            conn_count.insert(peer_id, num_established);
                         }
                     }
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -470,7 +703,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     &mut reconnect_peer,
                                     &mut reconnect_pending,
                                 );
-                            } else if peer.is_none() {
+                            } else if active.is_none() {
                                 if let Some(addrs) = known_addrs.get(&p) {
                                     if !addrs.is_empty() {
                                         println!(
@@ -494,16 +727,13 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                     }
                     SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                         for (found_id, addr) in list {
+                            if found_id == *swarm.local_peer_id() {
+                                continue;
+                            }
                             println!("{}", format!("mDNS 发现节点: {found_id}").cyan());
                             let recorded = known_addrs.entry(found_id).or_default();
                             if !recorded.contains(&addr) {
                                 recorded.push(addr.clone());
-                            }
-                            if peer.is_none()
-                                && !dialing.contains(&found_id)
-                                && swarm.dial(addr).is_ok()
-                            {
-                                dialing.insert(found_id);
                             }
                         }
                     }
@@ -527,8 +757,12 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     }
                                     ChatPayload::Control(ctrl) => match ctrl {
                                         Control::Heartbeat => {}
-                                        Control::Hello => {
-                                            println!("{}", "对方已上线".green());
+                                        Control::Hello(name) => {
+                                            names.insert(from, name.clone());
+                                            println!(
+                                                "{}",
+                                                format!("对方已上线: {name}").green()
+                                            );
                                         }
                                         Control::Bye => {
                                             println!("{}", "对方已正常退出".yellow());
@@ -544,7 +778,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     SwarmEvent::Behaviour(NodeBehaviourEvent::Chat(request_response::Event::OutboundFailure { peer: p, error, .. })) => {
-                        if bye_peers.contains(&p) || peer != Some(p) {
+                        if bye_peers.contains(&p) || active != Some(p) {
                             eprintln!(
                                 "{}",
                                 format!("发送到 {p} 失败（对方正在退出或已离线）: {error}").dimmed()

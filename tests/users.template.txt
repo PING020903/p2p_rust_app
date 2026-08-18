@@ -1,0 +1,14 @@
+# 测试凭据模板
+# 用法：复制本文件为 tests/users.txt 后自行填写；users.txt 已被 git 忽略，不会上传
+# 格式说明：userN-字段:值，N 取 1 和 2；age 值后的 (YYYY-MM-DD) 为格式提示，解析时自动剥离
+# 注意：请勿在 users.txt 中填写真实的姓名/生日/密码
+
+user1-name:张三
+user1-age:1990-01-01(YYYY-MM-DD)
+user1-sex:M
+user1-password:change-me-1
+
+user2-name:李四
+user2-age:1992-05-20(YYYY-MM-DD)
+user2-sex:F
+user2-password:change-me-2
