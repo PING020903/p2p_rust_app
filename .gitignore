@@ -4,6 +4,7 @@
 # 白名单
 !/.gitignore
 !/README.md
+!/CHANGELOG.md
 !/LICENSE
 !/Cargo.toml
 !/Cargo.lock
