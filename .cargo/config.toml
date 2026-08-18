@@ -13,6 +13,11 @@ rustflags = ["-C", "link-arg=--export-table"]
 [target.x86_64-pc-windows-msvc]
 # 可以在这里添加 Windows 特定的编译选项
 
+# Windows GNU 配置：linker 指向 PATH 中的 gcc（本机 MinGW64），
+# 不使用 rustup 工具链自带的 gcc
+[target.x86_64-pc-windows-gnu]
+linker = "gcc"
+
 # 其他有用的配置
 [net]
 # 网络配置（如果需要）

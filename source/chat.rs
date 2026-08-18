@@ -1,22 +1,45 @@
 use colored::Colorize;
 use futures::StreamExt;
 use libp2p::{
-    mdns, noise, ping,
+    mdns, multiaddr::Protocol, noise, ping,
     request_response::{self, ProtocolSupport},
     swarm::SwarmEvent,
-    tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
+    tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::net::Ipv6Addr;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncBufReadExt;
 
 use crate::cmd_tree::{CmdError, CmdTree, ROOT};
 
+/// 控制面：协议信令，静默处理，不作为聊天内容显示
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ChatRequest(String);
+enum Control {
+    Heartbeat,
+    Hello,
+    Bye,
+}
+
+/// 数据面（Text/Binary）+ 控制面（Control）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ChatPayload {
+    Text(String),
+    Binary { name: String, data: Vec<u8> },
+    Control(Control),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatRequest(ChatPayload);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatResponse(bool);
+
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+const BYE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct NodeBehaviour {
@@ -123,6 +146,28 @@ fn build_tree() -> CmdTree<ChatCtx> {
     tree
 }
 
+fn dial_next_reconnect(
+    swarm: &mut Swarm<NodeBehaviour>,
+    dialing: &mut HashSet<PeerId>,
+    reconnect_peer: &mut Option<PeerId>,
+    pending: &mut Vec<Multiaddr>,
+) {
+    while let Some(ma) = pending.pop() {
+        if swarm.dial(ma).is_ok() {
+            if let Some(p) = reconnect_peer {
+                dialing.insert(*p);
+            }
+            return;
+        }
+    }
+    if reconnect_peer.take().is_some() {
+        eprintln!(
+            "{}",
+            "重连失败: 已知地址均无法连接，对方可能已退出".yellow()
+        );
+    }
+}
+
 pub fn run() {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -152,7 +197,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                 mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?,
                 ping: ping::Behaviour::default(),
                 chat: request_response::cbor::Behaviour::new(
-                    [(StreamProtocol::new("/chat/1.0.0"), ProtocolSupport::Full)],
+                    [(StreamProtocol::new("/chat/3.0.0"), ProtocolSupport::Full)],
                     request_response::Config::default(),
                 ),
             })
@@ -161,12 +206,19 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
 
     let listen_addr: Multiaddr = "/ip4/0.0.0.0/tcp/0".parse()?;
     swarm.listen_on(listen_addr)?;
-    if let Ok(addr6) = "/ip6/::/tcp/0".parse::<Multiaddr>() {
-        let _ = swarm.listen_on(addr6);
-    }
+    let mut v6_listen_issued = false;
 
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     let mut peer: Option<PeerId> = None;
+    let mut dialing: HashSet<PeerId> = HashSet::new();
+    let mut known_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+    let mut reconnect_peer: Option<PeerId> = None;
+    let mut reconnect_pending: Vec<Multiaddr> = Vec::new();
+    let mut last_rx: Option<Instant> = None;
+    let mut bye_peers: HashSet<PeerId> = HashSet::new();
+    let mut greeted: HashSet<PeerId> = HashSet::new();
+    let mut user_dials: HashSet<PeerId> = HashSet::new();
     let mut ctx = ChatCtx {
         action: ChatAction::None,
     };
@@ -198,10 +250,84 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                         eprintln!("{}", format!("未知命令: {cmd}").yellow());
                     }
                     match ctx.action {
-                        ChatAction::Quit => break,
+                        ChatAction::Quit => {
+                            if let Some(p) = peer {
+                                let req_id = swarm.behaviour_mut().chat.send_request(
+                                    &p,
+                                    ChatRequest(ChatPayload::Control(Control::Bye)),
+                                );
+                                println!("{}", "正在通知对方下线...".dimmed());
+                                let deadline =
+                                    tokio::time::Instant::now() + BYE_HANDSHAKE_TIMEOUT;
+                                loop {
+                                    tokio::select! {
+                                        _ = tokio::time::sleep_until(deadline) => break,
+                                        event = swarm.select_next_some() => {
+                                            let done = match event {
+                                                SwarmEvent::Behaviour(NodeBehaviourEvent::Chat(
+                                                    request_response::Event::Message {
+                                                        message:
+                                                            request_response::Message::Response {
+                                                                request_id,
+                                                                ..
+                                                            },
+                                                        ..
+                                                    },
+                                                )) => request_id == req_id,
+                                                SwarmEvent::Behaviour(NodeBehaviourEvent::Chat(
+                                                    request_response::Event::OutboundFailure {
+                                                        request_id,
+                                                        ..
+                                                    },
+                                                )) => request_id == req_id,
+                                                SwarmEvent::Behaviour(NodeBehaviourEvent::Chat(
+                                                    request_response::Event::Message {
+                                                        message:
+                                                            request_response::Message::Request {
+                                                                channel,
+                                                                ..
+                                                            },
+                                                        ..
+                                                    },
+                                                )) => {
+                                                    let _ = swarm
+                                                        .behaviour_mut()
+                                                        .chat
+                                                        .send_response(channel, ChatResponse(true));
+                                                    false
+                                                }
+                                                _ => false,
+                                            };
+                                            if done {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            break;
+                        }
                         ChatAction::Dial(ma) => {
-                            if let Err(e) = swarm.dial(ma) {
-                                eprintln!("{}", format!("拨号失败: {e}").red());
+                            let target = ma.iter().find_map(|p| match p {
+                                Protocol::P2p(pid) => Some(pid),
+                                _ => None,
+                            });
+                            if let Some(p) = target {
+                                let recorded = known_addrs.entry(p).or_default();
+                                if !recorded.contains(&ma) {
+                                    recorded.push(ma.clone());
+                                }
+                            }
+                            match swarm.dial(ma) {
+                                Ok(()) => {
+                                    if let Some(p) = target {
+                                        dialing.insert(p);
+                                        user_dials.insert(p);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("{}", format!("拨号失败: {e}").red());
+                                }
                             }
                         }
                         ChatAction::None => {}
@@ -210,49 +336,222 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                 }
                 match peer {
                     Some(p) => {
-                        swarm.behaviour_mut().chat.send_request(&p, ChatRequest(line.to_string()));
+                        swarm.behaviour_mut().chat.send_request(
+                            &p,
+                            ChatRequest(ChatPayload::Text(line.to_string())),
+                        );
                         println!("{}", format!("[我] {line}").green());
                     }
                     None => eprintln!("{}", "尚未连接对端，无法发送".yellow()),
+                }
+            }
+            _ = heartbeat.tick() => {
+                if let Some(p) = peer {
+                    if !bye_peers.contains(&p) {
+                        if last_rx.is_some_and(|t| t.elapsed() > HEARTBEAT_TIMEOUT) {
+                            println!(
+                                "{}",
+                                format!(
+                                    "心跳超时（超过 {} 秒无响应），判定对方离线",
+                                    HEARTBEAT_TIMEOUT.as_secs()
+                                )
+                                .yellow()
+                            );
+                            last_rx = None;
+                            let _ = swarm.disconnect_peer_id(p);
+                            continue;
+                        }
+                        swarm.behaviour_mut().chat.send_request(
+                            &p,
+                            ChatRequest(ChatPayload::Control(Control::Heartbeat)),
+                        );
+                    }
                 }
             }
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
                         println!("{}", format!("监听地址: {address}/p2p/{}", swarm.local_peer_id()).green());
+                        if !v6_listen_issued
+                            && address.iter().any(|p| matches!(p, Protocol::Ip4(_)))
+                        {
+                            v6_listen_issued = true;
+                            let port = address.iter().find_map(|p| match p {
+                                Protocol::Tcp(port) => Some(port),
+                                _ => None,
+                            });
+                            let mut v6_addr = Multiaddr::empty();
+                            v6_addr.push(Protocol::Ip6(Ipv6Addr::UNSPECIFIED));
+                            v6_addr.push(Protocol::Tcp(port.unwrap_or(0)));
+                            if let Err(e) = swarm.listen_on(v6_addr) {
+                                eprintln!(
+                                    "{}",
+                                    format!("ip6 复用 ip4 端口监听失败({e})，改用随机端口").yellow()
+                                );
+                                if let Ok(fallback) = "/ip6/::/tcp/0".parse::<Multiaddr>() {
+                                    let _ = swarm.listen_on(fallback);
+                                }
+                            }
+                        }
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                        peer = Some(peer_id);
-                        println!("{}", format!("已连接对端: {peer_id}").green());
-                    }
-                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                        if peer == Some(peer_id) {
-                            peer = None;
+                        dialing.remove(&peer_id);
+                        if reconnect_peer == Some(peer_id) {
+                            reconnect_peer = None;
+                            reconnect_pending.clear();
                         }
-                        println!("{}", format!("连接已关闭: {peer_id}").yellow());
+                        peer = Some(peer_id);
+                        last_rx = Some(Instant::now());
+                        println!("{}", format!("已连接对端: {peer_id}").green());
+                        if greeted.insert(peer_id) {
+                            swarm.behaviour_mut().chat.send_request(
+                                &peer_id,
+                                ChatRequest(ChatPayload::Control(Control::Hello)),
+                            );
+                        }
+                    }
+                    SwarmEvent::ConnectionClosed {
+                        peer_id,
+                        num_established,
+                        cause,
+                        ..
+                    } => {
+                        let cause_text = match &cause {
+                            Some(c) => format!("，原因: {c}"),
+                            None => String::new(),
+                        };
+                        println!(
+                            "{}",
+                            format!("连接已关闭: {peer_id}（剩余连接 {num_established}{cause_text}）")
+                                .yellow()
+                        );
+                        if num_established == 0 {
+                            dialing.remove(&peer_id);
+                            greeted.remove(&peer_id);
+                            if peer == Some(peer_id) {
+                                peer = None;
+                                last_rx = None;
+                                if bye_peers.contains(&peer_id) {
+                                    println!("{}", "对方已正常退出，不进行重连".dimmed());
+                                } else if let Some(addrs) = known_addrs.get(&peer_id) {
+                                    if !addrs.is_empty() {
+                                        println!(
+                                            "{}",
+                                            format!("尝试重连 {peer_id}...").cyan()
+                                        );
+                                        reconnect_peer = Some(peer_id);
+                                        reconnect_pending = addrs.clone();
+                                        dial_next_reconnect(
+                                            &mut swarm,
+                                            &mut dialing,
+                                            &mut reconnect_peer,
+                                            &mut reconnect_pending,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                        eprintln!("{}", format!("拨号 {peer_id:?} 失败: {error}").red());
+                        if let Some(p) = peer_id {
+                            if user_dials.remove(&p) {
+                                eprintln!("{}", format!("拨号 {p} 失败: {error}").red());
+                            } else {
+                                eprintln!(
+                                    "{}",
+                                    format!("拨号 {p} 失败（自动恢复中）: {error}").dimmed()
+                                );
+                            }
+                            dialing.remove(&p);
+                            if reconnect_peer == Some(p) {
+                                dial_next_reconnect(
+                                    &mut swarm,
+                                    &mut dialing,
+                                    &mut reconnect_peer,
+                                    &mut reconnect_pending,
+                                );
+                            } else if peer.is_none() {
+                                if let Some(addrs) = known_addrs.get(&p) {
+                                    if !addrs.is_empty() {
+                                        println!(
+                                            "{}",
+                                            format!("拨号失败，尝试 {p} 的其他已知地址...").cyan()
+                                        );
+                                        reconnect_peer = Some(p);
+                                        reconnect_pending = addrs.clone();
+                                        dial_next_reconnect(
+                                            &mut swarm,
+                                            &mut dialing,
+                                            &mut reconnect_peer,
+                                            &mut reconnect_pending,
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            eprintln!("{}", format!("拨号失败: {error}").red());
+                        }
                     }
                     SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                         for (found_id, addr) in list {
                             println!("{}", format!("mDNS 发现节点: {found_id}").cyan());
-                            if peer.is_none() {
-                                let _ = swarm.dial(addr);
+                            let recorded = known_addrs.entry(found_id).or_default();
+                            if !recorded.contains(&addr) {
+                                recorded.push(addr.clone());
+                            }
+                            if peer.is_none()
+                                && !dialing.contains(&found_id)
+                                && swarm.dial(addr).is_ok()
+                            {
+                                dialing.insert(found_id);
                             }
                         }
                     }
-                    SwarmEvent::Behaviour(NodeBehaviourEvent::Chat(request_response::Event::Message { message, .. })) => {
+                    SwarmEvent::Behaviour(NodeBehaviourEvent::Chat(request_response::Event::Message { peer: from, message, .. })) => {
                         match message {
                             request_response::Message::Request { request, channel, .. } => {
-                                println!("{}", format!("[对方] {}", request.0).bright_cyan());
+                                last_rx = Some(Instant::now());
+                                match request.0 {
+                                    ChatPayload::Text(text) => {
+                                        println!("{}", format!("[对方] {text}").bright_cyan());
+                                    }
+                                    ChatPayload::Binary { name, data } => {
+                                        println!(
+                                            "{}",
+                                            format!(
+                                                "[对方] 收到二进制数据 '{name}'（{} 字节），文件功能未实现",
+                                                data.len()
+                                            )
+                                            .dimmed()
+                                        );
+                                    }
+                                    ChatPayload::Control(ctrl) => match ctrl {
+                                        Control::Heartbeat => {}
+                                        Control::Hello => {
+                                            println!("{}", "对方已上线".green());
+                                        }
+                                        Control::Bye => {
+                                            println!("{}", "对方已正常退出".yellow());
+                                            bye_peers.insert(from);
+                                        }
+                                    },
+                                }
                                 let _ = swarm.behaviour_mut().chat.send_response(channel, ChatResponse(true));
                             }
-                            request_response::Message::Response { .. } => {}
+                            request_response::Message::Response { .. } => {
+                                last_rx = Some(Instant::now());
+                            }
                         }
                     }
                     SwarmEvent::Behaviour(NodeBehaviourEvent::Chat(request_response::Event::OutboundFailure { peer: p, error, .. })) => {
-                        eprintln!("{}", format!("发送到 {p} 失败: {error}").red());
+                        if bye_peers.contains(&p) || peer != Some(p) {
+                            eprintln!(
+                                "{}",
+                                format!("发送到 {p} 失败（对方正在退出或已离线）: {error}").dimmed()
+                            );
+                        } else {
+                            eprintln!("{}", format!("发送到 {p} 失败: {error}").red());
+                        }
                     }
                     _ => {}
                 }
