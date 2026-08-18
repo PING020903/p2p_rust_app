@@ -173,6 +173,7 @@ fn dial_next_reconnect(
     dialing: &mut HashSet<PeerId>,
     reconnect_peer: &mut Option<PeerId>,
     pending: &mut Vec<Multiaddr>,
+    known_addrs: &mut HashMap<PeerId, Vec<Multiaddr>>,
 ) {
     while let Some(ma) = pending.pop() {
         if swarm.dial(ma).is_ok() {
@@ -182,7 +183,8 @@ fn dial_next_reconnect(
             return;
         }
     }
-    if reconnect_peer.take().is_some() {
+    if let Some(p) = reconnect_peer.take() {
+        known_addrs.remove(&p);
         eprintln!(
             "{}",
             "重连失败: 已知地址均无法连接，对方可能已退出".yellow()
@@ -378,6 +380,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
     let mut bye_peers: HashSet<PeerId> = HashSet::new();
     let mut greeted: HashSet<PeerId> = HashSet::new();
     let mut user_dials: HashSet<PeerId> = HashSet::new();
+    let mut pending_chat: Option<PeerId> = None;
     let mut ctx = ChatCtx {
         action: ChatAction::None,
     };
@@ -496,27 +499,31 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                 .map(|(p, _)| *p)
                                 .or_else(|| target.parse::<PeerId>().ok());
                             match resolved {
-                                Some(p) => match known_addrs.get(&p) {
-                                    Some(addrs) if !addrs.is_empty() => {
-                                        println!(
+                                Some(p) => {
+                                    pending_chat = Some(p);
+                                    active = Some(p);
+                                    match known_addrs.get(&p) {
+                                        Some(addrs) if !addrs.is_empty() => {
+                                            println!(
+                                                "{}",
+                                                format!("正在连接 {target}...").cyan()
+                                            );
+                                            reconnect_peer = Some(p);
+                                            reconnect_pending = addrs.clone();
+                                            dial_next_reconnect(
+                                                &mut swarm,
+                                                &mut dialing,
+                                                &mut reconnect_peer,
+                                                &mut reconnect_pending,
+                                                &mut known_addrs,
+                                            );
+                                        }
+                                        _ => println!(
                                             "{}",
-                                            format!("正在连接 {target}...").cyan()
-                                        );
-                                        active = Some(p);
-                                        reconnect_peer = Some(p);
-                                        reconnect_pending = addrs.clone();
-                                        dial_next_reconnect(
-                                            &mut swarm,
-                                            &mut dialing,
-                                            &mut reconnect_peer,
-                                            &mut reconnect_pending,
-                                        );
+                                            "该节点暂无已知地址，等待 mDNS 发现，发现后自动连接".cyan()
+                                        ),
                                     }
-                                    _ => eprintln!(
-                                        "{}",
-                                        "该节点暂无已知地址（局域网未发现），可让对方上线后用 /list 查看".yellow()
-                                    ),
-                                },
+                                }
                                 None => eprintln!(
                                     "{}",
                                     format!(
@@ -625,6 +632,9 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                             reconnect_peer = None;
                             reconnect_pending.clear();
                         }
+                        if pending_chat == Some(peer_id) {
+                            pending_chat = None;
+                        }
                         *conn_count.entry(peer_id).or_insert(0) += 1;
                         if active.is_none() {
                             active = Some(peer_id);
@@ -663,6 +673,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                 active = None;
                                 last_rx = None;
                                 if bye_peers.contains(&peer_id) {
+                                    known_addrs.remove(&peer_id);
                                     println!("{}", "对方已正常退出，不进行重连".dimmed());
                                 } else if let Some(addrs) = known_addrs.get(&peer_id) {
                                     if !addrs.is_empty() {
@@ -677,6 +688,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                             &mut dialing,
                                             &mut reconnect_peer,
                                             &mut reconnect_pending,
+                                            &mut known_addrs,
                                         );
                                     }
                                 }
@@ -702,6 +714,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     &mut dialing,
                                     &mut reconnect_peer,
                                     &mut reconnect_pending,
+                                    &mut known_addrs,
                                 );
                             } else if active.is_none() {
                                 if let Some(addrs) = known_addrs.get(&p) {
@@ -717,6 +730,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                             &mut dialing,
                                             &mut reconnect_peer,
                                             &mut reconnect_pending,
+                                            &mut known_addrs,
                                         );
                                     }
                                 }
@@ -734,6 +748,24 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                             let recorded = known_addrs.entry(found_id).or_default();
                             if !recorded.contains(&addr) {
                                 recorded.push(addr.clone());
+                            }
+                            if pending_chat == Some(found_id)
+                                && reconnect_peer != Some(found_id)
+                                && !conn_count.contains_key(&found_id)
+                            {
+                                println!(
+                                    "{}",
+                                    format!("发现待接呼叫节点，拨号 {found_id}").cyan()
+                                );
+                                reconnect_peer = Some(found_id);
+                                reconnect_pending = vec![addr];
+                                dial_next_reconnect(
+                                    &mut swarm,
+                                    &mut dialing,
+                                    &mut reconnect_peer,
+                                    &mut reconnect_pending,
+                                    &mut known_addrs,
+                                );
                             }
                         }
                     }

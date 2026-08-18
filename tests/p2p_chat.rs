@@ -219,7 +219,8 @@ fn basic_chat_scenario() {
     b.kill();
 }
 
-/// 场景2：B 退出后重新登录（同一凭据身份不变），A 按角色名呼叫
+/// 场景2：B 退出后重新登录（同一凭据身份不变），A 立即按角色名呼叫（待接呼叫），
+/// 并回归验证 /list 地址数不随上下线循环累积
 fn chat_by_name_scenario() {
     let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
     let (cred_a, cred_b) = load_creds();
@@ -235,15 +236,11 @@ fn chat_by_name_scenario() {
     b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
     a.wait_for(&format!("对方已上线: {}", cred_b.name), WAIT);
 
-    println!("=== B 优雅退出后重新登录（同一凭据，身份不变）===");
+    println!("=== B 优雅退出后重新登录，A 立即按角色名呼叫（待接呼叫）===");
     b.send("/q");
     a.wait_for("对方已正常退出", WAIT);
     enter_chat(&mut b, &cred_b);
 
-    println!("=== 等待 mDNS 重新发现 B 的新地址 ===");
-    thread::sleep(Duration::from_secs(8));
-
-    println!("=== A 按角色名呼叫 B ===");
     a.send(&format!("/chat {}", cred_b.name));
     a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
     b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
@@ -251,6 +248,19 @@ fn chat_by_name_scenario() {
 
     a.send("按名呼叫后的消息");
     b.wait_for("[对方] 按名呼叫后的消息", WAIT);
+
+    println!("=== /list 地址簿回归：地址数不得累积膨胀 ===");
+    a.send("/list");
+    a.wait_for("=== 已登记节点 ===", WAIT);
+    let list_line = a.wait_for(&b_id, WAIT);
+    let addr_n: usize = list_line
+        .split("地址数")
+        .nth(1)
+        .expect("/list 行缺少地址数")
+        .trim()
+        .parse()
+        .expect("地址数不是数字");
+    assert!(addr_n <= 4, "地址簿膨胀: 地址数 {addr_n} > 4");
 
     a.kill();
     b.kill();
