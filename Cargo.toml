@@ -1,6 +1,6 @@
 [package]
 name = "p2p_rust_app"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 
 [[bin]]
@@ -19,5 +19,6 @@ rand = "0.8"
 libp2p = { version = "0.56.0", features = ["tokio", "tcp", "noise", "yamux", "ping", "request-response", "cbor", "macros", "mdns"] }
 rpassword = "7"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1.53.1", features = ["full"] }

@@ -13,6 +13,7 @@ use libp2p::{
 };
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io::{IsTerminal, Write};
@@ -72,6 +73,7 @@ enum ChatAction {
     Chat(String),
     List,
     Backup,
+    Trust(String),
 }
 
 struct ChatCtx {
@@ -178,6 +180,17 @@ fn build_tree() -> CmdTree<ChatCtx> {
     tree.set_help(q, "退出聊天");
     let backup = tree.register(ROOT, "backup", |ctx, _| ctx.action = ChatAction::Backup);
     tree.set_help(backup, "重新查看本身份助记词（需输入密码）");
+    let trust = tree.register(ROOT, "trust", |ctx, args| {
+        if args.is_empty() {
+            eprintln!(
+                "{}",
+                "用法: /trust <角色名 或 节点ID>（加 ! 前缀取消信任）".yellow()
+            );
+            return;
+        }
+        ctx.action = ChatAction::Trust(args.join(" "));
+    });
+    tree.set_help(trust, "标记/取消信任联系人（! 前缀取消）");
     tree
 }
 
@@ -465,6 +478,110 @@ fn save_keystore(
 
 fn valid_password(pwd: &str) -> bool {
     (8..=128).contains(&pwd.len())
+}
+
+/// 联系人条目：peer_id 即身份指纹（公钥哈希），额外派生短指纹便于人工核对
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContactEntry {
+    peer_id: String,
+    name: String,
+    fingerprint: String,
+    verified: bool,
+    first_seen: u64,
+    last_seen: u64,
+}
+
+/// 本地联系人簿（TOFU：首次接触记录指纹，之后凭指纹识别，防身份切换）。
+/// 明文存储——peer_id/名字本就是公开元数据
+struct ContactBook {
+    path: PathBuf,
+    entries: HashMap<String, ContactEntry>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// SSH 风格短指纹：PeerId 字节的 SHA-256 前 16 字节，冒号分组十六进制
+fn fingerprint_of(peer_id: &PeerId) -> String {
+    let hash = Sha256::digest(peer_id.to_bytes());
+    hash[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+impl ContactBook {
+    fn path_for(my_peer_id: &PeerId) -> PathBuf {
+        let dir = cache_dir().unwrap_or_else(|_| PathBuf::from("."));
+        dir.join(format!("contacts_{my_peer_id}.json"))
+    }
+
+    fn load(my_peer_id: &PeerId) -> ContactBook {
+        let path = Self::path_for(my_peer_id);
+        let entries = match std::fs::read_to_string(&path) {
+            Ok(s) => serde_json::from_str::<Vec<ContactEntry>>(&s).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+        .into_iter()
+        .map(|e| (e.peer_id.clone(), e))
+        .collect();
+        ContactBook { path, entries }
+    }
+
+    fn save(&self) {
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut list: Vec<&ContactEntry> = self.entries.values().collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Ok(s) = serde_json::to_string_pretty(&list) {
+            let _ = std::fs::write(&self.path, s);
+        }
+    }
+
+    fn get(&self, peer_id: &str) -> Option<&ContactEntry> {
+        self.entries.get(peer_id)
+    }
+
+    fn verified(&self, peer_id: &str) -> bool {
+        self.entries.get(peer_id).map(|e| e.verified).unwrap_or(false)
+    }
+
+    /// 首次接触插入 / 已存在则更新名字与最近见时间；verified 参数为 OR 合并
+    fn ensure_contact(&mut self, peer: &PeerId, name: &str, verified: bool) {
+        let pid = peer.to_string();
+        let now = unix_now();
+        match self.entries.get_mut(&pid) {
+            Some(e) => {
+                if !name.is_empty() {
+                    e.name = name.to_string();
+                }
+                e.last_seen = now;
+                if verified {
+                    e.verified = true;
+                }
+            }
+            None => {
+                self.entries.insert(
+                    pid.clone(),
+                    ContactEntry {
+                        peer_id: pid,
+                        name: name.to_string(),
+                        fingerprint: fingerprint_of(peer),
+                        verified,
+                        first_seen: now,
+                        last_seen: now,
+                    },
+                );
+            }
+        }
+        self.save();
+    }
 }
 
 async fn read_line(stdin: &mut StdinLines, prompt: &str) -> Result<String, Box<dyn Error>> {
@@ -786,6 +903,9 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    // TOFU 联系人簿（首次接触记录指纹）
+    let mut contacts = ContactBook::load(swarm.local_peer_id());
+
     let listen_addr: Multiaddr = "/ip4/0.0.0.0/tcp/0".parse()?;
     swarm.listen_on(listen_addr)?;
     let mut v6_listen_issued = false;
@@ -980,7 +1100,15 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     } else {
                                         "离线"
                                     };
-                                    println!("  {who}  {id_str}  [{state}]  地址数 {addr_n}");
+                                    let trust_badge = if contacts.verified(&id_str) {
+                                        "已信任".green()
+                                    } else {
+                                        "未信任".yellow()
+                                    };
+                                    println!(
+                                        "  {who}  {id_str}  [{}]  [{state}]  地址数 {addr_n}",
+                                        trust_badge
+                                    );
                                 }
                             }
                         }
@@ -1016,6 +1144,38 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     "{}",
                                     "未找到本身份的 keystore（身份未在本机加密保存过）".yellow()
                                 );
+                            }
+                        }
+                        ChatAction::Trust(target) => {
+                            let (untrust, target) = match target.strip_prefix('!') {
+                                Some(stripped) => (true, stripped.to_string()),
+                                None => (false, target),
+                            };
+                            let resolved = names
+                                .iter()
+                                .find(|(_, n)| n.as_str() == target)
+                                .map(|(p, _)| *p)
+                                .or_else(|| target.parse::<PeerId>().ok());
+                            match resolved {
+                                Some(p) => {
+                                    let name = names
+                                        .get(&p)
+                                        .cloned()
+                                        .unwrap_or_else(|| "未知".to_string());
+                                    contacts.ensure_contact(&p, &name, !untrust);
+                                    if untrust {
+                                        println!(
+                                            "{}",
+                                            format!("已取消信任: {name}").yellow()
+                                        );
+                                    } else {
+                                        println!("{}", format!("已信任: {name}").green());
+                                    }
+                                }
+                                None => eprintln!(
+                                    "{}",
+                                    "未知节点，无法标记信任（用 /list 查看）".yellow()
+                                ),
                             }
                         }
                         ChatAction::None => {}
@@ -1251,6 +1411,50 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                                 "{}",
                                                 format!("对方已上线: {name}").green()
                                             );
+                                            let pid = from.to_string();
+                                            if contacts.get(&pid).is_none() {
+                                                // 首次接触：TOFU 指纹核对。
+                                                // 交互终端须人工确认；管道环境（脚本/自动化）
+                                                // 无法交互，采用 SSH accept-new 语义自动信任
+                                                if interactive {
+                                                    println!(
+                                                        "{}",
+                                                        "首次连接，请核对对方身份指纹:".yellow()
+                                                    );
+                                                    println!(
+                                                        "  指纹: {}",
+                                                        fingerprint_of(&from).dimmed()
+                                                    );
+                                                    println!("  节点ID: {pid}");
+                                                    let ans = read_line(
+                                                        &mut stdin,
+                                                        "是否信任该节点（记录为联系人）? (y/n): ",
+                                                    )
+                                                    .await?;
+                                                    let trusted =
+                                                        ans.trim().eq_ignore_ascii_case("y");
+                                                    contacts.ensure_contact(
+                                                        &from,
+                                                        &name,
+                                                        trusted,
+                                                    );
+                                                    if trusted {
+                                                        println!(
+                                                            "{}",
+                                                            format!("已记录并信任: {name}").green()
+                                                        );
+                                                    } else {
+                                                        println!(
+                                                            "{}",
+                                                            format!("已记录但未信任: {name}").yellow()
+                                                        );
+                                                    }
+                                                } else {
+                                                    contacts.ensure_contact(&from, &name, true);
+                                                }
+                                            } else {
+                                                contacts.ensure_contact(&from, &name, false);
+                                            }
                                         }
                                         Control::Bye => {
                                             println!("{}", "对方已正常退出".yellow());
@@ -1445,5 +1649,46 @@ mod tests {
         assert!(!valid_password("1234567"));
         assert!(!valid_password(""));
         assert!(!valid_password(&"x".repeat(129)));
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_distinct() {
+        let a = keypair_from_mnemonic(MNEMONIC_A).unwrap().public().to_peer_id();
+        let b = keypair_from_mnemonic(MNEMONIC_B).unwrap().public().to_peer_id();
+        let fa1 = fingerprint_of(&a);
+        let fa2 = fingerprint_of(&a);
+        let fb = fingerprint_of(&b);
+        assert_eq!(fa1, fa2);
+        assert_ne!(fa1, fb);
+        assert_eq!(fa1.split(':').count(), 16);
+    }
+
+    #[test]
+    fn contact_book_persists_across_load() {
+        let dir = std::env::temp_dir().join(format!("p2p_contact_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("P2P_ID_CACHE_DIR", &dir);
+        }
+        let a = keypair_from_mnemonic(MNEMONIC_A).unwrap();
+        let a_id = a.public().to_peer_id();
+        let b = keypair_from_mnemonic(MNEMONIC_B).unwrap();
+        let b_id = b.public().to_peer_id();
+
+        {
+            let mut book = ContactBook::load(&a_id);
+            assert!(!book.verified(&a_id.to_string()));
+            book.ensure_contact(&b_id, "bob", true);
+        }
+        let book = ContactBook::load(&a_id);
+        assert!(book.verified(&b_id.to_string()));
+        let entry = book.get(&b_id.to_string()).unwrap();
+        assert_eq!(entry.name, "bob");
+        assert!(!entry.fingerprint.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("P2P_ID_CACHE_DIR");
+        }
     }
 }
