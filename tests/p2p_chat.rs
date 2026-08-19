@@ -50,33 +50,51 @@ fn load_creds() -> (Creds, Creds) {
     (cred("user1"), cred("user2"))
 }
 
+/// 每场景独立的身份缓存临时目录（保证登录菜单行为确定）
+fn scenario_cache_dir(scenario: &str) -> String {
+    let dir = std::env::temp_dir()
+        .join(format!("p2p_e2e_cache_{}", std::process::id()))
+        .join(scenario);
+    std::fs::create_dir_all(&dir).expect("创建测试缓存目录失败");
+    dir.to_string_lossy().into_owned()
+}
+
 struct Node {
     child: Child,
     lines: mpsc::Receiver<String>,
 }
 
 impl Node {
-    fn spawn(bin: &str) -> Self {
+    fn spawn(bin: &str, cache_dir: &str) -> Self {
         let mut child = Command::new(bin)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
+            .env("P2P_ID_CACHE_DIR", cache_dir)
+            .env("P2P_ID_PROBE_SECS", "2")
             .spawn()
             .expect("启动节点失败");
-        let stdout = child.stdout.take().unwrap();
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(l) => {
-                        if tx.send(l).is_err() {
-                            break;
+        let forward = |mut stream: Box<dyn std::io::Read + Send>, tag: &'static str, tx: mpsc::Sender<String>| {
+            thread::spawn(move || {
+                for line in BufReader::new(&mut stream).lines() {
+                    match line {
+                        Ok(l) => {
+                            if tx.send(format!("[{tag}] {l}")).is_err() {
+                                break;
+                            }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
-            }
-        });
+            });
+        };
+        forward(
+            Box::new(child.stdout.take().unwrap()),
+            "out",
+            tx.clone(),
+        );
+        forward(Box::new(child.stderr.take().unwrap()), "err", tx);
         Node { child, lines: rx }
     }
 
@@ -146,48 +164,47 @@ fn random_msg(seed: u64) -> String {
         .collect()
 }
 
-/// 按登录流程依次喂四项信息（测试环境 stdin 为管道，密码走行读取）
-fn login(node: &mut Node, creds: &Creds) {
+/// 新身份登录：喂四项信息；登录成功后补发缓存询问的应答（y/n）
+fn login_new(node: &mut Node, creds: &Creds, cache_answer: &str) {
     node.send(&creds.name);
     node.send(&creds.birthday);
     node.send(&creds.gender);
     node.send(&creds.password);
-    node.wait_for(
-        &format!("登录成功: {}", creds.name),
-        Duration::from_secs(30),
-    );
+    node.wait_for("登录成功: ", Duration::from_secs(30));
+    node.send(cache_answer);
 }
 
 /// 启动节点并登录进入聊天，返回 127.0.0.1 监听地址行（含 /p2p/ 节点ID）
-fn spawn_into_chat(bin: &str, creds: &Creds) -> (Node, String) {
-    let mut node = Node::spawn(bin);
+fn spawn_into_chat(bin: &str, cache_dir: &str, creds: &Creds) -> (Node, String) {
+    let mut node = Node::spawn(bin, cache_dir);
     node.wait_for("=== 主菜单 ===", Duration::from_secs(10));
     node.send("4");
-    login(&mut node, creds);
+    login_new(&mut node, creds, "n");
     let listen = node.wait_for("监听地址: /ip4/127.0.0.1", Duration::from_secs(20));
     (node, listen)
 }
 
-/// 在已有节点上重新进入聊天（重新登录）
+/// 在已有节点上重新进入聊天（缓存为空时走完整新身份登录）
 fn enter_chat(node: &mut Node, creds: &Creds) -> String {
     node.send("4");
-    login(node, creds);
+    login_new(node, creds, "n");
     node.wait_for("监听地址: /ip4/127.0.0.1", Duration::from_secs(20))
 }
 
 /// 场景1：基础聊天——登录、连接、带名字的 Hello、双向收发、12 秒静默保活、Bye 优雅退出
 fn basic_chat_scenario() {
     let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache = scenario_cache_dir("s1");
     let (cred_a, cred_b) = load_creds();
     println!("=== 场景1: 基础聊天 ===");
 
     println!("=== 启动节点 A ===");
-    let (mut a, a_listen) = spawn_into_chat(bin, &cred_a);
+    let (mut a, a_listen) = spawn_into_chat(bin, &cache, &cred_a);
     let a_addr = listen_addr(&a_listen);
     let a_id = parse_peer_id(&a_listen);
 
     println!("=== 启动节点 B ===");
-    let (mut b, b_listen) = spawn_into_chat(bin, &cred_b);
+    let (mut b, b_listen) = spawn_into_chat(bin, &cache, &cred_b);
     let b_id = parse_peer_id(&b_listen);
     b.send(&format!("/dial {a_addr}"));
 
@@ -223,14 +240,15 @@ fn basic_chat_scenario() {
 /// 并回归验证 /list 地址数不随上下线循环累积
 fn chat_by_name_scenario() {
     let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache = scenario_cache_dir("s2");
     let (cred_a, cred_b) = load_creds();
     println!("=== 场景2: 按角色名呼叫 ===");
 
-    let (mut a, a_listen) = spawn_into_chat(bin, &cred_a);
+    let (mut a, a_listen) = spawn_into_chat(bin, &cache, &cred_a);
     let a_addr = listen_addr(&a_listen);
     let a_id = parse_peer_id(&a_listen);
 
-    let (mut b, b_listen) = spawn_into_chat(bin, &cred_b);
+    let (mut b, b_listen) = spawn_into_chat(bin, &cache, &cred_b);
     let b_id = parse_peer_id(&b_listen);
     b.send(&format!("/dial {a_addr}"));
     b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
@@ -269,14 +287,15 @@ fn chat_by_name_scenario() {
 /// 场景3：B 主动下线/上线循环，每轮发送 ≤64 字节随机消息
 fn graceful_offline_online_scenario() {
     let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache = scenario_cache_dir("s3");
     let (cred_a, cred_b) = load_creds();
     println!("=== 场景3: 主动上下线循环 x{CYCLES_GRACEFUL} ===");
 
-    let (mut a, a_listen) = spawn_into_chat(bin, &cred_a);
+    let (mut a, a_listen) = spawn_into_chat(bin, &cache, &cred_a);
     let a_addr = listen_addr(&a_listen);
     let a_id = parse_peer_id(&a_listen);
 
-    let mut b = Node::spawn(bin);
+    let mut b = Node::spawn(bin, &cache);
     b.wait_for("=== 主菜单 ===", Duration::from_secs(10));
 
     for i in 0..CYCLES_GRACEFUL {
@@ -305,14 +324,15 @@ fn graceful_offline_online_scenario() {
 /// 场景4：kill 进程模拟掉线（无 Bye），隔一段时间后重新上线
 fn kill_offline_online_scenario() {
     let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache = scenario_cache_dir("s4");
     let (cred_a, cred_b) = load_creds();
     println!("=== 场景4: kill 掉线循环 x{CYCLES_KILL} ===");
 
-    let (mut a, a_listen) = spawn_into_chat(bin, &cred_a);
+    let (mut a, a_listen) = spawn_into_chat(bin, &cache, &cred_a);
     let a_addr = listen_addr(&a_listen);
     let a_id = parse_peer_id(&a_listen);
 
-    let mut b = Node::spawn(bin);
+    let mut b = Node::spawn(bin, &cache);
     b.wait_for("=== 主菜单 ===", Duration::from_secs(10));
 
     for i in 0..CYCLES_KILL {
@@ -336,7 +356,7 @@ fn kill_offline_online_scenario() {
         println!("=== 隔 3 秒后重新上线 ===");
         thread::sleep(Duration::from_secs(3));
         if i + 1 < CYCLES_KILL {
-            b = Node::spawn(bin);
+            b = Node::spawn(bin, &cache);
             b.wait_for("=== 主菜单 ===", Duration::from_secs(10));
         }
     }
@@ -344,11 +364,76 @@ fn kill_offline_online_scenario() {
     a.kill();
 }
 
+/// 场景5：身份缓存回环——首登缓存(y) → 退出重进 → 选缓存身份 + 只输密码
+/// （先故意输错验证密码校验）
+fn cache_login_scenario() {
+    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache = scenario_cache_dir("s5");
+    let (cred_a, _cred_b) = load_creds();
+    println!("=== 场景5: 身份缓存回环 ===");
+
+    let mut a = Node::spawn(bin, &cache);
+    a.wait_for("=== 主菜单 ===", Duration::from_secs(10));
+    a.send("4");
+    login_new(&mut a, &cred_a, "y");
+    a.wait_for("身份已缓存", WAIT);
+    a.wait_for("监听地址: /ip4/127.0.0.1", WAIT);
+
+    println!("=== 退出聊天后重新进入，走缓存登录 ===");
+    a.send("/q");
+    a.wait_for("=== 主菜单 ===", WAIT);
+    a.send("4");
+    a.wait_for("缓存身份:", WAIT);
+
+    println!("=== 先输错密码，验证校验 ===");
+    a.send("1");
+    a.send("wrong-password");
+    a.wait_for("密码错误", WAIT);
+
+    println!("=== 输正确密码（免姓名/生日/性别）===");
+    a.send(&cred_a.password);
+    a.wait_for("登录成功: ", WAIT);
+    a.wait_for("监听地址: /ip4/127.0.0.1", WAIT);
+
+    a.kill();
+}
+
+/// 场景6：同 ID 冲突——两节点同一凭据，后者登录必须被拒绝
+fn duplicate_id_scenario() {
+    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache = scenario_cache_dir("s6");
+    let (cred_a, _cred_b) = load_creds();
+    println!("=== 场景6: 同 ID 冲突拒绝 ===");
+
+    let mut a = Node::spawn(bin, &cache);
+    a.wait_for("=== 主菜单 ===", Duration::from_secs(10));
+    a.send("4");
+    login_new(&mut a, &cred_a, "n");
+    a.wait_for("监听地址: /ip4/127.0.0.1", WAIT);
+
+    println!("=== B 用同一凭据登录，必须被拒绝 ===");
+    let mut b = Node::spawn(bin, &cache);
+    b.wait_for("=== 主菜单 ===", Duration::from_secs(10));
+    b.send("4");
+    b.send(&cred_a.name);
+    b.send(&cred_a.birthday);
+    b.send(&cred_a.gender);
+    b.send(&cred_a.password);
+    b.wait_for("登录成功: ", Duration::from_secs(30));
+    b.send("n");
+    b.wait_for("该角色 ID 已在线", Duration::from_secs(30));
+
+    a.kill();
+    b.kill();
+}
+
 #[test]
 fn p2p_chat_e2e_suite() {
-    // 四场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
+    // 六场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
     basic_chat_scenario();
     chat_by_name_scenario();
     graceful_offline_online_scenario();
     kill_offline_online_scenario();
+    cache_login_scenario();
+    duplicate_id_scenario();
 }

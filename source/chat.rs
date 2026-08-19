@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io::{IsTerminal, Write};
 use std::net::Ipv6Addr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncBufReadExt;
 
@@ -251,70 +252,300 @@ fn derive_identity(
 
 /// 角色登录：收集四项信息并派生身份。交互终端下密码不回显（rpassword）；
 /// stdin 被管道接管时（测试/脚本）退回普通行读取。输入不合法循环重问。
-async fn login(
-    stdin: &mut tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>,
+type StdinLines = tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>;
+
+/// 缓存身份条目：只存公开盐信息与派生结果 PeerId，不存密码、不存种子
+struct CachedIdentity {
+    name: String,
+    birthday: String,
+    gender: char,
+    peer_id: String,
+}
+
+/// 派生信息（缓存写入与登录返回共用）
+struct IdentityInfo {
+    name: String,
+    birthday: String,
+    gender: char,
+}
+
+fn cache_dir() -> Result<PathBuf, String> {
+    if let Ok(dir) = std::env::var("P2P_ID_CACHE_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .ok_or_else(|| "无法确定用户主目录".to_string())?;
+    Ok(PathBuf::from(home).join(".p2p_rust_app"))
+}
+
+fn load_cached_identities() -> Vec<CachedIdentity> {
+    let dir = match cache_dir() {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut list = Vec::new();
+    for entry in entries.flatten() {
+        let content = match std::fs::read_to_string(entry.path()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut name = None;
+        let mut birthday = None;
+        let mut gender = None;
+        let mut peer_id = None;
+        for line in content.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                match k.trim() {
+                    "name" => name = Some(v.trim().to_string()),
+                    "birthday" => birthday = Some(v.trim().to_string()),
+                    "gender" => gender = v.trim().chars().next(),
+                    "peer_id" => peer_id = Some(v.trim().to_string()),
+                    _ => {}
+                }
+            }
+        }
+        if let (Some(name), Some(birthday), Some(gender), Some(peer_id)) =
+            (name, birthday, gender, peer_id)
+        {
+            list.push(CachedIdentity {
+                name,
+                birthday,
+                gender,
+                peer_id,
+            });
+        }
+    }
+    list.sort_by(|a, b| a.name.cmp(&b.name));
+    list
+}
+
+fn save_cached_identity(info: &IdentityInfo, peer_id: &PeerId) {
+    let dir = match cache_dir() {
+        Ok(d) => d,
+        Err(reason) => {
+            eprintln!("{}", format!("无法缓存身份: {reason}").yellow());
+            return;
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("{}", format!("创建缓存目录失败: {e}").yellow());
+        return;
+    }
+    let path = dir.join(format!("{peer_id}.id"));
+    let content = format!(
+        "name={}\nbirthday={}\ngender={}\npeer_id={peer_id}\n",
+        info.name, info.birthday, info.gender
+    );
+    match std::fs::write(&path, content) {
+        Ok(()) => println!("{}", format!("身份已缓存: {}", path.display()).dimmed()),
+        Err(e) => eprintln!("{}", format!("写入缓存失败: {e}").yellow()),
+    }
+}
+
+async fn read_line(stdin: &mut StdinLines, prompt: &str) -> Result<String, Box<dyn Error>> {
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    match stdin.next_line().await? {
+        Some(l) => Ok(l),
+        None => Err("输入结束".into()),
+    }
+}
+
+/// 读取密码：交互终端不回显（rpassword）；管道环境（测试/脚本）退回行读取
+async fn read_secret(
+    stdin: &mut StdinLines,
     interactive: bool,
-) -> Result<(Keypair, String), Box<dyn Error>> {
+    prompt: &str,
+) -> Result<String, Box<dyn Error>> {
+    if interactive {
+        Ok(rpassword::prompt_password(prompt)?)
+    } else {
+        read_line(stdin, prompt).await
+    }
+}
+
+/// 登录菜单：缓存身份选择（只输密码，派生后与缓存 PeerId 比对验证）或新身份登录（四项信息）。
+/// 返回 (密钥对, 派生信息, 是否新身份)；同 ID 冲突由调用方在探测后处理。
+async fn login_flow(
+    stdin: &mut StdinLines,
+    interactive: bool,
+) -> Result<(Keypair, IdentityInfo, bool), Box<dyn Error>> {
     loop {
-        print!("姓名: ");
-        std::io::stdout().flush()?;
-        let name = match stdin.next_line().await? {
-            Some(l) => l.trim().to_string(),
-            None => return Err("输入结束，无法登录".into()),
-        };
-        if name.is_empty() || name.len() > 64 {
-            eprintln!("{}", "姓名不能为空且不超过 64 字节".yellow());
-            continue;
-        }
-        print!("生日 (YYYY-MM-DD): ");
-        std::io::stdout().flush()?;
-        let birthday_raw = match stdin.next_line().await? {
-            Some(l) => l,
-            None => return Err("输入结束，无法登录".into()),
-        };
-        let birthday = match normalize_birthday(&birthday_raw) {
-            Ok(b) => b,
-            Err(reason) => {
-                eprintln!("{}", reason.yellow());
-                continue;
-            }
-        };
-        print!("性别 (男/M 女/F 保密/O): ");
-        std::io::stdout().flush()?;
-        let gender_raw = match stdin.next_line().await? {
-            Some(l) => l,
-            None => return Err("输入结束，无法登录".into()),
-        };
-        let gender = match normalize_gender(&gender_raw) {
-            Ok(g) => g,
-            Err(reason) => {
-                eprintln!("{}", reason.yellow());
-                continue;
-            }
-        };
-        let password = if interactive {
-            rpassword::prompt_password("密码: ")?
+        let cached = load_cached_identities();
+        println!("{}", "[角色登录]".green());
+        let choice = if cached.is_empty() {
+            println!("{}", "暂无缓存身份，进入新身份登录".dimmed());
+            0
         } else {
-            print!("密码: ");
-            std::io::stdout().flush()?;
-            match stdin.next_line().await? {
-                Some(l) => l,
-                None => return Err("输入结束，无法登录".into()),
+            println!("缓存身份:");
+            for (i, c) in cached.iter().enumerate() {
+                println!("  {}. {}  ({})", i + 1, c.name, c.peer_id);
+            }
+            println!("  0. 新身份登录");
+            let input = read_line(stdin, "请选择序号: ").await?;
+            match input.trim().parse::<usize>() {
+                Ok(n) if n <= cached.len() => n,
+                _ => {
+                    eprintln!("{}", "序号无效，请重新选择".yellow());
+                    continue;
+                }
             }
         };
-        if password.is_empty() || password.len() > 128 {
-            eprintln!("{}", "密码不能为空且不超过 128 字节".yellow());
-            continue;
+
+        if choice == 0 {
+            let name = loop {
+                let raw = read_line(stdin, "姓名: ").await?;
+                let name = raw.trim().to_string();
+                if name.is_empty() || name.len() > 64 {
+                    eprintln!("{}", "姓名不能为空且不超过 64 字节".yellow());
+                } else {
+                    break name;
+                }
+            };
+            let birthday = loop {
+                let raw = read_line(stdin, "生日 (YYYY-MM-DD): ").await?;
+                match normalize_birthday(&raw) {
+                    Ok(b) => break b,
+                    Err(reason) => eprintln!("{}", reason.yellow()),
+                }
+            };
+            let gender = loop {
+                let raw = read_line(stdin, "性别 (男/M 女/F 保密/O): ").await?;
+                match normalize_gender(&raw) {
+                    Ok(g) => break g,
+                    Err(reason) => eprintln!("{}", reason.yellow()),
+                }
+            };
+            let password = loop {
+                let pwd = read_secret(stdin, interactive, "密码: ").await?;
+                if pwd.is_empty() || pwd.len() > 128 {
+                    eprintln!("{}", "密码不能为空且不超过 128 字节".yellow());
+                } else {
+                    break pwd;
+                }
+            };
+            println!("{}", "正在派生角色身份...".dimmed());
+            match derive_identity(&name, &birthday, gender, &password) {
+                Ok(kp) => {
+                    return Ok((kp, IdentityInfo { name, birthday, gender }, true));
+                }
+                Err(reason) => {
+                    eprintln!("{}", reason.red());
+                    continue;
+                }
+            }
+        } else {
+            let entry = &cached[choice - 1];
+            for _ in 0..3 {
+                let password = read_secret(stdin, interactive, "密码: ").await?;
+                if password.is_empty() || password.len() > 128 {
+                    eprintln!("{}", "密码不能为空且不超过 128 字节".yellow());
+                    continue;
+                }
+                println!("{}", "正在派生角色身份...".dimmed());
+                match derive_identity(&entry.name, &entry.birthday, entry.gender, &password) {
+                    Ok(kp) if kp.public().to_peer_id().to_string() == entry.peer_id => {
+                        return Ok((
+                            kp,
+                            IdentityInfo {
+                                name: entry.name.clone(),
+                                birthday: entry.birthday.clone(),
+                                gender: entry.gender,
+                            },
+                            false,
+                        ));
+                    }
+                    Ok(_) => {
+                        eprintln!("{}", "密码错误（派生身份与缓存不符），请重试".red());
+                    }
+                    Err(reason) => {
+                        eprintln!("{}", reason.red());
+                    }
+                }
+            }
+            eprintln!("{}", "连续多次密码错误，返回选择菜单".yellow());
         }
-        println!("{}", "正在派生角色身份...".dimmed());
-        match derive_identity(&name, &birthday, gender, &password) {
-            Ok(kp) => return Ok((kp, name)),
-            Err(reason) => {
-                eprintln!("{}", reason.red());
-                continue;
+    }
+}
+
+/// 影子探测：用一次性随机身份（仅 mDNS，不监听不聊天）探测局域网内是否已存在
+/// 与真实 ID 相同的节点。libp2p 的 mDNS 库会把与"本机身份"同 PeerId 的节点
+/// 过滤掉（behaviour/iface/query.rs 的 filter），因此必须借影子身份绕过。
+async fn probe_duplicate_id(
+    real_id: PeerId,
+    window: Duration,
+) -> Result<Option<Multiaddr>, Box<dyn Error>> {
+    let mut probe_swarm = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
+        .with_behaviour(|key| {
+            let peer_id = key.public().to_peer_id();
+            mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        })?
+        .build();
+    println!(
+        "{}",
+        format!(
+            "正在探测局域网内是否存在同 ID 节点（{} 秒）...",
+            window.as_secs()
+        )
+        .dimmed()
+    );
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return Ok(None),
+            event = probe_swarm.select_next_some() => {
+                if let SwarmEvent::Behaviour(mdns::Event::Discovered(list)) = event {
+                    if let Some((_, addr)) = list.iter().find(|(p, _)| *p == real_id) {
+                        return Ok(Some(addr.clone()));
+                    }
+                }
             }
         }
     }
+}
+
+fn probe_window() -> Duration {
+    std::env::var("P2P_ID_PROBE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(5))
+}
+
+fn build_swarm(keypair: Keypair) -> Result<Swarm<NodeBehaviour>, Box<dyn Error>> {
+    let swarm = SwarmBuilder::with_existing_identity(keypair)
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
+        .with_behaviour(|key| {
+            let peer_id = key.public().to_peer_id();
+            Ok(NodeBehaviour {
+                mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?,
+                ping: ping::Behaviour::default(),
+                chat: request_response::cbor::Behaviour::new(
+                    [(StreamProtocol::new("/chat/4.0.0"), ProtocolSupport::Full)],
+                    request_response::Config::default(),
+                ),
+            })
+        })?
+        .build();
+    Ok(swarm)
 }
 
 pub fn run() {
@@ -336,33 +567,40 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
     let interactive = std::io::stdin().is_terminal();
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
 
-    println!("{}", "[角色登录]".green());
-    let (keypair, my_name) = login(&mut stdin, interactive).await?;
-    let local_id = keypair.public().to_peer_id();
-    println!(
-        "{}",
-        format!("登录成功: {my_name} (节点ID {local_id})").green()
-    );
-
-    let mut swarm = SwarmBuilder::with_existing_identity(keypair)
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
-        .with_behaviour(|key| {
-            let peer_id = key.public().to_peer_id();
-            Ok(NodeBehaviour {
-                mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?,
-                ping: ping::Behaviour::default(),
-                chat: request_response::cbor::Behaviour::new(
-                    [(StreamProtocol::new("/chat/4.0.0"), ProtocolSupport::Full)],
-                    request_response::Config::default(),
-                ),
-            })
-        })?
-        .build();
+    // 登录 + 影子探测；ID 冲突时退回重新选择身份
+    let (mut swarm, my_name) = loop {
+        let (keypair, info, is_new) = login_flow(&mut stdin, interactive).await?;
+        let real_id = keypair.public().to_peer_id();
+        println!(
+            "{}",
+            format!("登录成功: {} (节点ID {real_id})", info.name).green()
+        );
+        match probe_duplicate_id(real_id, probe_window()).await? {
+            Some(addr) => {
+                eprintln!(
+                    "{}",
+                    format!("该角色 ID 已在线（发现于 {addr}），同一 ID 不能同时上线").red()
+                );
+                eprintln!(
+                    "{}",
+                    "请改用其他身份，或先关闭占用该 ID 的设备后重试".yellow()
+                );
+            }
+            None => {
+                if is_new {
+                    let answer = read_line(
+                        &mut stdin,
+                        "是否在本机缓存该身份（下次免输姓名/生日/性别）? (y/n): ",
+                    )
+                    .await?;
+                    if answer.trim().eq_ignore_ascii_case("y") {
+                        save_cached_identity(&info, &real_id);
+                    }
+                }
+                break (build_swarm(keypair)?, info.name);
+            }
+        }
+    };
 
     let listen_addr: Multiaddr = "/ip4/0.0.0.0/tcp/0".parse()?;
     swarm.listen_on(listen_addr)?;
@@ -899,5 +1137,24 @@ mod tests {
     fn reject_bad_peer_id() {
         let e = parse_dial_addr("/ip4/1.2.3.4/tcp/1/p2p/not-a-peer-id").unwrap_err();
         assert!(e.contains("节点ID无效"));
+    }
+
+    #[test]
+    fn birthday_normalization() {
+        assert_eq!(normalize_birthday("1990-1-1").unwrap(), "1990-01-01");
+        assert_eq!(normalize_birthday(" 2000-12-05 ").unwrap(), "2000-12-05");
+        assert!(normalize_birthday("1990/1/1").is_err());
+        assert!(normalize_birthday("1899-01-01").is_err());
+        assert!(normalize_birthday("1990-13-01").is_err());
+        assert!(normalize_birthday("1990-01-32").is_err());
+    }
+
+    #[test]
+    fn gender_normalization() {
+        assert_eq!(normalize_gender("男").unwrap(), 'M');
+        assert_eq!(normalize_gender("m").unwrap(), 'M');
+        assert_eq!(normalize_gender("女").unwrap(), 'F');
+        assert_eq!(normalize_gender("保密").unwrap(), 'O');
+        assert!(normalize_gender("x").is_err());
     }
 }
