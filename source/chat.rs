@@ -1,3 +1,8 @@
+use bip39::Mnemonic;
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Key, Nonce,
+};
 use colored::Colorize;
 use futures::StreamExt;
 use libp2p::{
@@ -6,8 +11,8 @@ use libp2p::{
     swarm::SwarmEvent,
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io::{IsTerminal, Write};
@@ -44,10 +49,14 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 const BYE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Argon2id 派生参数（v1 常量：参数是角色 ID 的一部分，改动将导致所有 ID 变更）
+/// Argon2id KDF 参数（仅用于本地 keystore 加密；逐文件记录，可独立升级，不再绑定身份）
 const ARGON2_M_KIB: u32 = 19456;
 const ARGON2_T: u32 = 2;
 const ARGON2_P: u32 = 1;
+
+/// 新身份助记词词数（12 词 = 128 bit 熵）与抄写确认词数
+const MNEMONIC_WORD_COUNT: usize = 12;
+const MNEMONIC_CONFIRM_WORDS: usize = 3;
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct NodeBehaviour {
@@ -62,6 +71,7 @@ enum ChatAction {
     Dial(Multiaddr),
     Chat(String),
     List,
+    Backup,
 }
 
 struct ChatCtx {
@@ -166,6 +176,8 @@ fn build_tree() -> CmdTree<ChatCtx> {
     tree.set_help(quit, "退出聊天");
     let q = tree.register(ROOT, "q", |ctx, _| ctx.action = ChatAction::Quit);
     tree.set_help(q, "退出聊天");
+    let backup = tree.register(ROOT, "backup", |ctx, _| ctx.action = ChatAction::Backup);
+    tree.set_help(backup, "重新查看本身份助记词（需输入密码）");
     tree
 }
 
@@ -230,43 +242,104 @@ fn normalize_gender(raw: &str) -> Result<char, String> {
     }
 }
 
-/// 角色身份派生：salt = SHA-256(姓名|生日|性别)，seed = Argon2id(密码, salt)，
-/// 再由 32 字节种子确定性生成 Ed25519 密钥对。同样的信息在任何机器登录都得到同一 ID。
-fn derive_identity(
-    name: &str,
-    birthday: &str,
-    gender: char,
-    password: &str,
-) -> Result<Keypair, String> {
-    let salt: [u8; 32] =
-        Sha256::digest(format!("{name}|{birthday}|{gender}").as_bytes()).into();
-    let params = argon2::Params::new(ARGON2_M_KIB, ARGON2_T, ARGON2_P, Some(32))
-        .map_err(|e| format!("Argon2 参数错误: {e}"))?;
-    let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-    let mut seed = [0u8; 32];
-    argon2
-        .hash_password_into(password.as_bytes(), &salt, &mut seed)
-        .map_err(|e| format!("密钥派生失败: {e}"))?;
+/// 助记词 → 32 字节 Ed25519 种子（BIP39 PBKDF2 输出取前 32 字节）
+fn seed_from_mnemonic(phrase: &str) -> Result<[u8; 32], String> {
+    let mnemonic = Mnemonic::parse(phrase.trim())
+        .map_err(|_| "助记词无效（须为 12 个标准英文词，空格分隔）".to_string())?;
+    let seed = mnemonic.to_seed("");
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&seed[..32]);
+    Ok(out)
+}
+
+fn keypair_from_seed(seed: [u8; 32]) -> Result<Keypair, String> {
     Keypair::ed25519_from_bytes(seed).map_err(|e| format!("生成密钥失败: {e}"))
 }
 
-/// 角色登录：收集四项信息并派生身份。交互终端下密码不回显（rpassword）；
-/// stdin 被管道接管时（测试/脚本）退回普通行读取。输入不合法循环重问。
-type StdinLines = tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>;
-
-/// 缓存身份条目：只存公开盐信息与派生结果 PeerId，不存密码、不存种子
-struct CachedIdentity {
-    name: String,
-    birthday: String,
-    gender: char,
-    peer_id: String,
+/// 助记词 → 确定性 Ed25519 密钥对（同一助记词在任何机器派生同一身份）
+fn keypair_from_mnemonic(phrase: &str) -> Result<Keypair, String> {
+    keypair_from_seed(seed_from_mnemonic(phrase)?)
 }
 
-/// 派生信息（缓存写入与登录返回共用）
+/// 生成新身份助记词（12 词 = 128 bit 熵）
+fn generate_mnemonic() -> Result<String, String> {
+    Mnemonic::generate_in_with(&mut OsRng, bip39::Language::English, MNEMONIC_WORD_COUNT)
+        .map(|m| m.to_string())
+        .map_err(|e| format!("生成助记词失败: {e}"))
+}
+
+/// 由密码派生 keystore 加密密钥（Argon2id）
+fn kdf_key(password: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<[u8; 32], String> {
+    let params = argon2::Params::new(m, t, p, Some(32)).map_err(|e| format!("Argon2 参数错误: {e}"))?;
+    let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let mut key = [0u8; 32];
+    argon2
+        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .map_err(|e| format!("密钥派生失败: {e}"))?;
+    Ok(key)
+}
+
+/// 加密助记词 → (密文, salt, nonce)。Argon2id 派生密钥 + ChaCha20-Poly1305 认证加密
+fn encrypt_mnemonic(
+    mnemonic: &str,
+    password: &str,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    let key = kdf_key(password, &salt, ARGON2_M_KIB, ARGON2_T, ARGON2_P)?;
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), mnemonic.as_bytes())
+        .map_err(|e| format!("加密失败: {e}"))?;
+    Ok((ciphertext, salt.to_vec(), nonce.to_vec()))
+}
+
+/// 解密助记词；密码错误返回"密码错误"，密文被篡改也会失败（AEAD 完整性）
+fn decrypt_mnemonic(
+    password: &str,
+    salt: &[u8],
+    nonce: &[u8],
+    enc: &[u8],
+    m: u32,
+    t: u32,
+    p: u32,
+) -> Result<String, String> {
+    let key = kdf_key(password, salt, m, t, p)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let plain = cipher
+        .decrypt(Nonce::from_slice(nonce), enc)
+        .map_err(|_| "密码错误".to_string())?;
+    String::from_utf8(plain).map_err(|_| "keystore 数据损坏".to_string())
+}
+
+/// 输入行迭代器（stdin 被管道接管时逐行读取）
+type StdinLines = tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>;
+
+/// 本地 keystore：明文头只含公开资料与 KDF/密文参数，
+/// 私密部分（身份助记词）用密码派生的密钥加密存放
+struct Keystore {
+    peer_id: String,
+    salt: Vec<u8>,
+    nonce: Vec<u8>,
+    enc: Vec<u8>,
+    kdf_m: u32,
+    kdf_t: u32,
+    kdf_p: u32,
+}
+
+/// 资料信息（姓名/生日/性别）：绑定在密钥上的元数据，不再参与身份派生
 struct IdentityInfo {
     name: String,
     birthday: String,
     gender: char,
+}
+
+/// 登录结果
+struct LoginOutcome {
+    keypair: Keypair,
+    info: IdentityInfo,
 }
 
 fn cache_dir() -> Result<PathBuf, String> {
@@ -279,7 +352,8 @@ fn cache_dir() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".p2p_rust_app"))
 }
 
-fn load_cached_identities() -> Vec<CachedIdentity> {
+/// 读取目录下全部 keystore（明文头 + 密文参数），损坏条目跳过
+fn load_keystores() -> Vec<(Keystore, IdentityInfo)> {
     let dir = match cache_dir() {
         Ok(d) => d,
         Err(_) => return Vec::new(),
@@ -290,61 +364,107 @@ fn load_cached_identities() -> Vec<CachedIdentity> {
     };
     let mut list = Vec::new();
     for entry in entries.flatten() {
-        let content = match std::fs::read_to_string(entry.path()) {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("key") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(_) => continue,
         };
-        let mut name = None;
-        let mut birthday = None;
-        let mut gender = None;
-        let mut peer_id = None;
+        let mut field: HashMap<String, String> = HashMap::new();
         for line in content.lines() {
             if let Some((k, v)) = line.split_once('=') {
-                match k.trim() {
-                    "name" => name = Some(v.trim().to_string()),
-                    "birthday" => birthday = Some(v.trim().to_string()),
-                    "gender" => gender = v.trim().chars().next(),
-                    "peer_id" => peer_id = Some(v.trim().to_string()),
-                    _ => {}
-                }
+                field.insert(k.trim().to_string(), v.trim().to_string());
             }
         }
-        if let (Some(name), Some(birthday), Some(gender), Some(peer_id)) =
-            (name, birthday, gender, peer_id)
-        {
-            list.push(CachedIdentity {
+        let need = |k: &str| field.get(k).cloned();
+        let (Some(name), Some(birthday), Some(gender), Some(peer_id), Some(salt), Some(nonce), Some(enc)) =
+            (
+                need("name"),
+                need("birthday"),
+                need("gender"),
+                need("peer_id"),
+                need("salt"),
+                need("nonce"),
+                need("enc"),
+            )
+        else {
+            continue;
+        };
+        let (Some(salt_b), Some(nonce_b), Some(enc_b)) =
+            (hex::decode(&salt).ok(), hex::decode(&nonce).ok(), hex::decode(&enc).ok())
+        else {
+            continue;
+        };
+        let Some(gender_c) = gender.chars().next() else {
+            continue;
+        };
+        let kdf_m = field
+            .get("kdf_m")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(ARGON2_M_KIB);
+        let kdf_t = field
+            .get("kdf_t")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(ARGON2_T);
+        let kdf_p = field
+            .get("kdf_p")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(ARGON2_P);
+        list.push((
+            Keystore {
+                peer_id,
+                salt: salt_b,
+                nonce: nonce_b,
+                enc: enc_b,
+                kdf_m,
+                kdf_t,
+                kdf_p,
+            },
+            IdentityInfo {
                 name,
                 birthday,
-                gender,
-                peer_id,
-            });
-        }
+                gender: gender_c,
+            },
+        ));
     }
-    list.sort_by(|a, b| a.name.cmp(&b.name));
+    list.sort_by(|a, b| a.1.name.cmp(&b.1.name));
     list
 }
 
-fn save_cached_identity(info: &IdentityInfo, peer_id: &PeerId) {
-    let dir = match cache_dir() {
-        Ok(d) => d,
-        Err(reason) => {
-            eprintln!("{}", format!("无法缓存身份: {reason}").yellow());
-            return;
-        }
-    };
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("{}", format!("创建缓存目录失败: {e}").yellow());
-        return;
-    }
-    let path = dir.join(format!("{peer_id}.id"));
+/// 加密保存 keystore（自动落盘；明文头含公开资料，私密助记词加密）
+fn save_keystore(
+    info: &IdentityInfo,
+    peer_id: &PeerId,
+    mnemonic: &str,
+    password: &str,
+) -> Result<(), String> {
+    let dir = cache_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建缓存目录失败: {e}"))?;
+    let (ciphertext, salt, nonce) = encrypt_mnemonic(mnemonic, password)?;
+    let path = dir.join(format!("{peer_id}.key"));
     let content = format!(
-        "name={}\nbirthday={}\ngender={}\npeer_id={peer_id}\n",
-        info.name, info.birthday, info.gender
+        "format=1\nname={}\nbirthday={}\ngender={}\npeer_id={peer_id}\n\
+         kdf_m={ARGON2_M_KIB}\nkdf_t={ARGON2_T}\nkdf_p={ARGON2_P}\n\
+         salt={}\nnonce={}\nenc={}\n",
+        info.name,
+        info.birthday,
+        info.gender,
+        hex::encode(&salt),
+        hex::encode(&nonce),
+        hex::encode(&ciphertext)
     );
-    match std::fs::write(&path, content) {
-        Ok(()) => println!("{}", format!("身份已缓存: {}", path.display()).dimmed()),
-        Err(e) => eprintln!("{}", format!("写入缓存失败: {e}").yellow()),
-    }
+    std::fs::write(&path, content).map_err(|e| format!("写入 keystore 失败: {e}"))?;
+    println!(
+        "{}",
+        format!("身份已保存（加密）: {}", path.display()).dimmed()
+    );
+    Ok(())
+}
+
+fn valid_password(pwd: &str) -> bool {
+    (8..=128).contains(&pwd.len())
 }
 
 async fn read_line(stdin: &mut StdinLines, prompt: &str) -> Result<String, Box<dyn Error>> {
@@ -369,106 +489,182 @@ async fn read_secret(
     }
 }
 
-/// 登录菜单：缓存身份选择（只输密码，派生后与缓存 PeerId 比对验证）或新身份登录（四项信息）。
-/// 返回 (密钥对, 派生信息, 是否新身份)；同 ID 冲突由调用方在探测后处理。
+/// 交互收集资料信息（姓名/生日/性别）
+async fn prompt_profile(stdin: &mut StdinLines) -> Result<IdentityInfo, Box<dyn Error>> {
+    let name = loop {
+        let raw = read_line(stdin, "姓名: ").await?;
+        let name = raw.trim().to_string();
+        if name.is_empty() || name.len() > 64 {
+            eprintln!("{}", "姓名不能为空且不超过 64 字节".yellow());
+        } else {
+            break name;
+        }
+    };
+    let birthday = loop {
+        let raw = read_line(stdin, "生日 (YYYY-MM-DD): ").await?;
+        match normalize_birthday(&raw) {
+            Ok(b) => break b,
+            Err(reason) => eprintln!("{}", reason.yellow()),
+        }
+    };
+    let gender = loop {
+        let raw = read_line(stdin, "性别 (男/M 女/F 保密/O): ").await?;
+        match normalize_gender(&raw) {
+            Ok(g) => break g,
+            Err(reason) => eprintln!("{}", reason.yellow()),
+        }
+    };
+    Ok(IdentityInfo {
+        name,
+        birthday,
+        gender,
+    })
+}
+
+/// 交互收集并校验密码
+async fn prompt_password(
+    stdin: &mut StdinLines,
+    interactive: bool,
+) -> Result<String, Box<dyn Error>> {
+    loop {
+        let pwd = read_secret(stdin, interactive, "密码: ").await?;
+        if valid_password(&pwd) {
+            return Ok(pwd);
+        }
+        eprintln!("{}", "密码须为 8~128 字节".yellow());
+    }
+}
+
+/// 展示助记词与安全提示
+fn print_mnemonic_guide(phrase: &str) {
+    println!("{}", "=".repeat(60).yellow());
+    println!(
+        "{}",
+        "你的身份助记词（12 词，唯一备份；丢失即永久丢失身份，泄露即身份被窃取）:".yellow()
+    );
+    println!("{}", phrase.red());
+    println!("{}", "=".repeat(60).yellow());
+}
+
+/// 登录流程：新身份生成 / 助记词恢复 / 缓存 keystore 解锁。
+/// 新身份与恢复都会自动加密保存 keystore；同 ID 冲突由调用方在探测后处理。
 async fn login_flow(
     stdin: &mut StdinLines,
     interactive: bool,
-) -> Result<(Keypair, IdentityInfo, bool), Box<dyn Error>> {
+) -> Result<LoginOutcome, Box<dyn Error>> {
     loop {
-        let cached = load_cached_identities();
+        let cached = load_keystores();
         println!("{}", "[角色登录]".green());
-        let choice = if cached.is_empty() {
-            println!("{}", "暂无缓存身份，进入新身份登录".dimmed());
-            0
+        if cached.is_empty() {
+            println!("{}", "暂无本地身份".dimmed());
         } else {
             println!("缓存身份:");
-            for (i, c) in cached.iter().enumerate() {
-                println!("  {}. {}  ({})", i + 1, c.name, c.peer_id);
+            for (i, (ks, info)) in cached.iter().enumerate() {
+                println!("  {}. {}  ({})", i + 1, info.name, ks.peer_id);
             }
-            println!("  0. 新身份登录");
-            let input = read_line(stdin, "请选择序号: ").await?;
-            match input.trim().parse::<usize>() {
-                Ok(n) if n <= cached.len() => n,
-                _ => {
-                    eprintln!("{}", "序号无效，请重新选择".yellow());
-                    continue;
-                }
-            }
-        };
+        }
+        println!("  0. 新身份登录");
+        println!("  r. 从助记词恢复");
+        let input = read_line(stdin, "请选择: ").await?;
+        let input = input.trim();
 
-        if choice == 0 {
-            let name = loop {
-                let raw = read_line(stdin, "姓名: ").await?;
-                let name = raw.trim().to_string();
-                if name.is_empty() || name.len() > 64 {
-                    eprintln!("{}", "姓名不能为空且不超过 64 字节".yellow());
-                } else {
-                    break name;
+        if input == "0" {
+            // 新身份：生成助记词，展示一次并要求抄写确认
+            let info = prompt_profile(stdin).await?;
+            let phrase = loop {
+                let phrase = match generate_mnemonic() {
+                    Ok(p) => p,
+                    Err(reason) => {
+                        eprintln!("{}", reason.red());
+                        continue;
+                    }
+                };
+                print_mnemonic_guide(&phrase);
+                let confirm = read_line(
+                    stdin,
+                    &format!("请抄下助记词，输入前 {MNEMONIC_CONFIRM_WORDS} 个词确认: "),
+                )
+                .await?;
+                let first: Vec<&str> = phrase
+                    .split_whitespace()
+                    .take(MNEMONIC_CONFIRM_WORDS)
+                    .collect();
+                let got: Vec<&str> = confirm.split_whitespace().collect();
+                if got.len() >= MNEMONIC_CONFIRM_WORDS
+                    && got[..MNEMONIC_CONFIRM_WORDS] == first[..]
+                {
+                    break phrase;
                 }
+                eprintln!("{}", "确认词不匹配，请重新抄写".yellow());
             };
-            let birthday = loop {
-                let raw = read_line(stdin, "生日 (YYYY-MM-DD): ").await?;
-                match normalize_birthday(&raw) {
-                    Ok(b) => break b,
-                    Err(reason) => eprintln!("{}", reason.yellow()),
-                }
-            };
-            let gender = loop {
-                let raw = read_line(stdin, "性别 (男/M 女/F 保密/O): ").await?;
-                match normalize_gender(&raw) {
-                    Ok(g) => break g,
-                    Err(reason) => eprintln!("{}", reason.yellow()),
-                }
-            };
-            let password = loop {
-                let pwd = read_secret(stdin, interactive, "密码: ").await?;
-                if pwd.is_empty() || pwd.len() > 128 {
-                    eprintln!("{}", "密码不能为空且不超过 128 字节".yellow());
-                } else {
-                    break pwd;
-                }
-            };
-            println!("{}", "正在派生角色身份...".dimmed());
-            match derive_identity(&name, &birthday, gender, &password) {
-                Ok(kp) => {
-                    return Ok((kp, IdentityInfo { name, birthday, gender }, true));
-                }
+            let password = prompt_password(stdin, interactive).await?;
+            let keypair = keypair_from_mnemonic(&phrase)?;
+            let peer_id = keypair.public().to_peer_id();
+            save_keystore(&info, &peer_id, &phrase, &password)?;
+            return Ok(LoginOutcome { keypair, info });
+        } else if input == "r" {
+            // 从助记词恢复身份（跨设备迁移 / 备份恢复）
+            let phrase = read_line(stdin, "助记词（12 个英文词，空格分隔）: ").await?;
+            let keypair = match keypair_from_mnemonic(&phrase) {
+                Ok(kp) => kp,
                 Err(reason) => {
                     eprintln!("{}", reason.red());
                     continue;
                 }
+            };
+            let info = prompt_profile(stdin).await?;
+            let password = prompt_password(stdin, interactive).await?;
+            let peer_id = keypair.public().to_peer_id();
+            save_keystore(&info, &peer_id, &phrase, &password)?;
+            return Ok(LoginOutcome { keypair, info });
+        } else if let Ok(n) = input.parse::<usize>() {
+            if n >= 1 && n <= cached.len() {
+                // 缓存解锁：密码错误最多重试 3 次
+                let (ks, info) = &cached[n - 1];
+                for _ in 0..3 {
+                    let password = read_secret(stdin, interactive, "密码: ").await?;
+                    if !valid_password(&password) {
+                        eprintln!("{}", "密码须为 8~128 字节".yellow());
+                        continue;
+                    }
+                    match decrypt_mnemonic(
+                        &password,
+                        &ks.salt,
+                        &ks.nonce,
+                        &ks.enc,
+                        ks.kdf_m,
+                        ks.kdf_t,
+                        ks.kdf_p,
+                    ) {
+                        Ok(phrase) => match keypair_from_mnemonic(&phrase) {
+                            Ok(kp) if kp.public().to_peer_id().to_string() == ks.peer_id => {
+                                return Ok(LoginOutcome {
+                                    keypair: kp,
+                                    info: IdentityInfo {
+                                        name: info.name.clone(),
+                                        birthday: info.birthday.clone(),
+                                        gender: info.gender,
+                                    },
+                                });
+                            }
+                            Ok(_) => {
+                                eprintln!("{}", "keystore 与派生身份不符，数据可能损坏".red());
+                            }
+                            Err(reason) => {
+                                eprintln!("{}", reason.red());
+                            }
+                        },
+                        Err(reason) => {
+                            eprintln!("{}", reason.red());
+                        }
+                    }
+                }
+                eprintln!("{}", "连续多次密码错误，返回选择菜单".yellow());
+            } else {
+                eprintln!("{}", "序号无效，请重新选择".yellow());
             }
         } else {
-            let entry = &cached[choice - 1];
-            for _ in 0..3 {
-                let password = read_secret(stdin, interactive, "密码: ").await?;
-                if password.is_empty() || password.len() > 128 {
-                    eprintln!("{}", "密码不能为空且不超过 128 字节".yellow());
-                    continue;
-                }
-                println!("{}", "正在派生角色身份...".dimmed());
-                match derive_identity(&entry.name, &entry.birthday, entry.gender, &password) {
-                    Ok(kp) if kp.public().to_peer_id().to_string() == entry.peer_id => {
-                        return Ok((
-                            kp,
-                            IdentityInfo {
-                                name: entry.name.clone(),
-                                birthday: entry.birthday.clone(),
-                                gender: entry.gender,
-                            },
-                            false,
-                        ));
-                    }
-                    Ok(_) => {
-                        eprintln!("{}", "密码错误（派生身份与缓存不符），请重试".red());
-                    }
-                    Err(reason) => {
-                        eprintln!("{}", reason.red());
-                    }
-                }
-            }
-            eprintln!("{}", "连续多次密码错误，返回选择菜单".yellow());
+            eprintln!("{}", "无效选择，请输入序号、0 或 r".yellow());
         }
     }
 }
@@ -569,11 +765,11 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
 
     // 登录 + 影子探测；ID 冲突时退回重新选择身份
     let (mut swarm, my_name) = loop {
-        let (keypair, info, is_new) = login_flow(&mut stdin, interactive).await?;
-        let real_id = keypair.public().to_peer_id();
+        let outcome = login_flow(&mut stdin, interactive).await?;
+        let real_id = outcome.keypair.public().to_peer_id();
         println!(
             "{}",
-            format!("登录成功: {} (节点ID {real_id})", info.name).green()
+            format!("登录成功: {} (节点ID {real_id})", outcome.info.name).green()
         );
         match probe_duplicate_id(real_id, probe_window()).await? {
             Some(addr) => {
@@ -586,19 +782,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                     "请改用其他身份，或先关闭占用该 ID 的设备后重试".yellow()
                 );
             }
-            None => {
-                if is_new {
-                    let answer = read_line(
-                        &mut stdin,
-                        "是否在本机缓存该身份（下次免输姓名/生日/性别）? (y/n): ",
-                    )
-                    .await?;
-                    if answer.trim().eq_ignore_ascii_case("y") {
-                        save_cached_identity(&info, &real_id);
-                    }
-                }
-                break (build_swarm(keypair)?, info.name);
-            }
+            None => break (build_swarm(outcome.keypair)?, outcome.info.name),
         }
     };
 
@@ -798,6 +982,40 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     };
                                     println!("  {who}  {id_str}  [{state}]  地址数 {addr_n}");
                                 }
+                            }
+                        }
+                        ChatAction::Backup => {
+                            let my_id = swarm.local_peer_id().to_string();
+                            let stored = load_keystores();
+                            if let Some((ks, _)) =
+                                stored.iter().find(|(k, _)| k.peer_id == my_id)
+                            {
+                                println!("{}", "请输入密码以解锁本身份".yellow());
+                                let password =
+                                    read_secret(&mut stdin, interactive, "密码: ").await?;
+                                match decrypt_mnemonic(
+                                    &password,
+                                    &ks.salt,
+                                    &ks.nonce,
+                                    &ks.enc,
+                                    ks.kdf_m,
+                                    ks.kdf_t,
+                                    ks.kdf_p,
+                                ) {
+                                    Ok(phrase) => {
+                                        print_mnemonic_guide(&phrase);
+                                        println!(
+                                            "{}",
+                                            "助记词是唯一备份，请妥善保管".dimmed()
+                                        );
+                                    }
+                                    Err(reason) => eprintln!("{}", reason.red()),
+                                }
+                            } else {
+                                eprintln!(
+                                    "{}",
+                                    "未找到本身份的 keystore（身份未在本机加密保存过）".yellow()
+                                );
                             }
                         }
                         ChatAction::None => {}
@@ -1156,5 +1374,76 @@ mod tests {
         assert_eq!(normalize_gender("女").unwrap(), 'F');
         assert_eq!(normalize_gender("保密").unwrap(), 'O');
         assert!(normalize_gender("x").is_err());
+    }
+
+    /// BIP39 官方测试向量助记词（仅测试用）
+    const MNEMONIC_A: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const MNEMONIC_B: &str =
+        "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
+    #[test]
+    fn mnemonic_identity_deterministic() {
+        let ka = keypair_from_mnemonic(MNEMONIC_A).unwrap();
+        let ka2 = keypair_from_mnemonic(MNEMONIC_A).unwrap();
+        let kb = keypair_from_mnemonic(MNEMONIC_B).unwrap();
+        assert_eq!(ka.public().to_peer_id(), ka2.public().to_peer_id());
+        assert_ne!(ka.public().to_peer_id(), kb.public().to_peer_id());
+    }
+
+    #[test]
+    fn mnemonic_invalid_rejected() {
+        assert!(seed_from_mnemonic("this is not a valid bip39 phrase").is_err());
+        assert!(seed_from_mnemonic("").is_err());
+        assert!(keypair_from_mnemonic(MNEMONIC_A).is_ok());
+    }
+
+    #[test]
+    fn generated_mnemonic_is_valid() {
+        let phrase = generate_mnemonic().unwrap();
+        let words: Vec<&str> = phrase.split_whitespace().collect();
+        assert_eq!(words.len(), MNEMONIC_WORD_COUNT);
+        assert!(keypair_from_mnemonic(&phrase).is_ok());
+    }
+
+    #[test]
+    fn keystore_encrypt_decrypt_roundtrip() {
+        let (enc, salt, nonce) = encrypt_mnemonic(MNEMONIC_A, "password-123").unwrap();
+        let out = decrypt_mnemonic(
+            "password-123",
+            &salt,
+            &nonce,
+            &enc,
+            ARGON2_M_KIB,
+            ARGON2_T,
+            ARGON2_P,
+        )
+        .unwrap();
+        assert_eq!(out, MNEMONIC_A);
+    }
+
+    #[test]
+    fn keystore_wrong_password_rejected() {
+        let (enc, salt, nonce) = encrypt_mnemonic(MNEMONIC_A, "password-123").unwrap();
+        let err = decrypt_mnemonic(
+            "wrong-password",
+            &salt,
+            &nonce,
+            &enc,
+            ARGON2_M_KIB,
+            ARGON2_T,
+            ARGON2_P,
+        )
+        .unwrap_err();
+        assert_eq!(err, "密码错误");
+    }
+
+    #[test]
+    fn password_length_rule() {
+        assert!(valid_password("12345678"));
+        assert!(valid_password(&"x".repeat(128)));
+        assert!(!valid_password("1234567"));
+        assert!(!valid_password(""));
+        assert!(!valid_password(&"x".repeat(129)));
     }
 }
