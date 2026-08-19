@@ -16,6 +16,7 @@
 !/.opencode/
 !/wish/
 
-# .opencode 下仅保留 skills
+# .opencode 下保留 skills 与 agent
 /.opencode/*
 !/.opencode/skills/
+!/.opencode/agent/
