@@ -66,12 +66,17 @@ struct Node {
 
 impl Node {
     fn spawn(bin: &str, cache_dir: &str) -> Self {
+        Self::spawn_with(bin, cache_dir, "advertise")
+    }
+
+    fn spawn_with(bin: &str, cache_dir: &str, discovery: &str) -> Self {
         let mut child = Command::new(bin)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("P2P_ID_CACHE_DIR", cache_dir)
             .env("P2P_ID_PROBE_SECS", "2")
+            .env("P2P_DISCOVERY", discovery)
             .spawn()
             .expect("启动节点失败");
         let (tx, rx) = mpsc::channel();
@@ -119,6 +124,25 @@ impl Node {
                     }
                 }
                 Err(_) => panic!("等待 '{needle}' 超时"),
+            }
+        }
+    }
+
+    /// 等待可选出现：限时内出现返回 Some，否则 None（用于断言"不应出现"）
+    fn wait_for_optional(&self, needle: &str, timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
+            match self.lines.recv_timeout(remaining) {
+                Ok(line) => {
+                    println!("  | {line}");
+                    if line.contains(needle) {
+                        return Some(line);
+                    }
+                }
+                Err(_) => return None,
             }
         }
     }
@@ -436,13 +460,52 @@ fn duplicate_id_scenario() {
     b.kill();
 }
 
+/// 场景7：发现模式——隐身节点只收不发：能发现别人但自己不广播（对端看不到它）
+fn discovery_mode_scenario() {
+    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache_a = scenario_cache_dir("s7_a");
+    let cache_b = scenario_cache_dir("s7_b");
+    let (cred_a, cred_b) = load_creds();
+    println!("=== 场景7: 隐身发现模式 ===");
+
+    println!("=== 启动隐身节点 A ===");
+    let mut a = Node::spawn_with(bin, &cache_a, "stealth");
+    a.wait_for("=== 主菜单 ===", Duration::from_secs(10));
+    login_restore(&mut a, &cred_a, MNEMONIC_USER1);
+    let a_listen = a.wait_for("监听地址: /ip4/127.0.0.1", Duration::from_secs(20));
+    let a_id = parse_peer_id(&a_listen);
+
+    println!("=== 启动广播节点 B ===");
+    let (mut b, b_listen) = spawn_into_chat(bin, &cache_b, &cred_b, MNEMONIC_USER2);
+    let b_id = parse_peer_id(&b_listen);
+    let b_addr = listen_addr(&b_listen);
+
+    println!("=== 隐身节点 A 应通过监听发现 B（libp2p-mdns 周期性组播自查自答）===");
+    a.send("/list");
+    a.wait_for(&b_id, Duration::from_secs(40));
+
+    println!("=== 广播节点 B 不应发现隐身节点 A（A 不广播）===");
+    b.send("/list");
+    let absent = b.wait_for_optional(&a_id, Duration::from_secs(8)).is_none();
+    assert!(absent, "广播节点不应发现隐身节点 {a_id}");
+
+    println!("=== A /dial B 手动直连仍可用 ===");
+    a.send(&format!("/dial {b_addr}"));
+    a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
+    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+
+    a.kill();
+    b.kill();
+}
+
 #[test]
 fn p2p_chat_e2e_suite() {
-    // 六场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
+    // 七场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
     basic_chat_scenario();
     chat_by_name_scenario();
     graceful_offline_online_scenario();
     kill_offline_online_scenario();
     cache_login_scenario();
     duplicate_id_scenario();
+    discovery_mode_scenario();
 }

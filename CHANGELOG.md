@@ -5,6 +5,28 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.0] - 2026-08-20
+
+### 新增
+
+- mDNS 发现模式（隐私最小化），`/discover advertise|stealth|off` 切换并持久化
+  （per-identity `settings_<节点ID>.json`），下次进入聊天生效；登录时打印当前模式；
+  测试可用 `P2P_DISCOVERY` 环境变量覆盖
+  - advertise（默认）：广播自身 + 发现他人（原行为）
+  - stealth 隐身：**只收不发**——自实现最小 mDNS 监听器（UDP 组播 224.0.0.251:5353，
+    解析 libp2p-mdns 组播响应中的 `dnsaddr=` TXT 记录），能发现他人，
+    但不对局域网广播本机在线状态/身份/地址
+  - off 关闭：完全禁用 mDNS，仅 `/dial` 手动直连
+- 单元测试新增 3 项：mDNS 报文 `dnsaddr=` TXT 解析、垃圾报文拒绝、发现模式解析
+- e2e 新增场景 7：隐身发现——隐身节点经监听发现广播节点，而广播节点看不到隐身节点，
+  手动 `/dial` 仍可直连
+
+### 变更
+
+- `NodeBehaviour` 的 mDNS 行为改用 libp2p `Toggle` 组合子按模式启停
+- mDNS 发现处理抽为 `on_peer_discovered`，广播发现与隐身监听共用
+- e2e 测试节点支持 `P2P_DISCOVERY` 启动环境（`Node::spawn_with`）
+
 ## [0.6.0] - 2026-08-20
 
 ### 新增

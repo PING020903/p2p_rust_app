@@ -8,6 +8,7 @@ use futures::StreamExt;
 use libp2p::{
     identity::Keypair, mdns, multiaddr::Protocol, noise, ping,
     request_response::{self, ProtocolSupport},
+    swarm::behaviour::toggle::Toggle,
     swarm::SwarmEvent,
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
@@ -23,6 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncBufReadExt;
 
 use crate::cmd_tree::{CmdError, CmdTree, ROOT};
+use crate::mdns_stealth::StealthMdns;
 
 /// 控制面：协议信令，静默处理，不作为聊天内容显示
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,9 +61,43 @@ const ARGON2_P: u32 = 1;
 const MNEMONIC_WORD_COUNT: usize = 12;
 const MNEMONIC_CONFIRM_WORDS: usize = 3;
 
+/// mDNS 发现模式：广播+发现 / 隐身（只收不发）/ 关闭
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryMode {
+    AdvertiseAndDiscover,
+    DiscoverOnly,
+    Off,
+}
+
+impl Default for DiscoveryMode {
+    fn default() -> Self {
+        DiscoveryMode::AdvertiseAndDiscover
+    }
+}
+
+impl DiscoveryMode {
+    fn parse(s: &str) -> Option<DiscoveryMode> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "advertise" | "ad" => Some(DiscoveryMode::AdvertiseAndDiscover),
+            "stealth" | "discover" | "listen" => Some(DiscoveryMode::DiscoverOnly),
+            "off" | "none" => Some(DiscoveryMode::Off),
+            _ => None,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            DiscoveryMode::AdvertiseAndDiscover => "advertise（广播+发现）",
+            DiscoveryMode::DiscoverOnly => "stealth（隐身：只发现不广播）",
+            DiscoveryMode::Off => "off（关闭 mDNS）",
+        }
+    }
+}
+
+/// mDNS 行为开关：Advertise 模式启用 libp2p-mdns；隐身/关闭模式用 Toggle 关闭
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct NodeBehaviour {
-    mdns: mdns::tokio::Behaviour,
+    mdns: Toggle<mdns::tokio::Behaviour>,
     ping: ping::Behaviour,
     chat: request_response::cbor::Behaviour<ChatRequest, ChatResponse>,
 }
@@ -74,6 +110,7 @@ enum ChatAction {
     List,
     Backup,
     Trust(String),
+    Discover(DiscoveryMode),
 }
 
 struct ChatCtx {
@@ -191,6 +228,26 @@ fn build_tree() -> CmdTree<ChatCtx> {
         ctx.action = ChatAction::Trust(args.join(" "));
     });
     tree.set_help(trust, "标记/取消信任联系人（! 前缀取消）");
+    let discover = tree.register(ROOT, "discover", |ctx, args| {
+        let mode = match args.first() {
+            Some(m) => match DiscoveryMode::parse(m) {
+                Some(v) => v,
+                None => {
+                    eprintln!(
+                        "{}",
+                        "发现模式须为 advertise / stealth / off".yellow()
+                    );
+                    return;
+                }
+            },
+            None => {
+                eprintln!("{}", "用法: /discover <advertise|stealth|off>".yellow());
+                return;
+            }
+        };
+        ctx.action = ChatAction::Discover(mode);
+    });
+    tree.set_help(discover, "设置 mDNS 发现模式（下次进入聊天生效）");
     tree
 }
 
@@ -214,6 +271,44 @@ fn dial_next_reconnect(
         eprintln!(
             "{}",
             "重连失败: 已知地址均无法连接，对方可能已退出".yellow()
+        );
+    }
+}
+
+/// 节点被发现（mDNS 广播 或 隐身监听）的公共处理：登记地址 + 待接呼叫自动拨号
+fn on_peer_discovered(
+    found_id: PeerId,
+    addr: Multiaddr,
+    local: &PeerId,
+    swarm: &mut Swarm<NodeBehaviour>,
+    known_addrs: &mut HashMap<PeerId, Vec<Multiaddr>>,
+    pending_chat: &mut Option<PeerId>,
+    reconnect_peer: &mut Option<PeerId>,
+    reconnect_pending: &mut Vec<Multiaddr>,
+    dialing: &mut HashSet<PeerId>,
+    conn_count: &HashMap<PeerId, u32>,
+) {
+    if found_id == *local {
+        return;
+    }
+    println!("{}", format!("mDNS 发现节点: {found_id}").cyan());
+    let recorded = known_addrs.entry(found_id).or_default();
+    if !recorded.contains(&addr) {
+        recorded.push(addr.clone());
+    }
+    if *pending_chat == Some(found_id)
+        && *reconnect_peer != Some(found_id)
+        && !conn_count.contains_key(&found_id)
+    {
+        println!("{}", format!("发现待接呼叫节点，拨号 {found_id}").cyan());
+        *reconnect_peer = Some(found_id);
+        *reconnect_pending = vec![addr];
+        dial_next_reconnect(
+            swarm,
+            dialing,
+            reconnect_peer,
+            reconnect_pending,
+            known_addrs,
         );
     }
 }
@@ -584,6 +679,40 @@ impl ContactBook {
     }
 }
 
+/// 读取发现模式：测试环境变量优先（P2P_DISCOVERY），否则读 per-identity 设置文件
+fn load_discovery_mode(peer_id: &PeerId) -> DiscoveryMode {
+    if let Ok(v) = std::env::var("P2P_DISCOVERY") {
+        return DiscoveryMode::parse(&v).unwrap_or_default();
+    }
+    let path = cache_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(format!("settings_{peer_id}.json"));
+    let mode = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            v.get("discovery_mode")
+                .and_then(|m| m.as_str())
+                .and_then(DiscoveryMode::parse)
+        });
+    mode.unwrap_or_default()
+}
+
+fn save_discovery_mode(peer_id: &PeerId, mode: DiscoveryMode) -> Result<(), String> {
+    let dir = cache_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    let path = dir.join(format!("settings_{peer_id}.json"));
+    let json = format!(
+        "{{\"discovery_mode\":\"{}\"}}",
+        match mode {
+            DiscoveryMode::AdvertiseAndDiscover => "advertise",
+            DiscoveryMode::DiscoverOnly => "stealth",
+            DiscoveryMode::Off => "off",
+        }
+    );
+    std::fs::write(&path, json).map_err(|e| format!("写入配置失败: {e}"))
+}
+
 async fn read_line(stdin: &mut StdinLines, prompt: &str) -> Result<String, Box<dyn Error>> {
     print!("{prompt}");
     std::io::stdout().flush()?;
@@ -838,7 +967,7 @@ fn probe_window() -> Duration {
         .unwrap_or(Duration::from_secs(5))
 }
 
-fn build_swarm(keypair: Keypair) -> Result<Swarm<NodeBehaviour>, Box<dyn Error>> {
+fn build_swarm(keypair: Keypair, mode: DiscoveryMode) -> Result<Swarm<NodeBehaviour>, Box<dyn Error>> {
     let swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -848,8 +977,14 @@ fn build_swarm(keypair: Keypair) -> Result<Swarm<NodeBehaviour>, Box<dyn Error>>
         )?
         .with_behaviour(|key| {
             let peer_id = key.public().to_peer_id();
+            let mdns = match mode {
+                DiscoveryMode::AdvertiseAndDiscover => {
+                    Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?)
+                }
+                DiscoveryMode::DiscoverOnly | DiscoveryMode::Off => None,
+            };
             Ok(NodeBehaviour {
-                mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?,
+                mdns: Toggle::from(mdns),
                 ping: ping::Behaviour::default(),
                 chat: request_response::cbor::Behaviour::new(
                     [(StreamProtocol::new("/chat/4.0.0"), ProtocolSupport::Full)],
@@ -881,7 +1016,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
 
     // 登录 + 影子探测；ID 冲突时退回重新选择身份
-    let (mut swarm, my_name) = loop {
+    let (mut swarm, my_name, discovery_mode) = loop {
         let outcome = login_flow(&mut stdin, interactive).await?;
         let real_id = outcome.keypair.public().to_peer_id();
         println!(
@@ -899,12 +1034,45 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                     "请改用其他身份，或先关闭占用该 ID 的设备后重试".yellow()
                 );
             }
-            None => break (build_swarm(outcome.keypair)?, outcome.info.name),
+            None => {
+                let mode = load_discovery_mode(&real_id);
+                break (build_swarm(outcome.keypair, mode)?, outcome.info.name, mode);
+            }
         }
     };
+    println!(
+        "{}",
+        format!("发现模式: {}", discovery_mode.name()).dimmed()
+    );
 
     // TOFU 联系人簿（首次接触记录指纹）
     let mut contacts = ContactBook::load(swarm.local_peer_id());
+
+    // 隐身模式：只收不发的 mDNS 监听任务，经通道向主循环上报发现
+    let mut stealth_rx: Option<tokio::sync::mpsc::Receiver<(PeerId, Multiaddr)>> = None;
+    if discovery_mode == DiscoveryMode::DiscoverOnly {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        stealth_rx = Some(rx);
+        tokio::spawn(async move {
+            let mut listener = match StealthMdns::new() {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("{}", format!("隐身监听启动失败: {e}").yellow());
+                    return;
+                }
+            };
+            loop {
+                match listener.next_discovery().await {
+                    Some((pid, addr)) => {
+                        if tx.send((pid, addr)).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        });
+    }
 
     let listen_addr: Multiaddr = "/ip4/0.0.0.0/tcp/0".parse()?;
     swarm.listen_on(listen_addr)?;
@@ -1178,6 +1346,21 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                 ),
                             }
                         }
+                        ChatAction::Discover(mode) => {
+                            match save_discovery_mode(swarm.local_peer_id(), mode) {
+                                Ok(()) => println!(
+                                    "{}",
+                                    format!(
+                                        "发现模式已设为 {}（下次进入聊天生效）",
+                                        mode.name()
+                                    )
+                                    .green()
+                                ),
+                                Err(e) => {
+                                    eprintln!("{}", format!("保存失败: {e}").yellow())
+                                }
+                            }
+                        }
                         ChatAction::None => {}
                     }
                     continue;
@@ -1214,6 +1397,28 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                             ChatRequest(ChatPayload::Control(Control::Heartbeat)),
                         );
                     }
+                }
+            }
+            discovered = async {
+                match stealth_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some((found_id, addr)) = discovered {
+                    let local = swarm.local_peer_id().clone();
+                    on_peer_discovered(
+                        found_id,
+                        addr,
+                        &local,
+                        &mut swarm,
+                        &mut known_addrs,
+                        &mut pending_chat,
+                        &mut reconnect_peer,
+                        &mut reconnect_pending,
+                        &mut dialing,
+                        &conn_count,
+                    );
                 }
             }
             event = swarm.select_next_some() => {
@@ -1356,33 +1561,20 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                        let local = swarm.local_peer_id().clone();
                         for (found_id, addr) in list {
-                            if found_id == *swarm.local_peer_id() {
-                                continue;
-                            }
-                            println!("{}", format!("mDNS 发现节点: {found_id}").cyan());
-                            let recorded = known_addrs.entry(found_id).or_default();
-                            if !recorded.contains(&addr) {
-                                recorded.push(addr.clone());
-                            }
-                            if pending_chat == Some(found_id)
-                                && reconnect_peer != Some(found_id)
-                                && !conn_count.contains_key(&found_id)
-                            {
-                                println!(
-                                    "{}",
-                                    format!("发现待接呼叫节点，拨号 {found_id}").cyan()
-                                );
-                                reconnect_peer = Some(found_id);
-                                reconnect_pending = vec![addr];
-                                dial_next_reconnect(
-                                    &mut swarm,
-                                    &mut dialing,
-                                    &mut reconnect_peer,
-                                    &mut reconnect_pending,
-                                    &mut known_addrs,
-                                );
-                            }
+                            on_peer_discovered(
+                                found_id,
+                                addr,
+                                &local,
+                                &mut swarm,
+                                &mut known_addrs,
+                                &mut pending_chat,
+                                &mut reconnect_peer,
+                                &mut reconnect_pending,
+                                &mut dialing,
+                                &conn_count,
+                            );
                         }
                     }
                     SwarmEvent::Behaviour(NodeBehaviourEvent::Chat(request_response::Event::Message { peer: from, message, .. })) => {
@@ -1661,6 +1853,24 @@ mod tests {
         assert_eq!(fa1, fa2);
         assert_ne!(fa1, fb);
         assert_eq!(fa1.split(':').count(), 16);
+    }
+
+    #[test]
+    fn discovery_mode_parse() {
+        assert_eq!(
+            DiscoveryMode::parse("advertise"),
+            Some(DiscoveryMode::AdvertiseAndDiscover)
+        );
+        assert_eq!(
+            DiscoveryMode::parse("STEALTH"),
+            Some(DiscoveryMode::DiscoverOnly)
+        );
+        assert_eq!(DiscoveryMode::parse("off"), Some(DiscoveryMode::Off));
+        assert_eq!(DiscoveryMode::parse("bogus"), None);
+        assert_eq!(
+            DiscoveryMode::default(),
+            DiscoveryMode::AdvertiseAndDiscover
+        );
     }
 
     #[test]
