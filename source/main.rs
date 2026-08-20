@@ -7,7 +7,7 @@ use color_print::{Color};
 mod calculator;
 mod chat;
 mod cmd_tree;
-mod mdns_stealth;
+mod p2p;
 mod student;
 
 struct MainCtx {

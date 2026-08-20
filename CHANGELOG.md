@@ -5,6 +5,20 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.0] - 2026-08-20
+
+### 变更
+
+- **抽离通用 P2P 通讯层** `source/p2p/`，聊天成为消费方（行为零变更，e2e 全绿守护）：
+  - `identity.rs`：助记词↔Ed25519、keystore 加解密、影子探测（自 chat.rs 迁出，含单测）
+  - `contacts.rs`：TOFU 联系人簿 + 指纹（迁出，含单测）
+  - `discovery.rs`：发现模式 advertise/stealth/off（迁出，含单测）
+  - `mdns_stealth.rs`：隐身 mDNS 监听器（自 `source/mdns_stealth.rs` 迁入）
+- `chat.rs` 1904 → ~1300 行：仅保留聊天协议、cmd_tree、登录 UI、连接/事件循环
+- 新增 `docs/ROADMAP.md`：规划传输 API（P2pNode/P2pEvent）、通用 Frame 信封、
+  文件传输、多点通讯（多会话/群组）、公网 M6
+- `.gitignore` 放行 `docs/`
+
 ## [0.7.0] - 2026-08-20
 
 ### 新增
