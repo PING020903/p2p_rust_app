@@ -1027,7 +1027,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                 &p,
                                 ChatRequest(ChatPayload::Text(line.to_string())),
                             );
-                            println!("{}", format!("[我 → {who}] {line}").green());
+                            println!("{}", format!("[我 -> {who}] {line}").green());
                         }
                     }
                     None => eprintln!(
