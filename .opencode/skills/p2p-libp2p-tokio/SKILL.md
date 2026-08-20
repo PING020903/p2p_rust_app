@@ -9,9 +9,12 @@ description: 本项目 libp2p 0.56 / tokio 1.53 用法参考。Use when editing 
 
 ## 1. 模块与 `mod` 引用
 
-- `source/main.rs` 顶层一次性声明各模块：`mod chat; mod cmd_tree; mod mdns_stealth;` 等
-- `chat.rs` 内引用同 crate 模块：`use crate::mdns_stealth::StealthMdns;`（crate 根 = `main.rs`）
-- `mdns_stealth.rs` 是独立文件模块，不是 `chat.rs` 的子模块；不要重复 `mod` 声明
+- `source/main.rs` 顶层一次性声明各模块：`mod chat; mod cmd_tree; mod p2p;` 等
+- `source/p2p/` 是**通用传输层**（身份/联系人/发现/隐身监听），`chat.rs` 是消费方：
+  - `p2p/mod.rs` 声明 `pub mod identity; pub mod contacts; pub mod discovery; pub mod mdns_stealth;`
+  - `chat.rs` 引用：`use crate::p2p::mdns_stealth::StealthMdns;`、
+    `use crate::p2p::{DiscoveryMode, ContactBook, load_keystores, ...};`
+- 通用层内跨文件引用：`super::identity::cache_dir`（如 contacts/discovery 用身份缓存目录）
 - libp2p 的类型有时需全路径：`libp2p::swarm::behaviour::toggle::Toggle`（不在 `libp2p::swarm::*` 顶层 re-export）
 
 ## 2. Swarm 构建模式
@@ -63,7 +66,7 @@ struct NodeBehaviour {
   收到自己的查询并**组播响应**（自查自答）；对别人查询的响应也走组播
 - 广告内容：TXT 记录携带 `dnsaddr=<multiaddr 含 /p2p/PeerId>`（见 libp2p-mdns `MdnsPeer::new`）
 - **隐身模式**（只收不发）= `Toggle` 关闭 libp2p-mdns 行为 + 自实现监听器：
-  `source/mdns_stealth.rs` 绑 `224.0.0.251:5353`，解析 `dnsaddr=` TXT 记录还原 (PeerId, Multiaddr)。
+  `source/p2p/mdns_stealth.rs` 绑 `224.0.0.251:5353`，解析 `dnsaddr=` TXT 记录还原 (PeerId, Multiaddr)。
   仅实现 IPv4。靠对端周期自查自答在约一个查询间隔内发现它
 - 发现模式枚举 `DiscoveryMode { AdvertiseAndDiscover, DiscoverOnly, Off }`，
   `Toggle` 只在 advertise 时启用 mdns

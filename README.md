@@ -71,7 +71,7 @@ cargo run
 > 身份安全模型：身份 = 随机 128 bit 种子派生（BIP39 助记词），密码只用于加密本地 keystore，
 > 不再从姓名/生日/性别派生。知道你的个人信息也无法冒充你；密码可以随时更换。
 > 节点识别采用 TOFU：首次接触记录指纹，之后凭指纹识别，防身份切换/冒充。
-> mDNS 隐身监听自实现于 `source/mdns_stealth.rs`（最小 DNS 报文解析，仅 IPv4）。
+ > mDNS 隐身监听自实现于 `source/p2p/mdns_stealth.rs`（最小 DNS 报文解析，仅 IPv4）。
 
 ### 运行测试
 
@@ -94,6 +94,7 @@ e2e 的登录凭据从 `tests/users.txt` 读取（首次运行前复制 `tests/u
 | 学生信息管理 | ✅ 完成 | 增/查/列表/状态 |
 | 彩色打印 | ✅ 完成 | 分级日志着色 + 调试宏 |
 | 指令树组件 `cmd_tree` | ✅ 完成 | 由 C 版 simpleCmd cmdTree v2.0 移植：树形路由、最深命中、双引号分词、多实例、help、dataHandler |
+| 通用 P2P 层 `source/p2p/` | ✅ 完成 | 身份（助记词+keystore）/ TOFU 联系人簿 / 发现模式 / 隐身 mDNS 监听，与聊天协议解耦，文件传输等复用 |
 | P2P 聊天（libp2p） | ✅ 局域网可用 | 身份=随机种子+12 词 BIP39 助记词派生（密码仅护本地加密 keystore，姓名/生日/性别为资料元数据）；TCP + Noise 加密 + Yamux 多路复用；mDNS 发现登记 + /chat 按需 1v1；心跳包活 + 超时判离线；Hello/Bye 上下线通知；断线自动重连；/backup 重看助记词；TOFU 指纹核对 + 联系人簿 + /trust；发现模式（广播/隐身/关闭） |
 | 公网 P2P | 🕐 未开始 | 中继（circuit v2）/ UDP 打洞（dcutr），见下方 M6 |
 
@@ -128,10 +129,16 @@ source/
   student.rs      学生信息管理
   color_print.rs  彩色打印与调试宏
   cmd_tree.rs     指令树组件（多实例、help、dataHandler）
-  chat.rs         P2P 聊天节点（libp2p）
-  mdns_stealth.rs 隐身模式最小 mDNS 监听器（只收不发）
+  p2p/            通用 P2P 通讯层（身份/联系人/发现/隐身监听）
+    identity.rs     助记词↔Ed25519、keystore 加解密、影子探测
+    contacts.rs     TOFU 联系人簿 + 指纹
+    discovery.rs    发现模式（advertise/stealth/off）
+    mdns_stealth.rs 隐身模式最小 mDNS 监听器（只收不发）
+  chat.rs         P2P 聊天应用（libp2p，消费方）
 tests/
   p2p_chat.rs     双节点端到端集成测试
+docs/
+  ROADMAP.md      路线图（传输 API / 文件传输 / 多点通讯 / 公网）
 wish/             初心与愿景文档（去中心化平台蓝图）
 ```
 

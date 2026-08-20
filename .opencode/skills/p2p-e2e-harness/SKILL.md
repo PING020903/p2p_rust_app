@@ -54,4 +54,4 @@ login_cached(&mut node, &creds)                   // 走缓存：进入聊天→
 2. `Node::spawn` / `spawn_with`（需要特殊发现模式时）→ 等主菜单 → `login_restore`
 3. 交互操作（`/dial`、`/chat`、`/list`、`/q`、消息）→ `wait_for` 逐步断言
 4. 在 `p2p_chat_e2e_suite` 末尾追加调用
-5. 回归：改动 `source/chat.rs` 或 `mdns_stealth.rs` 后必须重跑整个 e2e（约 2.5 分钟）
+5. 回归：改动 `source/chat.rs` 或 `source/p2p/` 后必须重跑整个 e2e（约 2.5 分钟）

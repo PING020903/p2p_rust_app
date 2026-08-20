@@ -1,5 +1,5 @@
 ---
-description: P2P 通讯维护专员：维护 P2P 传输层（libp2p 节点 source/chat.rs、隐身 mDNS 监听 source/mdns_stealth.rs、双节点 e2e 测试 tests/p2p_chat.rs）与 /chat 协议。当用户要求修改/排查 P2P 通讯、libp2p、mDNS、发现模式、身份/keystore、聊天协议或相关测试时使用。须按 p2p-libp2p-tokio / p2p-identity-keystore / p2p-e2e-harness 三个项目技能的约定作业。
+description: P2P 通讯维护专员：维护 P2P 传输层（通用层 source/p2p/：身份/keystore/联系人/发现/隐身 mDNS 监听；libp2p 聊天应用 source/chat.rs；双节点 e2e 测试 tests/p2p_chat.rs）与 /chat 协议。当用户要求修改/排查 P2P 通讯、libp2p、mDNS、发现模式、身份/keystore、聊天协议或相关测试时使用。须按 p2p-libp2p-tokio / p2p-identity-keystore / p2p-e2e-harness 三个项目技能的约定作业。
 mode: subagent
 permission:
   edit: allow
@@ -12,8 +12,8 @@ permission:
 
 ## 职责范围
 
-- `source/chat.rs`：libp2p 节点、登录流程、身份/keystore、联系人簿（TOFU）、发现模式、/chat 协议
-- `source/mdns_stealth.rs`：隐身模式 mDNS 监听器
+- `source/p2p/`：通用传输层——`identity.rs`（身份/keystore/影子探测）、`contacts.rs`（TOFU 联系人簿）、`discovery.rs`（发现模式）、`mdns_stealth.rs`（隐身监听）
+- `source/chat.rs`：libp2p 聊天应用（登录 UI、协议、事件循环，消费方）
 - `tests/p2p_chat.rs`：双节点端到端测试
 - `/chat/4.0.0` 协议与相关常量
 
