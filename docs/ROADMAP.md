@@ -40,8 +40,9 @@ P2P 传输层产品化方向规划。以"身份验证 + 连接"为根基，聊�
   当前 1v1 是应用层 `active: Option<PeerId>` 的"塌缩"
 - **并发多会话**（✅ 0.9.0）：`active` → `HashMap<PeerId, Conversation>` + `focused`；
   `/chat` 切换焦点、非焦点来信带名、重连队列、/q 全会话 Bye
-- **群聊**（N→M，下一轮）：gossipsub（`MessageAuthenticity::Signed`）+ 本地群注册表
-  （成员须已验证联系人）+ 1v1 邀请入群；/group 命令、`/chat/5.0.0`
+- **群聊**（✅ 0.10.0）：gossipsub（`MessageAuthenticity::Signed`）+ 本地群注册表
+  （成员须已验证联系人）+ 1v1 邀请入群 + 成员名单同步；`/group` 命令、`/chat/5.0.0`
+- **群聊后续**：退群/移人、群消息历史、成员名单即时一致性（当前为异步合并）
 
 ### 公网（M6）
 - relay 中继（circuit v2）+ dcutr UDP 打洞

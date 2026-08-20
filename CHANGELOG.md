@@ -5,6 +5,26 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.10.0] - 2026-08-20
+
+### 新增
+
+- **群聊（gossipsub，微信式群）**：
+  - 群消息经 libp2p gossipsub 分发，`MessageAuthenticity::Signed` 签名保证来源真实可验
+  - 本地群注册表 `groups_<节点ID>.json`（id/name/members）；**成员必须是已验证联系人**
+  - `/group new <群名>` 建群（随机群 ID）并订阅 topic；`/group list` 列群；
+    `/group <群名>` 聚焦（此后输入直接发群里）
+  - `/group add <群名> <角色|节点ID>` 加人：经 1v1 发送**入群邀请**，接收方自动建群记录并订阅；
+    加人后向全群发布**最新成员名单**（本地注册表同步）
+  - 群消息显示：焦点群 `[成员名]`，非焦点群 `[群名] [成员名]`；群消息带**发送者自报名**
+    （签名保证来源真实，名字为展示元数据）
+- 协议升级 `/chat/4.0.0` → `/chat/5.0.0`（新增 `GroupInvite` 载荷）
+- e2e 新增场景 9：三节点群聊（建群 / 邀请入群 / 群消息扇出 / 非焦点带群名）
+
+### 变更
+
+- `NodeBehaviour` 增加 `gossipsub` 行为（Signed 签名身份）；`ChatPayload` 增加 `GroupInvite`
+
 ## [0.9.0] - 2026-08-20
 
 ### 新增

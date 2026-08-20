@@ -571,9 +571,68 @@ fn multi_session_scenario() {
     c.kill();
 }
 
+/// 场景9：三节点群聊（gossipsub）——A 建群加 B、C，群消息扇出，非焦点群来信带群名
+fn group_chat_scenario() {
+    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache_a = scenario_cache_dir("s9_a");
+    let cache_b = scenario_cache_dir("s9_b");
+    let cache_c = scenario_cache_dir("s9_c");
+    let (cred_a, cred_b, cred_c) = load_creds3();
+    let b_name = cred_b.name.clone();
+    let c_name = cred_c.name.clone();
+    let group = "testgrp";
+    println!("=== 场景9: 三节点群聊 ===");
+
+    println!("=== 启动节点 A/B/C ===");
+    let (mut a, a_listen) = spawn_into_chat(bin, &cache_a, &cred_a, MNEMONIC_USER1);
+    let a_addr = listen_addr(&a_listen);
+    let a_id = parse_peer_id(&a_listen);
+    let (mut b, _b_listen) = spawn_into_chat(bin, &cache_b, &cred_b, MNEMONIC_USER2);
+    let (mut c, _c_listen) = spawn_into_chat(bin, &cache_c, &cred_c, MNEMONIC_USER3);
+
+    println!("=== B、C 拨号 A（建立 gossipsub 网格与邀请通道）===");
+    b.send(&format!("/dial {a_addr}"));
+    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+    c.send(&format!("/dial {a_addr}"));
+    c.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+
+    println!("=== A 建群并加 B、C ===");
+    a.send(&format!("/group new {group}"));
+    a.wait_for(&format!("已创建并聚焦群聊: {group}"), WAIT);
+    a.send(&format!("/group add {group} {b_name}"));
+    a.wait_for(&format!("已将 {b_name} 加入群"), WAIT);
+    b.wait_for(&format!("被邀请加入群聊: {group}"), WAIT);
+    a.send(&format!("/group add {group} {c_name}"));
+    a.wait_for(&format!("已将 {c_name} 加入群"), WAIT);
+    c.wait_for(&format!("被邀请加入群聊: {group}"), WAIT);
+
+    // 等 gossipsub 网格形成（heartbeat ~1s），再发群消息
+    thread::sleep(Duration::from_secs(2));
+
+    println!("=== A 发群消息，B/C 都收到（非焦点 → 带群名）===");
+    a.send("hello grp");
+    b.wait_for(&format!("[{group}] [{}] hello grp", cred_a.name), Duration::from_secs(40));
+    c.wait_for(&format!("[{group}] [{}] hello grp", cred_a.name), Duration::from_secs(40));
+
+    println!("=== C 聚焦群聊并回消息，A/B 都收到 ===");
+    c.send(&format!("/group {group}"));
+    c.wait_for(&format!("已切换到群聊: {group}"), WAIT);
+    c.send("hi from C");
+    a.wait_for(&format!("[{c_name}] hi from C"), Duration::from_secs(40));
+    b.wait_for(&format!("[{group}] [{c_name}] hi from C"), Duration::from_secs(40));
+
+    println!("=== /group list 列出群 ===");
+    a.send("/group list");
+    a.wait_for(&format!("{group}（"), WAIT);
+
+    a.kill();
+    b.kill();
+    c.kill();
+}
+
 #[test]
 fn p2p_chat_e2e_suite() {
-    // 八场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
+    // 九场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
     basic_chat_scenario();
     chat_by_name_scenario();
     graceful_offline_online_scenario();
@@ -582,4 +641,5 @@ fn p2p_chat_e2e_suite() {
     duplicate_id_scenario();
     discovery_mode_scenario();
     multi_session_scenario();
+    group_chat_scenario();
 }

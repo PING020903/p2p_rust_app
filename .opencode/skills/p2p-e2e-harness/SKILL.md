@@ -5,7 +5,7 @@ description: 本项目双节点端到端测试脚手架用法。Use when editing
 
 # 双节点 e2e 测试脚手架（本项目）
 
-文件：`tests/p2p_chat.rs`。串行 8 场景（`p2p_chat_e2e_suite`）——**不要拆成并行 `#[test]`**，
+文件：`tests/p2p_chat.rs`。串行 9 场景（`p2p_chat_e2e_suite`）——**不要拆成并行 `#[test]`**，
 同机 mDNS 会跨测试互相发现导致连错对象。
 
 ## 1. 节点启动与环境变量
