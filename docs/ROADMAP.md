@@ -34,13 +34,14 @@ P2P 传输层产品化方向规划。以"身份验证 + 连接"为根基，聊�
 - 复用身份验证 + 联系人簿：发送前校验接收方是**已验证联系人**（"发给谁"由传输层保证）
 - 分块 / 进度 / 校验和（哈希）；`ChatPayload::Binary` 变体已预留
 - UX 改进（后期）：二维码互扫、联系人选择器、邀请码，降低首接指纹确认的繁琐
-
 ### 多点通讯
+
 - **传输层已是多点**：libp2p 同时持有多条认证连接，`send(peer, frame)` 按 peer 寻址；
   当前 1v1 是应用层 `active: Option<PeerId>` 的"塌缩"
-- **并发多会话**（先做）：`active` → `HashMap<PeerId, Conversation>`（消息历史 / last_rx / 离线缓冲），发送永远显式带 peer_id
-- **群组**（N→M）：先应用层扇出（群 = 已验证联系人集合，逐个走 1v1），
-  必要时再上 libp2p gossipsub（注意：gossipsub 消息默认不签名，身份绑定需自己做）
+- **并发多会话**（✅ 0.9.0）：`active` → `HashMap<PeerId, Conversation>` + `focused`；
+  `/chat` 切换焦点、非焦点来信带名、重连队列、/q 全会话 Bye
+- **群聊**（N→M，下一轮）：gossipsub（`MessageAuthenticity::Signed`）+ 本地群注册表
+  （成员须已验证联系人）+ 1v1 邀请入群；/group 命令、`/chat/5.0.0`
 
 ### 公网（M6）
 - relay 中继（circuit v2）+ dcutr UDP 打洞

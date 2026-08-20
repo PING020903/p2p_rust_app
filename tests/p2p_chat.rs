@@ -20,6 +20,12 @@ struct Creds {
 /// 文件格式：`userN-name / userN-age / userN-sex / userN-password` 键值行，
 /// age 值允许带 "(YYYY-MM-DD)" 格式提示，解析时剥离。
 fn load_creds() -> (Creds, Creds) {
+    let (a, b, _) = load_creds3();
+    (a, b)
+}
+
+/// user1/user2/user3（3 号用于三节点多会话/群聊场景，要求名字互不相同）
+fn load_creds3() -> (Creds, Creds, Creds) {
     let path = format!("{}/tests/users.txt", env!("CARGO_MANIFEST_DIR"));
     let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!("读取 {path} 失败: {e}（请复制 tests/users.template.txt 为 tests/users.txt 并填写）")
@@ -47,7 +53,7 @@ fn load_creds() -> (Creds, Creds) {
         gender: take(user, "sex"),
         password: take(user, "password"),
     };
-    (cred("user1"), cred("user2"))
+    (cred("user1"), cred("user2"), cred("user3"))
 }
 
 /// 每场景独立的身份缓存临时目录（保证登录菜单行为确定）
@@ -194,6 +200,8 @@ const MNEMONIC_USER1: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 const MNEMONIC_USER2: &str =
     "legal winner thank year wave sausage worth useful legal winner thank yellow";
+const MNEMONIC_USER3: &str =
+    "ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic";
 
 /// 从助记词恢复身份登录（r 路径）：喂 r → 助记词 → 四项资料 → 密码
 fn login_restore(node: &mut Node, creds: &Creds, mnemonic: &str) {
@@ -498,9 +506,74 @@ fn discovery_mode_scenario() {
     b.kill();
 }
 
+/// 场景8：三节点 1v1 多会话——A 同时连 B、C，切换焦点收发，非焦点来信带名字
+fn multi_session_scenario() {
+    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache_a = scenario_cache_dir("s8_a");
+    let cache_b = scenario_cache_dir("s8_b");
+    let cache_c = scenario_cache_dir("s8_c");
+    let (cred_a, cred_b, cred_c) = load_creds3();
+    let b_name = cred_b.name.clone();
+    let c_name = cred_c.name.clone();
+    println!("=== 场景8: 三节点 1v1 多会话 ===");
+
+    println!("=== 启动节点 A（user1）===");
+    let (mut a, a_listen) = spawn_into_chat(bin, &cache_a, &cred_a, MNEMONIC_USER1);
+    let a_addr = listen_addr(&a_listen);
+    let a_id = parse_peer_id(&a_listen);
+
+    println!("=== 启动节点 B（user2）===");
+    let (mut b, b_listen) = spawn_into_chat(bin, &cache_b, &cred_b, MNEMONIC_USER2);
+    let b_id = parse_peer_id(&b_listen);
+
+    println!("=== 启动节点 C（user3）===");
+    let (mut c, c_listen) = spawn_into_chat(bin, &cache_c, &cred_c, MNEMONIC_USER3);
+    let c_id = parse_peer_id(&c_listen);
+
+    println!("=== B、C 依次拨号 A：A 自动聚焦首个（B），C 不抢焦点 ===");
+    b.send(&format!("/dial {a_addr}"));
+    a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
+    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+    b.wait_for(&format!("对方已上线: {}", cred_a.name), WAIT);
+
+    c.send(&format!("/dial {a_addr}"));
+    a.wait_for(&format!("已连接对端: {c_id}"), WAIT);
+    c.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+    a.wait_for(&format!("对方已上线: {c_name}"), WAIT);
+
+    println!("=== A 聚焦 B：发消息 B 收 `[对方]` ===");
+    a.send("hello B");
+    b.wait_for("[对方] hello B", WAIT);
+
+    println!("=== A /chat C 切焦点，发消息 C 收 `[对方]` ===");
+    a.send(&format!("/chat {c_name}"));
+    a.wait_for(&format!("已切换到会话: {c_name}"), WAIT);
+    a.send("hello C");
+    c.wait_for("[对方] hello C", WAIT);
+
+    println!("=== B 来信（A 聚焦 C）：A 显示 `[B名] ...` ===");
+    b.send("msg from B");
+    a.wait_for(&format!("[{b_name}] msg from B"), WAIT);
+
+    println!("=== C 来信（A 聚焦 C）：A 显示 `[对方] ...` ===");
+    c.send("msg from C");
+    a.wait_for("[对方] msg from C", WAIT);
+
+    println!("=== /list 同时见 B、C 两会话 ===");
+    a.send("/list");
+    a.wait_for("=== 已登记节点 ===", WAIT);
+    // /list 按节点ID排序，C（12D3KooWH…）排在 B（12D3KooWPCy…）前，按序断言
+    a.wait_for(&c_id, WAIT);
+    a.wait_for(&b_id, WAIT);
+
+    a.kill();
+    b.kill();
+    c.kill();
+}
+
 #[test]
 fn p2p_chat_e2e_suite() {
-    // 七场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
+    // 八场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
     basic_chat_scenario();
     chat_by_name_scenario();
     graceful_offline_online_scenario();
@@ -508,4 +581,5 @@ fn p2p_chat_e2e_suite() {
     cache_login_scenario();
     duplicate_id_scenario();
     discovery_mode_scenario();
+    multi_session_scenario();
 }

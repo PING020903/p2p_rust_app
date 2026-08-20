@@ -5,7 +5,7 @@ description: 本项目双节点端到端测试脚手架用法。Use when editing
 
 # 双节点 e2e 测试脚手架（本项目）
 
-文件：`tests/p2p_chat.rs`。串行 7 场景（`p2p_chat_e2e_suite`）——**不要拆成并行 `#[test]`**，
+文件：`tests/p2p_chat.rs`。串行 8 场景（`p2p_chat_e2e_suite`）——**不要拆成并行 `#[test]`**，
 同机 mDNS 会跨测试互相发现导致连错对象。
 
 ## 1. 节点启动与环境变量
@@ -25,8 +25,10 @@ Node::spawn_with(bin, cache_dir, "stealth")       // 指定发现模式
 - BIP39 **官方测试向量**助记词常量（勿用于生产）：
   - `MNEMONIC_USER1 = "abandon abandon ... abandon about"`
   - `MNEMONIC_USER2 = "legal winner thank year wave sausage worth useful legal winner thank yellow"`
+  - `MNEMONIC_USER3 = "ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic"`（三节点场景用）
 - 同一助记词 → 同一 PeerId（场景内跨重启/重进身份不变）
-- 资料（姓名/生日/性别/密码）从 `tests/users.txt` 读取（git 忽略，模板 `users.template.txt`）
+- 资料（姓名/生日/性别/密码）从 `tests/users.txt` 读取（git 忽略，模板 `users.template.txt`）；
+  user1/2/3 名字须互不相同（多会话场景靠名字消歧）
 
 ## 3. 登录驱动与断言
 
