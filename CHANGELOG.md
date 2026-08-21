@@ -5,6 +5,34 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.14.0] - 2026-08-22
+
+### 变更（三层架构落地）
+
+- **L1 传输层抽象**：新增 `source/p2p/node.rs`，`P2pNode` 持有 swarm 与全部连接/地址簿/
+  重连/发现/心跳状态，在**独立 tokio 任务**中运行（`P2pNode::run`），经 `P2pCommand`
+  （Dial/DialPeer/Send/MarkBye/Subscribe/Unsubscribe/Publish/Shutdown）与 `P2pEvent`
+  （PeerConnected/PeerDisconnected/PeerDiscovered/Message/Gossip/SendFailure）与应用层通信
+- **根治网络冻结**：应用层卡在 TOFU 指纹确认、`/backup` 密码等交互 await 时，传输任务
+  仍独立维持心跳与收发——事件通道用无界 mpsc，传输任务永不因应用阻塞
+- **心跳归 L1**：对全部已连接非 bye 的 peer 保活（原只护聚焦会话）；超时判离线并断开
+- **bye 策略命令化**：收到 Bye 后应用发 `MarkBye(peer)` → L1 停止心跳、断开后不再自动重连
+- **发现决策归 L3**：L1 只登记地址并上报 `PeerDiscovered`；待接呼叫/常驻群成员是否拨号
+  由应用决策，经 `DialPeer` 命令执行
+- **L2 身份基础服务**：新增 `source/p2p/identity_service.rs`，`IdentityService` 收拢
+  登录（含影子探测）+ 联系人簿（TOFU）+ 信任判定 + Hello/Bye 存在处理，供 L3 与未来
+  多协议复用；聊天协议无关
+- gossip 经 L1 通用 `Subscribe/Publish/Gossip` 透传，topic 为不透明字符串，L1 不解释
+- **命令逻辑收进指令树**：去掉 `ChatAction` 枚举 + run_node 巨型 match；每个命令的完整逻辑
+  注册为 `CmdTree` 同步 handler，需要 `.await` 的动作（发命令/读密码）经
+  `ChatCtx.ops`（`VecDeque`，同步生产者 → 异步消费者）排队，主循环统一消费
+
+### 测试
+
+- 新增 e2e 场景 10：应用卡在 `/backup` 密码交互（模拟 TOFU 阻塞）17 秒 > 心跳超时 15s，
+  传输任务心跳仍存活，解锁后连接照常收发——三层架构核心验收点
+- 单测 32 个（新增 `IdentityService` 信任判定测试）；e2e 10 场景串行
+
 ## [0.13.1] - 2026-08-22
 
 ### 变更

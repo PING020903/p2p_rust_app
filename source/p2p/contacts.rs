@@ -9,6 +9,10 @@ use std::path::PathBuf;
 
 use super::identity::cache_dir;
 
+/// 测试共享锁：`P2P_ID_CACHE_DIR` 是进程级环境变量，凡依赖它的测试须持有此锁串行执行
+#[cfg(test)]
+pub(crate) static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 联系人条目：peer_id 即身份指纹（公钥哈希），额外派生短指纹便于人工核对
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactEntry {
@@ -81,6 +85,15 @@ impl ContactBook {
         self.entries.get(peer_id).map(|e| e.verified).unwrap_or(false)
     }
 
+    /// 仅刷新最近见时间（存在层记录；不改变名字与信任状态）
+    pub fn mark_seen(&mut self, peer: &PeerId) {
+        let pid = peer.to_string();
+        if let Some(e) = self.entries.get_mut(&pid) {
+            e.last_seen = unix_now();
+            self.save();
+        }
+    }
+
     /// 首次接触插入 / 已存在则更新名字与最近见时间；verified 参数为 OR 合并
     pub fn ensure_contact(&mut self, peer: &PeerId, name: &str, verified: bool) {
         let pid = peer.to_string();
@@ -137,6 +150,7 @@ mod tests {
 
     #[test]
     fn contact_book_persists_across_load() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("p2p_contact_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         unsafe {

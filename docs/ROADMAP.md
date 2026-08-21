@@ -16,23 +16,29 @@ P2P 传输层产品化方向规划。以"身份验证 + 连接"为根基，聊�
 - **0.5.0** 身份模型革命：随机种子 + BIP39 助记词，密码只护本地 keystore（Argon2id + ChaCha20-Poly1305），`/backup` 与 `r` 恢复
 - **0.6.0** SSH 式 TOFU 指纹核对 + 联系人簿 + `/trust`
 - **0.7.0** mDNS 发现模式（advertise/stealth/off），自实现隐身监听器
-- **0.8.0（进行中）** 通用 p2p 模块抽离（`source/p2p/`：identity/contacts/discovery/mdns_stealth），聊天变薄
+- **0.8.0** 通用 p2p 模块抽离（`source/p2p/`：identity/contacts/discovery/mdns_stealth），聊天变薄
+- **0.14.0** 三层架构：L1 `P2pNode` 传输任务（命令/事件通道，永不阻塞于应用交互）+
+  L2 `IdentityService`（登录/TOFU/信任/Hello-Bye）+ L3 业务（会话/群/焦点/列表）；
+  心跳归 L1 且对全部已连接非 bye peer；根治 TOFU 卡住导致的心跳冻结
 
 ## 后续规划
 
-### Phase B：通用传输 API（`P2pNode` + `P2pEvent`）
-- 把 `build_swarm`、连接建立/关闭、地址簿、重连、`on_peer_discovered` 收进 `P2pNode`
-- 事件通道解耦 `run_node` 的 select 循环（stdin / 心跳 / 事件流）
-- 聊天成为第一个消费方，行为不变（e2e 守护）
+### Phase B：通用传输 API（`P2pNode` + `P2pEvent`）✅ 0.14.0
+- `source/p2p/node.rs`：`P2pNode` 收拢 build_swarm、连接建立/关闭、地址簿、重连、发现、心跳
+- `P2pCommand`（Dial/DialPeer/Send/MarkBye/Subscribe/Unsubscribe/Publish/Shutdown）+
+  `P2pEvent`（PeerConnected/PeerDisconnected/PeerDiscovered/Message/Gossip/SendFailure）
+  双通道解耦 `run_node` 的 select 循环
+- 传输任务独立运行，事件用无界通道——应用卡在 TOFU/密码交互时心跳照常
+- 聊天作为第一个消费方，行为不变（e2e 守护）
 
 ### Phase C：协议与传输解耦
 - **消息帧信封**（✅ 0.12.0 核心）：`Frame{control/text/binary}` 三通道——
   `control` 心跳/传输控制、`text` 节点间短消息（Hello/Bye）、`binary` 用户内容负载
   （`AppPayload` 自描述，cbor）；协议 `/chat/7.0.0`
+- **心跳（保活）进传输层**（✅ 0.14.0）：L1 对全部已连接非 bye peer 保活，超时判离线；
+  上线/离线通知（`PeerConnected/PeerDisconnected`）与名字握手（Hello/Bye 归 L2）分属传输/身份层
 - **handler 注册表**（后续）：把三通道的硬编码 match 改为"按变体标签注册处理器 +
   按标签分发"，新信号/新业务（文件等）= 注册一个 handler 不动核心
-- 心跳（保活）进传输层，对全部已连接 peer；上线/离线通知进传输层
-  （`PeerConnected/PeerDisconnected`），名字握手留协议层
 
 ### 文件传输（`/file/1.0.0`）
 - 复用身份验证 + 联系人簿：发送前校验接收方是**已验证联系人**（"发给谁"由传输层保证）

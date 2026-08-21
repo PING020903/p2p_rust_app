@@ -1,44 +1,17 @@
-use colored::Colorize;
-use futures::StreamExt;
-use libp2p::{
-    gossipsub::{self, IdentTopic, MessageAuthenticity},
-    identity::Keypair, mdns, multiaddr::Protocol, noise, ping,
-    request_response::{self, ProtocolSupport},
-    swarm::behaviour::toggle::Toggle,
-    swarm::SwarmEvent,
-    tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
-};
+﻿use colored::Colorize;
+use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
-use std::io::{IsTerminal, Write};
-use std::net::Ipv6Addr;
+use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 use tokio::io::AsyncBufReadExt;
 
 use crate::cmd_tree::{CmdError, CmdTree, ROOT};
-use crate::p2p::mdns_stealth::StealthMdns;
-use crate::p2p::{
-    cache_dir, decrypt_mnemonic, fingerprint_of, generate_mnemonic, keypair_from_mnemonic,
-    load_discovery_mode, load_keystores, probe_duplicate_id, probe_window,
-    save_discovery_mode, save_keystore, valid_password, ContactBook, DiscoveryMode,
-    IdentityInfo, LoginOutcome,
-};
-
-/// control 字段：传输层控制指令（心跳维持）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum Control {
-    Heartbeat,
-}
-
-/// text 字段：节点间短消息（**非用户内容**），可扩展自定义操作信号
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum NodeMsg {
-    Hello(String), // 上线 + 对方名字
-    Bye,           // 下线
-}
+use crate::p2p::{cache_dir, load_discovery_mode, save_discovery_mode, DiscoveryMode};
+use crate::p2p::identity_service::{IdentityService, StdinLines};
+use crate::p2p::node::{Control, Frame, NodeMsg, P2pCommand, P2pEvent, P2pNode, BYE_HANDSHAKE_TIMEOUT};
 
 /// binary 字段：用户内容负载（应用层自描述，cbor 序列化后放入 binary）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,65 +31,62 @@ enum AppPayload {
     },
 }
 
-/// 1v1 通道通用帧：control（传输控制）/ text（节点信号）/ binary（用户内容）按需填充
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Frame {
-    control: Option<Control>,
-    text: Option<NodeMsg>,
-    binary: Option<Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ChatRequest(Frame);
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ChatResponse(bool);
-
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
-const BYE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// 新身份助记词抄写确认词数
-const MNEMONIC_CONFIRM_WORDS: usize = 3;
-
-/// mDNS 行为开关：Advertise 模式启用 libp2p-mdns；隐身/关闭模式用 Toggle 关闭
-#[derive(libp2p::swarm::NetworkBehaviour)]
-struct NodeBehaviour {
-    mdns: Toggle<mdns::tokio::Behaviour>,
-    gossipsub: gossipsub::Behaviour,
-    ping: ping::Behaviour,
-    chat: request_response::cbor::Behaviour<ChatRequest, ChatResponse>,
-}
-
-enum ChatAction {
-    None,
-    Quit,
-    Dial(Multiaddr),
-    Chat(String),
-    List,
+/// 命令 handler 产出的异步动作：同步逻辑跑在指令树 handler 里，真正需要 `.await`
+/// 的 I/O（发命令给传输任务 / 读密码）排进 `ChatCtx.ops`，由主循环统一消费。
+/// 这本质是"同步生产者 → 异步消费者"的 ring buffer 解耦。
+enum AsyncOp {
+    Cmd(P2pCommand),
     Backup,
-    Trust(String),
-    Discover(DiscoveryMode),
-    GroupNew(String),
-    GroupAdd { group: String, target: String },
-    GroupResident { group: String, enable: bool },
-    GroupLeave(String),
-    GroupList,
-    GroupFocus(String),
 }
 
-struct ChatCtx {
-    action: ChatAction,
+/// 命令上下文：一次性持有全部可变状态，供指令树 handler 直接读写。
+/// 每次解析一行命令前临时构造（借用随本次处理结束释放），quit 置位表示请求退出。
+struct ChatCtx<'a> {
+    identity: &'a mut IdentityService,
+    cmd_tx: &'a tokio::sync::mpsc::Sender<P2pCommand>,
+    stdin: &'a mut StdinLines,
+    interactive: bool,
+    conversations: &'a mut HashMap<PeerId, Conversation>,
+    groups: &'a mut HashMap<String, Group>,
+    focused: &'a mut Option<PeerId>,
+    focused_group: &'a mut Option<String>,
+    connected: &'a HashSet<PeerId>,
+    registered: &'a mut HashMap<PeerId, Vec<Multiaddr>>,
+    /// 待消费的异步动作队列（VecDeque 即可增长的环状缓冲）
+    ops: VecDeque<AsyncOp>,
+    quit: bool,
 }
 
-/// 一个 1v1 会话：与某 peer 的聊天上下文（连接可多路共存）。
-/// Phase 2 群聊将扩展该结构（群成员/群名）
+impl<'a> ChatCtx<'a> {
+    /// 按名字/节点ID 解析目标 peer（先查 1v1 会话名，再按节点ID解析）
+    fn resolve(&self, target: &str) -> Option<PeerId> {
+        self.conversations
+            .iter()
+            .find(|(_, c)| c.name == target)
+            .map(|(p, _)| *p)
+            .or_else(|| target.parse::<PeerId>().ok())
+    }
+
+    /// 按群名解析群 id
+    fn group_id(&self, name: &str) -> Option<String> {
+        self.groups
+            .iter()
+            .find(|(_, g)| g.name == name)
+            .map(|(id, _)| id.clone())
+    }
+}
+
+/// 向命令队列排入"发命令"动作（字段级借用，可在 handler 持有其它字段借用时调用）
+fn push_cmd(ops: &mut VecDeque<AsyncOp>, cmd: P2pCommand) {
+    ops.push_back(AsyncOp::Cmd(cmd));
+}
+
+/// 一个 1v1 会话：与某 peer 的聊天上下文（连接可多路共存）
 struct Conversation {
-    name: String,             // 对方角色名（Hello 更新；未知为空）
-    greeted: bool,            // 是否已发过 Hello（重连后重置，避免漏问候）
-    bye: bool,                // 对方已主动退出（不再心跳/重连）
-    pending_dial: bool,       // /chat 后尚无地址，等待 mDNS 发现自动拨号
-    last_rx: Option<Instant>, // 本会话最近收到消息/心跳响应时间（超时判离线）
+    name: String,       // 对方角色名（Hello 更新；未知为空）
+    greeted: bool,      // 是否已发过 Hello（重连后重置，避免漏问候）
+    bye: bool,          // 对方已主动退出（不再心跳/重连）
+    pending_dial: bool, // /chat 后尚无地址，等待 mDNS 发现自动拨号
 }
 
 impl Conversation {
@@ -126,7 +96,6 @@ impl Conversation {
             greeted: false,
             bye: false,
             pending_dial: false,
-            last_rx: None,
         }
     }
 }
@@ -162,13 +131,14 @@ enum GroupPayload {
     },
 }
 
-fn group_topic(group_id: &str) -> IdentTopic {
-    IdentTopic::new(format!("/group/{group_id}/v1"))
+/// 群 topic 字符串（L1 不解释 topic，直接透传；订阅/发布/接收须用同一格式）
+fn group_topic(group_id: &str) -> String {
+    format!("/group/{group_id}/v1")
 }
 
-/// 群主向目标成员 1v1 扇出名单更新（版本化整体替换）
+/// 群主向目标成员 1v1 扇出名单更新（版本化整体替换）：同步排入命令队列，主循环统一消费
 fn fanout_member_list(
-    swarm: &mut Swarm<NodeBehaviour>,
+    ops: &mut VecDeque<AsyncOp>,
     group_id: &str,
     version: u64,
     members: &[String],
@@ -180,27 +150,55 @@ fn fanout_member_list(
         members: members.to_vec(),
     })
     .unwrap_or_default();
-    let request = ChatRequest(Frame {
+    let frame = Frame {
         control: None,
         text: None,
         binary: Some(payload),
-    });
+    };
     for p in targets {
-        let _ = swarm.behaviour_mut().chat.send_request(p, request.clone());
+        ops.push_back(AsyncOp::Cmd(P2pCommand::Send {
+            peer: *p,
+            frame: frame.clone(),
+        }));
     }
 }
 
-/// 拨号群成员（跳过自己/已连接/已在途）：常驻群保持 mesh 与聚焦群按需连接的共用入口
+/// 事件分支（主循环内、已有命令发送器）用的异步扇出
+async fn fanout_member_list_async(
+    cmd_tx: &tokio::sync::mpsc::Sender<P2pCommand>,
+    group_id: &str,
+    version: u64,
+    members: &[String],
+    targets: &[PeerId],
+) {
+    let payload = serde_cbor::to_vec(&AppPayload::GroupMemberList {
+        group_id: group_id.to_string(),
+        version,
+        members: members.to_vec(),
+    })
+    .unwrap_or_default();
+    let frame = Frame {
+        control: None,
+        text: None,
+        binary: Some(payload),
+    };
+    for p in targets {
+        let _ = cmd_tx
+            .send(P2pCommand::Send {
+                peer: *p,
+                frame: frame.clone(),
+            })
+            .await;
+    }
+}
+
+/// 拨号群成员（跳过自己/已连接/无已知地址）：常驻群保持 mesh 与聚焦群按需连接的共用入口
 fn dial_group_members(
-    swarm: &mut Swarm<NodeBehaviour>,
+    ops: &mut VecDeque<AsyncOp>,
     g: &Group,
     my_id: &PeerId,
-    conn_count: &HashMap<PeerId, u32>,
-    known_addrs: &mut HashMap<PeerId, Vec<Multiaddr>>,
-    reconnect_peer: &mut Option<PeerId>,
-    reconnect_pending: &mut Vec<Multiaddr>,
-    reconnect_queue: &mut VecDeque<PeerId>,
-    dialing: &mut HashSet<PeerId>,
+    connected: &HashSet<PeerId>,
+    registered: &HashMap<PeerId, Vec<Multiaddr>>,
 ) {
     let my_id_str = my_id.to_string();
     for m in &g.members {
@@ -210,21 +208,13 @@ fn dial_group_members(
         let Ok(pid) = m.parse::<PeerId>() else {
             continue;
         };
-        if conn_count.contains_key(&pid) || *reconnect_peer == Some(pid) {
+        if connected.contains(&pid) {
             continue;
         }
-        if known_addrs.get(&pid).map(|a| !a.is_empty()).unwrap_or(false) {
-            enqueue_reconnect(pid, reconnect_queue, reconnect_peer);
+        if registered.get(&pid).map(|a| !a.is_empty()).unwrap_or(false) {
+            ops.push_back(AsyncOp::Cmd(P2pCommand::DialPeer(pid)));
         }
     }
-    dial_next_reconnect(
-        swarm,
-        dialing,
-        reconnect_peer,
-        reconnect_pending,
-        known_addrs,
-        reconnect_queue,
-    );
 }
 
 fn groups_path(my_peer_id: &PeerId) -> PathBuf {
@@ -253,21 +243,19 @@ fn save_groups(my_peer_id: &PeerId, groups: &HashMap<String, Group>) -> Result<(
     std::fs::write(&path, s).map_err(|e| format!("写入群注册表失败: {e}"))
 }
 
-/// 由 peer 解析显示名：先查 1v1 会话名，再查联系人，兜底完整节点ID
+/// 由 peer 解析显示名：先查 1v1 会话名，再查 L2 联系人，兜底完整节点ID
 fn peer_name(
     peer: &PeerId,
     conversations: &HashMap<PeerId, Conversation>,
-    contacts: &ContactBook,
+    identity: &IdentityService,
 ) -> String {
     if let Some(c) = conversations.get(peer) {
         if !c.name.is_empty() {
             return c.name.clone();
         }
     }
-    if let Some(e) = contacts.get(&peer.to_string()) {
-        if !e.name.is_empty() {
-            return e.name.clone();
-        }
+    if let Some(n) = identity.contact_name(peer) {
+        return n;
     }
     peer.to_string()
 }
@@ -336,8 +324,8 @@ fn parse_dial_addr(input: &str) -> Result<Multiaddr, String> {
     s.parse::<Multiaddr>().map_err(|e| format!("地址整体解析失败: {e}"))
 }
 
-fn build_tree() -> CmdTree<ChatCtx> {
-    let mut tree: CmdTree<ChatCtx> = CmdTree::new();
+fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
+    let mut tree: CmdTree<ChatCtx<'a>> = CmdTree::new();
     let dial = tree.register(ROOT, "dial", |ctx, args| {
         if args.is_empty() {
             print_dial_template();
@@ -345,7 +333,19 @@ fn build_tree() -> CmdTree<ChatCtx> {
         }
         let raw = args.join(" ");
         match parse_dial_addr(&raw) {
-            Ok(ma) => ctx.action = ChatAction::Dial(ma),
+            Ok(ma) => {
+                let target = ma.iter().find_map(|p| match p {
+                    Protocol::P2p(pid) => Some(pid),
+                    _ => None,
+                });
+                if let Some(p) = target {
+                    let recorded = ctx.registered.entry(p).or_default();
+                    if !recorded.contains(&ma) {
+                        recorded.push(ma.clone());
+                    }
+                }
+                push_cmd(&mut ctx.ops, P2pCommand::Dial { addr: ma });
+            }
             Err(reason) => {
                 eprintln!("{}", format!("地址无效: {reason}").red());
                 print_dial_template();
@@ -361,16 +361,176 @@ fn build_tree() -> CmdTree<ChatCtx> {
             );
             return;
         }
-        ctx.action = ChatAction::Chat(args.join(" "));
+        let target = args.join(" ");
+        match ctx.resolve(&target) {
+            Some(p) => {
+                *ctx.focused_group = None;
+                if ctx.connected.contains(&p) {
+                    // 已连接：仅切换焦点
+                    *ctx.focused = Some(p);
+                    let name = ctx
+                        .conversations
+                        .get(&p)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default();
+                    println!(
+                        "{}",
+                        format!(
+                            "已切换到会话: {}（{p}）",
+                            if name.is_empty() {
+                                target.as_str()
+                            } else {
+                                name.as_str()
+                            }
+                        )
+                        .green()
+                    );
+                } else {
+                    // 未连接：建/复用会话并拨号（或待接）
+                    ctx.conversations.entry(p).or_insert_with(Conversation::new);
+                    *ctx.focused = Some(p);
+                    let name = ctx.conversations[&p].name.clone();
+                    if name.is_empty() {
+                        ctx.conversations.get_mut(&p).unwrap().name = target.to_string();
+                    }
+                    match ctx.registered.get(&p) {
+                        Some(addrs) if !addrs.is_empty() => {
+                            println!("{}", format!("正在连接 {target}...").cyan());
+                            ctx.conversations.get_mut(&p).unwrap().pending_dial = false;
+                            push_cmd(&mut ctx.ops, P2pCommand::DialPeer(p));
+                        }
+                        _ => {
+                            ctx.conversations.get_mut(&p).unwrap().pending_dial = true;
+                            println!(
+                                "{}",
+                                "该节点暂无已知地址，等待 mDNS 发现，发现后自动连接".cyan()
+                            );
+                        }
+                    }
+                }
+            }
+            None => eprintln!(
+                "{}",
+                format!(
+                    "未知角色: {target}（须为完整角色名或完整节点ID，/list 查看）"
+                )
+                .yellow()
+            ),
+        }
     });
     tree.set_help(chat, "按完整角色名或完整节点ID发起 1v1 聊天");
-    let list = tree.register(ROOT, "list", |ctx, _| ctx.action = ChatAction::List);
+    let list = tree.register(ROOT, "list", |ctx, _| {
+        if ctx.registered.is_empty() {
+            println!(
+                "{}",
+                "暂无已登记节点（等待 mDNS 发现或用 /dial 直连）".dimmed()
+            );
+        } else {
+            println!("{}", "=== 已登记节点 ===".cyan());
+            let mut entries: Vec<(String, &PeerId, usize)> = ctx
+                .registered
+                .iter()
+                .map(|(p, addrs)| (p.to_string(), p, addrs.len()))
+                .collect();
+            entries.sort();
+            for (id_str, p, addr_n) in entries {
+                let pname = peer_name(p, ctx.conversations, ctx.identity);
+                let who = if pname == p.to_string() {
+                    "未知".to_string()
+                } else {
+                    pname
+                };
+                let state = if *ctx.focused == Some(*p) {
+                    "当前会话"
+                } else if ctx.connected.contains(p) {
+                    "已连接"
+                } else {
+                    "离线"
+                };
+                let trust_badge = if ctx.identity.is_verified(p) {
+                    "已信任".green()
+                } else {
+                    "未信任".yellow()
+                };
+                println!(
+                    "  {who}  {id_str}  [{}]  [{state}]  地址数 {addr_n}",
+                    trust_badge
+                );
+            }
+        }
+        if !ctx.groups.is_empty() {
+            println!("{}", "=== 群聊 ===".cyan());
+            for g in ctx.groups.values() {
+                let n = g.members.len();
+                let focus = if ctx.focused_group.as_deref() == Some(g.id.as_str()) {
+                    "  ← 当前群聊".green()
+                } else {
+                    "".dimmed()
+                };
+                let resident = if g.resident {
+                    " [常驻]".green()
+                } else {
+                    "".dimmed()
+                };
+                println!(
+                    "  {}（{} 人，名单版本 {}，群ID {}）{resident}{focus}",
+                    g.name, n, g.version, g.id
+                );
+            }
+        }
+    });
     tree.set_help(list, "列出已登记节点与状态");
-    let quit = tree.register(ROOT, "quit", |ctx, _| ctx.action = ChatAction::Quit);
+    let quit = tree.register(ROOT, "quit", |ctx, _| {
+        let peers: Vec<PeerId> = ctx
+            .conversations
+            .iter()
+            .filter(|(p, c)| ctx.connected.contains(p) && !c.bye)
+            .map(|(p, _)| *p)
+            .collect();
+        for p in peers {
+            push_cmd(
+                &mut ctx.ops,
+                P2pCommand::Send {
+                    peer: p,
+                    frame: Frame {
+                        control: None,
+                        text: Some(NodeMsg::Bye),
+                        binary: None,
+                    },
+                },
+            );
+            println!("{}", format!("正在通知对方下线: {p}...").dimmed());
+        }
+        ctx.quit = true;
+    });
     tree.set_help(quit, "退出聊天");
-    let q = tree.register(ROOT, "q", |ctx, _| ctx.action = ChatAction::Quit);
+    let q = tree.register(ROOT, "q", |ctx, _| {
+        let peers: Vec<PeerId> = ctx
+            .conversations
+            .iter()
+            .filter(|(p, c)| ctx.connected.contains(p) && !c.bye)
+            .map(|(p, _)| *p)
+            .collect();
+        for p in peers {
+            push_cmd(
+                &mut ctx.ops,
+                P2pCommand::Send {
+                    peer: p,
+                    frame: Frame {
+                        control: None,
+                        text: Some(NodeMsg::Bye),
+                        binary: None,
+                    },
+                },
+            );
+            println!("{}", format!("正在通知对方下线: {p}...").dimmed());
+        }
+        ctx.quit = true;
+    });
     tree.set_help(q, "退出聊天");
-    let backup = tree.register(ROOT, "backup", |ctx, _| ctx.action = ChatAction::Backup);
+    let backup = tree.register(ROOT, "backup", |ctx, _| {
+        ctx.ops.push_back(AsyncOp::Backup);
+    });
     tree.set_help(backup, "重新查看本身份助记词（需输入密码）");
     let trust = tree.register(ROOT, "trust", |ctx, args| {
         if args.is_empty() {
@@ -380,7 +540,27 @@ fn build_tree() -> CmdTree<ChatCtx> {
             );
             return;
         }
-        ctx.action = ChatAction::Trust(args.join(" "));
+        let target = args.join(" ");
+        let (untrust, target) = match target.strip_prefix('!') {
+            Some(stripped) => (true, stripped.to_string()),
+            None => (false, target),
+        };
+        match ctx.resolve(&target) {
+            Some(p) => {
+                let name = ctx
+                    .conversations
+                    .get(&p)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "未知".to_string());
+                ctx.identity.trust(&p, &name, !untrust);
+                if untrust {
+                    println!("{}", format!("已取消信任: {name}").yellow());
+                } else {
+                    println!("{}", format!("已信任: {name}").green());
+                }
+            }
+            None => eprintln!("{}", "未知节点，无法标记信任（用 /list 查看）".yellow()),
+        }
     });
     tree.set_help(trust, "标记/取消信任联系人（! 前缀取消）");
     let discover = tree.register(ROOT, "discover", |ctx, args| {
@@ -400,13 +580,48 @@ fn build_tree() -> CmdTree<ChatCtx> {
                 return;
             }
         };
-        ctx.action = ChatAction::Discover(mode);
+        match save_discovery_mode(ctx.identity.my_id(), mode) {
+            Ok(()) => println!(
+                "{}",
+                format!(
+                    "发现模式已设为 {}（下次进入聊天生效）",
+                    mode.name()
+                )
+                .green()
+            ),
+            Err(e) => {
+                eprintln!("{}", format!("保存失败: {e}").yellow())
+            }
+        }
     });
     tree.set_help(discover, "设置 mDNS 发现模式（下次进入聊天生效）");
     // group 树：`/group <群名>` 聚焦由 group 节点处理，子命令注册为子节点（指令树最深命中）
     let group = tree.register(ROOT, "group", |ctx, args| {
         match args.first() {
-            Some(name) => ctx.action = ChatAction::GroupFocus(name.to_string()),
+            Some(name) => match ctx.group_id(name) {
+                Some(gid) => {
+                    *ctx.focused_group = Some(gid.clone());
+                    *ctx.focused = None;
+                    let g = ctx.groups[&gid].clone();
+                    let gname = g.name.clone();
+                    // 聚焦即连：拨号群成员（常驻群维持 mesh，普通群按需连接）
+                    dial_group_members(
+                        &mut ctx.ops,
+                        &g,
+                        ctx.identity.my_id(),
+                        ctx.connected,
+                        ctx.registered,
+                    );
+                    println!(
+                        "{}",
+                        format!("已切换到群聊: {gname}（输入直接发群里）").green()
+                    );
+                }
+                None => eprintln!(
+                    "{}",
+                    format!("未知群: {name}（/group list 查看）").yellow()
+                ),
+            },
             None => eprintln!(
                 "{}",
                 "群聊: /group new <群名> 建群 | /group add <群名> <角色|节点ID> 加人(仅群主) | /group resident <群名> on|off 常驻接收 | /group leave <群名> 退群 | /group list 列群 | /group <群名> 聚焦".yellow()
@@ -416,422 +631,246 @@ fn build_tree() -> CmdTree<ChatCtx> {
     tree.set_help(group, "聚焦群聊（/group <群名>）；子命令 new/add/resident/leave/list");
     let g_new = tree.register(group, "new", |ctx, args| {
         match args.first() {
-            Some(name) if !name.is_empty() => ctx.action = ChatAction::GroupNew(name.to_string()),
+            Some(name) if !name.is_empty() => {
+                if ctx.groups.values().any(|g| g.name == *name) {
+                    eprintln!("{}", format!("已存在同名群: {name}").yellow());
+                } else {
+                    let id = format!("{:08x}", OsRng.next_u32());
+                    let creator = ctx.identity.my_id().to_string();
+                    ctx.groups.insert(
+                        id.clone(),
+                        Group {
+                            id: id.clone(),
+                            name: name.to_string(),
+                            members: vec![creator.clone()],
+                            version: 0,
+                            creator: creator.clone(),
+                            resident: false, // 默认非常驻，用户显式 /group resident on
+                        },
+                    );
+                    push_cmd(
+                        &mut ctx.ops,
+                        P2pCommand::Subscribe {
+                            topic: group_topic(&id),
+                        },
+                    );
+                    let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
+                    *ctx.focused_group = Some(id.clone());
+                    *ctx.focused = None;
+                    println!(
+                        "{}",
+                        format!("已创建并聚焦群聊: {name}（群ID {id}，你是群主）").green()
+                    );
+                }
+            }
             _ => eprintln!("{}", "用法: /group new <群名>".yellow()),
         }
     });
     tree.set_help(g_new, "建群");
     let g_add = tree.register(group, "add", |ctx, args| {
-        match (args.first(), args.get(1)) {
-            (Some(g), Some(t)) => {
-                ctx.action = ChatAction::GroupAdd {
-                    group: g.to_string(),
-                    target: t.to_string(),
+        let (group, target) = match (args.first(), args.get(1)) {
+            (Some(g), Some(t)) => (g.to_string(), t.to_string()),
+            _ => {
+                eprintln!("{}", "用法: /group add <群名> <角色|节点ID>（仅群主）".yellow());
+                return;
+            }
+        };
+        match ctx.group_id(&group) {
+            Some(gid) => {
+                let my_id = ctx.identity.my_id().to_string();
+                if ctx.groups[&gid].creator != my_id {
+                    eprintln!("{}", "仅群主可邀请新成员".yellow());
+                    return;
+                }
+                match ctx.resolve(&target) {
+                    Some(p) => {
+                        if !ctx.identity.is_verified(&p) {
+                            eprintln!(
+                                "{}",
+                                format!("{target} 尚未验证，请先 /trust {target}").yellow()
+                            );
+                        } else if ctx.groups[&gid].members.contains(&p.to_string()) {
+                            println!("{}", format!("{target} 已在群 {group} 中").dimmed());
+                        } else {
+                            let name = peer_name(&p, ctx.conversations, ctx.identity);
+                            ctx.groups.get_mut(&gid).unwrap().version += 1;
+                            ctx.groups.get_mut(&gid).unwrap().members.push(p.to_string());
+                            let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
+                            // 邀请新成员（携带当前版本 + 全量名单，入群即一致）
+                            let g = &ctx.groups[&gid];
+                            let invite = serde_cbor::to_vec(&AppPayload::GroupInvite {
+                                group_id: g.id.clone(),
+                                group_name: g.name.clone(),
+                                version: g.version,
+                                members: g.members.clone(),
+                            })
+                            .unwrap_or_default();
+                            push_cmd(
+                                &mut ctx.ops,
+                                P2pCommand::Send {
+                                    peer: p,
+                                    frame: Frame {
+                                        control: None,
+                                        text: None,
+                                        binary: Some(invite),
+                                    },
+                                },
+                            );
+                            // 向其余成员（不含新人、不含自己）1v1 扇出名单更新
+                            let g = &ctx.groups[&gid];
+                            let others: Vec<PeerId> = g
+                                .members
+                                .iter()
+                                .filter(|m| {
+                                    m.as_str() != &p.to_string() && m.as_str() != &my_id
+                                })
+                                .filter_map(|m| m.parse().ok())
+                                .collect();
+                            fanout_member_list(
+                                &mut ctx.ops,
+                                &g.id,
+                                g.version,
+                                &g.members,
+                                &others,
+                            );
+                            println!(
+                                "{}",
+                                format!(
+                                    "已将 {name} 加入群 {group}（名单版本 {}）",
+                                    g.version
+                                )
+                                .green()
+                            );
+                        }
+                    }
+                    None => eprintln!(
+                        "{}",
+                        format!("未知成员: {target}（须为已连接的角色名或节点ID）").yellow()
+                    ),
                 }
             }
-            _ => eprintln!("{}", "用法: /group add <群名> <角色|节点ID>（仅群主）".yellow()),
+            None => eprintln!("{}", format!("未知群: {group}（/group list 查看）").yellow()),
         }
     });
     tree.set_help(g_add, "加人（仅群主）");
     let g_resident = tree.register(group, "resident", |ctx, args| {
-        match (args.first(), args.get(1)) {
-            (Some(g), Some(onoff)) => match *onoff {
-                "on" => ctx.action = ChatAction::GroupResident {
-                    group: g.to_string(),
-                    enable: true,
-                },
-                "off" => ctx.action = ChatAction::GroupResident {
-                    group: g.to_string(),
-                    enable: false,
-                },
-                _ => eprintln!("{}", "用法: /group resident <群名> on|off".yellow()),
-            },
-            _ => eprintln!("{}", "用法: /group resident <群名> on|off".yellow()),
+        let (group, enable) = match (args.first(), args.get(1)) {
+            (Some(g), Some(&"on")) => (g.to_string(), true),
+            (Some(g), Some(&"off")) => (g.to_string(), false),
+            _ => {
+                eprintln!("{}", "用法: /group resident <群名> on|off".yellow());
+                return;
+            }
+        };
+        match ctx.group_id(&group) {
+            Some(gid) => {
+                ctx.groups.get_mut(&gid).unwrap().resident = enable;
+                let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
+                let name = ctx.groups[&gid].name.clone();
+                if enable {
+                    // 标记常驻：立即补连成员（上线后也会自动拨号）
+                    let g = ctx.groups[&gid].clone();
+                    dial_group_members(
+                        &mut ctx.ops,
+                        &g,
+                        ctx.identity.my_id(),
+                        ctx.connected,
+                        ctx.registered,
+                    );
+                }
+                println!(
+                    "{}",
+                    format!(
+                        "群 {name} 已设为{}常驻（成员上线自动连接维持接收）",
+                        if enable { "" } else { "非" }
+                    )
+                    .green()
+                );
+            }
+            None => eprintln!("{}", format!("未知群: {group}（/group list 查看）").yellow()),
         }
     });
     tree.set_help(g_resident, "常驻接收 on/off（防通讯风暴）");
     let g_leave = tree.register(group, "leave", |ctx, args| {
-        match args.first() {
-            Some(name) => ctx.action = ChatAction::GroupLeave(name.to_string()),
-            None => eprintln!("{}", "用法: /group leave <群名>".yellow()),
+        let group = match args.first() {
+            Some(name) => name.to_string(),
+            None => {
+                eprintln!("{}", "用法: /group leave <群名>".yellow());
+                return;
+            }
+        };
+        match ctx.group_id(&group) {
+            Some(gid) => {
+                let creator: PeerId = match ctx.groups[&gid].creator.parse() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        eprintln!("{}", "该群缺少群主信息，无法退群".yellow());
+                        return;
+                    }
+                };
+                // 通知群主划去自己
+                let leave = serde_cbor::to_vec(&AppPayload::GroupLeave {
+                    group_id: gid.clone(),
+                })
+                .unwrap_or_default();
+                push_cmd(
+                    &mut ctx.ops,
+                    P2pCommand::Send {
+                        peer: creator,
+                        frame: Frame {
+                            control: None,
+                            text: None,
+                            binary: Some(leave),
+                        },
+                    },
+                );
+                // 本地移除群记录并退订 topic
+                push_cmd(
+                    &mut ctx.ops,
+                    P2pCommand::Unsubscribe {
+                        topic: group_topic(&gid),
+                    },
+                );
+                if ctx.focused_group.as_deref() == Some(gid.as_str()) {
+                    *ctx.focused_group = None;
+                }
+                ctx.groups.remove(&gid);
+                let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
+                println!(
+                    "{}",
+                    format!("已退出群聊 {group}（已通知群主）").yellow()
+                );
+            }
+            None => eprintln!("{}", format!("未知群: {group}（/group list 查看）").yellow()),
         }
     });
     tree.set_help(g_leave, "退群（通知群主划去）");
-    let g_list = tree.register(group, "list", |ctx, _| ctx.action = ChatAction::GroupList);
+    let g_list = tree.register(group, "list", |ctx, _| {
+        if ctx.groups.is_empty() {
+            println!("{}", "暂无群聊（/group new <群名> 创建）".dimmed());
+        } else {
+            println!("{}", "=== 群聊 ===".cyan());
+            for g in ctx.groups.values() {
+                let n = g.members.len();
+                let focus = if ctx.focused_group.as_deref() == Some(g.id.as_str()) {
+                    "  ← 当前群聊".green()
+                } else {
+                    "".dimmed()
+                };
+                let resident = if g.resident {
+                    " [常驻]".green()
+                } else {
+                    "".dimmed()
+                };
+                println!(
+                    "  {}（{} 人，名单版本 {}，群ID {}）{resident}{focus}",
+                    g.name, n, g.version, g.id
+                );
+            }
+        }
+    });
     tree.set_help(g_list, "列群");
     tree
-}
-
-/// 将 peer 加入重连队列（不在当前重连中、且未在队列里才入队）
-fn enqueue_reconnect(
-    peer: PeerId,
-    queue: &mut VecDeque<PeerId>,
-    reconnect_peer: &Option<PeerId>,
-) {
-    if *reconnect_peer != Some(peer) && !queue.contains(&peer) {
-        queue.push_back(peer);
-    }
-}
-
-/// 重连驱动：依次处理重连队列，逐个尝试目标 peer 的已知地址。
-/// 当前无在途目标时从队列取队首；地址耗尽则报失败、清地址、继续下一目标
-fn dial_next_reconnect(
-    swarm: &mut Swarm<NodeBehaviour>,
-    dialing: &mut HashSet<PeerId>,
-    reconnect_peer: &mut Option<PeerId>,
-    pending: &mut Vec<Multiaddr>,
-    known_addrs: &mut HashMap<PeerId, Vec<Multiaddr>>,
-    queue: &mut VecDeque<PeerId>,
-) {
-    loop {
-        if reconnect_peer.is_none() {
-            let p = match queue.pop_front() {
-                Some(p) => p,
-                None => return,
-            };
-            *reconnect_peer = Some(p);
-            *pending = known_addrs.get(&p).cloned().unwrap_or_default();
-        }
-        let target = reconnect_peer.as_ref().unwrap().clone();
-        while let Some(ma) = pending.pop() {
-            if swarm.dial(ma).is_ok() {
-                dialing.insert(target);
-                return;
-            }
-        }
-        known_addrs.remove(&target);
-        *reconnect_peer = None;
-        eprintln!(
-            "{}",
-            format!("重连失败: {target} 的已知地址均无法连接，对方可能已退出").yellow()
-        );
-    }
-}
-
-/// 节点被发现（mDNS 广播 或 隐身监听）的公共处理：登记地址 + 待接呼叫/常驻群成员自动拨号
-fn on_peer_discovered(
-    found_id: PeerId,
-    addr: Multiaddr,
-    local: &PeerId,
-    swarm: &mut Swarm<NodeBehaviour>,
-    known_addrs: &mut HashMap<PeerId, Vec<Multiaddr>>,
-    conversations: &HashMap<PeerId, Conversation>,
-    groups: &HashMap<String, Group>,
-    reconnect_peer: &mut Option<PeerId>,
-    reconnect_pending: &mut Vec<Multiaddr>,
-    dialing: &mut HashSet<PeerId>,
-    conn_count: &HashMap<PeerId, u32>,
-    queue: &mut VecDeque<PeerId>,
-) {
-    if found_id == *local {
-        return;
-    }
-    println!("{}", format!("mDNS 发现节点: {found_id}").cyan());
-    let recorded = known_addrs.entry(found_id).or_default();
-    if !recorded.contains(&addr) {
-        recorded.push(addr.clone());
-    }
-    let pending_dial = conversations
-        .get(&found_id)
-        .map(|c| c.pending_dial)
-        .unwrap_or(false);
-    // 常驻群成员：上线即自动拨号维持 mesh（防通讯风暴，仅常驻群生效）
-    let resident_member = groups.values().any(|g| {
-        g.resident && g.members.iter().any(|m| m == &found_id.to_string())
-    });
-    if (pending_dial || resident_member)
-        && *reconnect_peer != Some(found_id)
-        && !conn_count.contains_key(&found_id)
-    {
-        println!("{}", format!("发现可连接节点，拨号 {found_id}").cyan());
-        enqueue_reconnect(found_id, queue, reconnect_peer);
-        dial_next_reconnect(
-            swarm,
-            dialing,
-            reconnect_peer,
-            reconnect_pending,
-            known_addrs,
-            queue,
-        );
-    }
-}
-
-fn normalize_birthday(raw: &str) -> Result<String, String> {
-    let parts: Vec<&str> = raw.trim().split('-').collect();
-    if parts.len() != 3 {
-        return Err("生日格式应为 YYYY-MM-DD，如 1990-01-01".into());
-    }
-    let (y, m, d): (u32, u32, u32) = (
-        parts[0]
-            .parse()
-            .map_err(|_| "年份应为数字".to_string())?,
-        parts[1]
-            .parse()
-            .map_err(|_| "月份应为数字".to_string())?,
-        parts[2]
-            .parse()
-            .map_err(|_| "日期应为数字".to_string())?,
-    );
-    if !(1900..=2100).contains(&y) {
-        return Err(format!("年份 {y} 超出范围 1900-2100"));
-    }
-    if !(1..=12).contains(&m) {
-        return Err(format!("月份 {m} 超出范围 1-12"));
-    }
-    if !(1..=31).contains(&d) {
-        return Err(format!("日期 {d} 超出范围 1-31"));
-    }
-    Ok(format!("{y:04}-{m:02}-{d:02}"))
-}
-
-fn normalize_gender(raw: &str) -> Result<char, String> {
-    match raw.trim() {
-        "男" | "M" | "m" => Ok('M'),
-        "女" | "F" | "f" => Ok('F'),
-        "保密" | "O" | "o" => Ok('O'),
-        other => Err(format!("性别须为 男/M、女/F 或 保密/O，当前: {other}")),
-    }
-}
-
-/// 输入行迭代器（stdin 被管道接管时逐行读取）
-type StdinLines = tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>;
-
-async fn read_line(stdin: &mut StdinLines, prompt: &str) -> Result<String, Box<dyn Error>> {
-    print!("{prompt}");
-    std::io::stdout().flush()?;
-    match stdin.next_line().await? {
-        Some(l) => Ok(l),
-        None => Err("输入结束".into()),
-    }
-}
-
-/// 读取密码：交互终端不回显（rpassword）；管道环境（测试/脚本）退回行读取
-async fn read_secret(
-    stdin: &mut StdinLines,
-    interactive: bool,
-    prompt: &str,
-) -> Result<String, Box<dyn Error>> {
-    if interactive {
-        Ok(rpassword::prompt_password(prompt)?)
-    } else {
-        read_line(stdin, prompt).await
-    }
-}
-
-/// 交互收集资料信息（姓名/生日/性别）
-async fn prompt_profile(stdin: &mut StdinLines) -> Result<IdentityInfo, Box<dyn Error>> {
-    let name = loop {
-        let raw = read_line(stdin, "姓名: ").await?;
-        let name = raw.trim().to_string();
-        if name.is_empty() || name.len() > 64 {
-            eprintln!("{}", "姓名不能为空且不超过 64 字节".yellow());
-        } else {
-            break name;
-        }
-    };
-    let birthday = loop {
-        let raw = read_line(stdin, "生日 (YYYY-MM-DD): ").await?;
-        match normalize_birthday(&raw) {
-            Ok(b) => break b,
-            Err(reason) => eprintln!("{}", reason.yellow()),
-        }
-    };
-    let gender = loop {
-        let raw = read_line(stdin, "性别 (男/M 女/F 保密/O): ").await?;
-        match normalize_gender(&raw) {
-            Ok(g) => break g,
-            Err(reason) => eprintln!("{}", reason.yellow()),
-        }
-    };
-    Ok(IdentityInfo {
-        name,
-        birthday,
-        gender,
-    })
-}
-
-/// 交互收集并校验密码
-async fn prompt_password(
-    stdin: &mut StdinLines,
-    interactive: bool,
-) -> Result<String, Box<dyn Error>> {
-    loop {
-        let pwd = read_secret(stdin, interactive, "密码: ").await?;
-        if valid_password(&pwd) {
-            return Ok(pwd);
-        }
-        eprintln!("{}", "密码须为 8~128 字节".yellow());
-    }
-}
-
-/// 展示助记词与安全提示
-fn print_mnemonic_guide(phrase: &str) {
-    println!("{}", "=".repeat(60).yellow());
-    println!(
-        "{}",
-        "你的身份助记词（12 词，唯一备份；丢失即永久丢失身份，泄露即身份被窃取）:".yellow()
-    );
-    println!("{}", phrase.red());
-    println!("{}", "=".repeat(60).yellow());
-}
-
-/// 登录流程：新身份生成 / 助记词恢复 / 缓存 keystore 解锁。
-/// 新身份与恢复都会自动加密保存 keystore；同 ID 冲突由调用方在探测后处理。
-async fn login_flow(
-    stdin: &mut StdinLines,
-    interactive: bool,
-) -> Result<LoginOutcome, Box<dyn Error>> {
-    loop {
-        let cached = load_keystores();
-        println!("{}", "[角色登录]".green());
-        if cached.is_empty() {
-            println!("{}", "暂无本地身份".dimmed());
-        } else {
-            println!("缓存身份:");
-            for (i, (ks, info)) in cached.iter().enumerate() {
-                println!("  {}. {}  ({})", i + 1, info.name, ks.peer_id);
-            }
-        }
-        println!("  0. 新身份登录");
-        println!("  r. 从助记词恢复");
-        let input = read_line(stdin, "请选择: ").await?;
-        let input = input.trim();
-
-        if input == "0" {
-            // 新身份：生成助记词，展示一次并要求抄写确认
-            let info = prompt_profile(stdin).await?;
-            let phrase = loop {
-                let phrase = match generate_mnemonic() {
-                    Ok(p) => p,
-                    Err(reason) => {
-                        eprintln!("{}", reason.red());
-                        continue;
-                    }
-                };
-                print_mnemonic_guide(&phrase);
-                let confirm = read_line(
-                    stdin,
-                    &format!("请抄下助记词，输入前 {MNEMONIC_CONFIRM_WORDS} 个词确认: "),
-                )
-                .await?;
-                let first: Vec<&str> = phrase
-                    .split_whitespace()
-                    .take(MNEMONIC_CONFIRM_WORDS)
-                    .collect();
-                let got: Vec<&str> = confirm.split_whitespace().collect();
-                if got.len() >= MNEMONIC_CONFIRM_WORDS
-                    && got[..MNEMONIC_CONFIRM_WORDS] == first[..]
-                {
-                    break phrase;
-                }
-                eprintln!("{}", "确认词不匹配，请重新抄写".yellow());
-            };
-            let password = prompt_password(stdin, interactive).await?;
-            let keypair = keypair_from_mnemonic(&phrase)?;
-            let peer_id = keypair.public().to_peer_id();
-            save_keystore(&info, &peer_id, &phrase, &password)?;
-            return Ok(LoginOutcome { keypair, info });
-        } else if input == "r" {
-            // 从助记词恢复身份（跨设备迁移 / 备份恢复）
-            let phrase = read_line(stdin, "助记词（12 个英文词，空格分隔）: ").await?;
-            let keypair = match keypair_from_mnemonic(&phrase) {
-                Ok(kp) => kp,
-                Err(reason) => {
-                    eprintln!("{}", reason.red());
-                    continue;
-                }
-            };
-            let info = prompt_profile(stdin).await?;
-            let password = prompt_password(stdin, interactive).await?;
-            let peer_id = keypair.public().to_peer_id();
-            save_keystore(&info, &peer_id, &phrase, &password)?;
-            return Ok(LoginOutcome { keypair, info });
-        } else if let Ok(n) = input.parse::<usize>() {
-            if n >= 1 && n <= cached.len() {
-                // 缓存解锁：密码错误最多重试 3 次
-                let (ks, info) = &cached[n - 1];
-                for _ in 0..3 {
-                    let password = read_secret(stdin, interactive, "密码: ").await?;
-                    if !valid_password(&password) {
-                        eprintln!("{}", "密码须为 8~128 字节".yellow());
-                        continue;
-                    }
-                    match decrypt_mnemonic(
-                        &password,
-                        &ks.salt,
-                        &ks.nonce,
-                        &ks.enc,
-                        ks.kdf_m,
-                        ks.kdf_t,
-                        ks.kdf_p,
-                    ) {
-                        Ok(phrase) => match keypair_from_mnemonic(&phrase) {
-                            Ok(kp) if kp.public().to_peer_id().to_string() == ks.peer_id => {
-                                return Ok(LoginOutcome {
-                                    keypair: kp,
-                                    info: IdentityInfo {
-                                        name: info.name.clone(),
-                                        birthday: info.birthday.clone(),
-                                        gender: info.gender,
-                                    },
-                                });
-                            }
-                            Ok(_) => {
-                                eprintln!("{}", "keystore 与派生身份不符，数据可能损坏".red());
-                            }
-                            Err(reason) => {
-                                eprintln!("{}", reason.red());
-                            }
-                        },
-                        Err(reason) => {
-                            eprintln!("{}", reason.red());
-                        }
-                    }
-                }
-                eprintln!("{}", "连续多次密码错误，返回选择菜单".yellow());
-            } else {
-                eprintln!("{}", "序号无效，请重新选择".yellow());
-            }
-        } else {
-            eprintln!("{}", "无效选择，请输入序号、0 或 r".yellow());
-        }
-    }
-}
-
-
-fn build_swarm(keypair: Keypair, mode: DiscoveryMode) -> Result<Swarm<NodeBehaviour>, Box<dyn Error>> {
-    let swarm = SwarmBuilder::with_existing_identity(keypair)
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
-        .with_behaviour(|key| {
-            let peer_id = key.public().to_peer_id();
-            let mdns = match mode {
-                DiscoveryMode::AdvertiseAndDiscover => {
-                    Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?)
-                }
-                DiscoveryMode::DiscoverOnly | DiscoveryMode::Off => None,
-            };
-            let gossipsub = gossipsub::Behaviour::new(
-                MessageAuthenticity::Signed(key.clone()),
-                gossipsub::Config::default(),
-            )
-            .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>)?;
-            Ok(NodeBehaviour {
-                mdns: Toggle::from(mdns),
-                gossipsub,
-                ping: ping::Behaviour::default(),
-                chat: request_response::cbor::Behaviour::new(
-                    [(StreamProtocol::new("/chat/7.0.0"), ProtocolSupport::Full)],
-                    request_response::Config::default(),
-                ),
-            })
-        })?
-        .build();
-    Ok(swarm)
 }
 
 pub fn run() {
@@ -853,90 +892,38 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
     let interactive = std::io::stdin().is_terminal();
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
 
-    // 登录 + 影子探测；ID 冲突时退回重新选择身份
-    let (mut swarm, my_name, discovery_mode) = loop {
-        let outcome = login_flow(&mut stdin, interactive).await?;
-        let real_id = outcome.keypair.public().to_peer_id();
-        println!(
-            "{}",
-            format!("登录成功: {} (节点ID {real_id})", outcome.info.name).green()
-        );
-        match probe_duplicate_id(real_id, probe_window()).await? {
-            Some(addr) => {
-                eprintln!(
-                    "{}",
-                    format!("该角色 ID 已在线（发现于 {addr}），同一 ID 不能同时上线").red()
-                );
-                eprintln!(
-                    "{}",
-                    "请改用其他身份，或先关闭占用该 ID 的设备后重试".yellow()
-                );
-            }
-            None => {
-                let mode = load_discovery_mode(&real_id);
-                break (build_swarm(outcome.keypair, mode)?, outcome.info.name, mode);
-            }
-        }
-    };
+    // L2 身份基础：登录（含影子探测防同 ID 双在线）+ 联系人簿（TOFU）
+    let mut identity = IdentityService::login(&mut stdin, interactive).await?;
+    let discovery_mode = load_discovery_mode(identity.my_id());
     println!(
         "{}",
         format!("发现模式: {}", discovery_mode.name()).dimmed()
     );
 
-    // TOFU 联系人簿（首次接触记录指纹）
-    let mut contacts = ContactBook::load(swarm.local_peer_id());
-
-    // 群注册表 + 订阅已保存群的 gossipsub topic
-    let mut groups: HashMap<String, Group> = load_groups(swarm.local_peer_id());
-    for g in groups.values() {
-        let _ = swarm.behaviour_mut().gossipsub.subscribe(&group_topic(&g.id));
-    }
+    // L3 群注册表（登录后先读本地持久化）
+    let mut groups: HashMap<String, Group> = load_groups(identity.my_id());
     let mut focused_group: Option<String> = None;
 
-    // 隐身模式：只收不发的 mDNS 监听任务，经通道向主循环上报发现
-    let mut stealth_rx: Option<tokio::sync::mpsc::Receiver<(PeerId, Multiaddr)>> = None;
-    if discovery_mode == DiscoveryMode::DiscoverOnly {
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
-        stealth_rx = Some(rx);
-        tokio::spawn(async move {
-            let mut listener = match StealthMdns::new() {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("{}", format!("隐身监听启动失败: {e}").yellow());
-                    return;
-                }
-            };
-            loop {
-                match listener.next_discovery().await {
-                    Some((pid, addr)) => {
-                        if tx.send((pid, addr)).await.is_err() {
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
-        });
+    // L1 传输任务：命令/事件双通道。事件用无界通道——传输任务永不因应用阻塞
+    // （应用卡在 TOFU/密码等交互 await 时，心跳仍由传输任务独立维持）
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(32);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+    let node = P2pNode::new(identity.keypair().clone(), discovery_mode)?;
+    tokio::spawn(node.run(cmd_rx, ev_tx));
+
+    // 订阅已保存群的 gossipsub topic
+    for g in groups.values() {
+        let _ = cmd_tx
+            .send(P2pCommand::Subscribe {
+                topic: group_topic(&g.id),
+            })
+            .await;
     }
 
-    let listen_addr: Multiaddr = "/ip4/0.0.0.0/tcp/0".parse()?;
-    swarm.listen_on(listen_addr)?;
-    let mut v6_listen_issued = false;
-
-    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     let mut conversations: HashMap<PeerId, Conversation> = HashMap::new();
     let mut focused: Option<PeerId> = None;
-    let mut conn_count: HashMap<PeerId, u32> = HashMap::new();
-    let mut dialing: HashSet<PeerId> = HashSet::new();
-    let mut known_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
-    let mut reconnect_peer: Option<PeerId> = None;
-    let mut reconnect_pending: Vec<Multiaddr> = Vec::new();
-    let mut reconnect_queue: VecDeque<PeerId> = VecDeque::new();
-    let mut user_dials: HashSet<PeerId> = HashSet::new();
-    let mut ctx = ChatCtx {
-        action: ChatAction::None,
-    };
-    let mut tree = build_tree();
+    let mut connected: HashSet<PeerId> = HashSet::new();
+    let mut registered: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
 
     println!(
         "{}",
@@ -959,643 +946,53 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                     continue;
                 }
                 if let Some(cmd) = line.strip_prefix('/') {
-                    ctx.action = ChatAction::None;
+                    // 命令上下文：一次性借用全部状态，handler 同步改状态 + 排异步动作队列。
+                    // 指令树每行重建（无状态 builder，开销可忽略）：其 `ChatCtx<'a>` 生命周期
+                    // 随本次处理结束释放，借用不跨 select 迭代存活。
+                    let mut ctx = ChatCtx {
+                        identity: &mut identity,
+                        cmd_tx: &cmd_tx,
+                        stdin: &mut stdin,
+                        interactive,
+                        conversations: &mut conversations,
+                        groups: &mut groups,
+                        focused: &mut focused,
+                        focused_group: &mut focused_group,
+                        connected: &connected,
+                        registered: &mut registered,
+                        ops: VecDeque::new(),
+                        quit: false,
+                    };
+                    let mut tree = build_tree();
                     if let Err(CmdError::NotFound) = tree.parse(cmd, &mut ctx) {
                         eprintln!("{}", format!("未知命令: {cmd}").yellow());
                     }
-                    match ctx.action {
-                        ChatAction::Quit => {
-                            let peers: Vec<PeerId> = conversations
-                                .iter()
-                                .filter(|(p, c)| conn_count.contains_key(p) && !c.bye)
-                                .map(|(p, _)| *p)
-                                .collect();
-                            for p in peers {
-                                let req_id = swarm.behaviour_mut().chat.send_request(
-                                    &p,
-                                    ChatRequest(Frame {
-                                        control: None,
-                                        text: Some(NodeMsg::Bye),
-                                        binary: None,
-                                    }),
-                                );
-                                println!(
-                                    "{}",
-                                    format!("正在通知对方下线: {p}...").dimmed()
-                                );
-                                let deadline =
-                                    tokio::time::Instant::now() + BYE_HANDSHAKE_TIMEOUT;
-                                loop {
-                                    tokio::select! {
-                                        _ = tokio::time::sleep_until(deadline) => break,
-                                        event = swarm.select_next_some() => {
-                                            let done = match event {
-                                                SwarmEvent::Behaviour(NodeBehaviourEvent::Chat(
-                                                    request_response::Event::Message {
-                                                        message:
-                                                            request_response::Message::Response {
-                                                                request_id,
-                                                                ..
-                                                            },
-                                                        ..
-                                                    },
-                                                )) => request_id == req_id,
-                                                SwarmEvent::Behaviour(NodeBehaviourEvent::Chat(
-                                                    request_response::Event::OutboundFailure {
-                                                        request_id,
-                                                        ..
-                                                    },
-                                                )) => request_id == req_id,
-                                                SwarmEvent::Behaviour(NodeBehaviourEvent::Chat(
-                                                    request_response::Event::Message {
-                                                        message:
-                                                            request_response::Message::Request {
-                                                                channel,
-                                                                ..
-                                                            },
-                                                        ..
-                                                    },
-                                                )) => {
-                                                    let _ = swarm
-                                                        .behaviour_mut()
-                                                        .chat
-                                                        .send_response(channel, ChatResponse(true));
-                                                    false
-                                                }
-                                                _ => false,
-                                            };
-                                            if done {
-                                                break;
-                                            }
-                                        }
-                                    }
+                    // 异步消费 handler 排队的动作（同步生产者 → 异步消费者）
+                    while let Some(op) = ctx.ops.pop_front() {
+                        match op {
+                            AsyncOp::Cmd(c) => {
+                                if let Err(e) = ctx.cmd_tx.send(c).await {
+                                    eprintln!("{}", format!("命令发送失败: {e}").red());
                                 }
                             }
-                            break;
-                        }
-                        ChatAction::Dial(ma) => {
-                            let target = ma.iter().find_map(|p| match p {
-                                Protocol::P2p(pid) => Some(pid),
-                                _ => None,
-                            });
-                            if let Some(p) = target {
-                                let recorded = known_addrs.entry(p).or_default();
-                                if !recorded.contains(&ma) {
-                                    recorded.push(ma.clone());
-                                }
-                            }
-                            match swarm.dial(ma) {
-                                Ok(()) => {
-                                    if let Some(p) = target {
-                                        dialing.insert(p);
-                                        user_dials.insert(p);
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("{}", format!("拨号失败: {e}").red());
+                            AsyncOp::Backup => {
+                                if let Err(e) =
+                                    ctx.identity.backup(ctx.stdin, ctx.interactive).await
+                                {
+                                    eprintln!("{}", format!("备份失败: {e}").red());
                                 }
                             }
                         }
-                        ChatAction::Chat(target) => {
-                            let resolved = conversations
-                                .iter()
-                                .find(|(_, c)| c.name == target)
-                                .map(|(p, _)| *p)
-                                .or_else(|| target.parse::<PeerId>().ok());
-                            match resolved {
-                                Some(p) => {
-                                    focused_group = None;
-                                    if conn_count.contains_key(&p) {
-                                        // 已连接：仅切换焦点
-                                        focused = Some(p);
-                                        let name = conversations
-                                            .get(&p)
-                                            .map(|c| c.name.clone())
-                                            .unwrap_or_default();
-                                        println!(
-                                            "{}",
-                                            format!(
-                                                "已切换到会话: {}（{p}）",
-                                                if name.is_empty() {
-                                                    target.as_str()
-                                                } else {
-                                                    name.as_str()
-                                                }
-                                            )
-                                            .green()
-                                        );
-                                    } else {
-                                        // 未连接：建/复用会话并拨号（或待接）
-                                        conversations
-                                            .entry(p)
-                                            .or_insert_with(Conversation::new);
-                                        focused = Some(p);
-                                        let name = conversations[&p].name.clone();
-                                        if name.is_empty() {
-                                            conversations.get_mut(&p).unwrap().name =
-                                                target.to_string();
-                                        }
-                                        match known_addrs.get(&p) {
-                                            Some(addrs) if !addrs.is_empty() => {
-                                                println!(
-                                                    "{}",
-                                                    format!("正在连接 {target}...").cyan()
-                                                );
-                                                conversations.get_mut(&p).unwrap().pending_dial =
-                                                    false;
-                                                enqueue_reconnect(
-                                                    p,
-                                                    &mut reconnect_queue,
-                                                    &reconnect_peer,
-                                                );
-                                                dial_next_reconnect(
-                                                    &mut swarm,
-                                                    &mut dialing,
-                                                    &mut reconnect_peer,
-                                                    &mut reconnect_pending,
-                                                    &mut known_addrs,
-                                                    &mut reconnect_queue,
-                                                );
-                                            }
-                                            _ => {
-                                                conversations.get_mut(&p).unwrap().pending_dial =
-                                                    true;
-                                                println!(
-                                                    "{}",
-                                                    "该节点暂无已知地址，等待 mDNS 发现，发现后自动连接".cyan()
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                None => eprintln!(
-                                    "{}",
-                                    format!(
-                                        "未知角色: {target}（须为完整角色名或完整节点ID，/list 查看）"
-                                    )
-                                    .yellow()
-                                ),
-                            }
-                        }
-                        ChatAction::List => {
-                            if known_addrs.is_empty() {
-                                println!(
-                                    "{}",
-                                    "暂无已登记节点（等待 mDNS 发现或用 /dial 直连）".dimmed()
-                                );
-                            } else {
-                                println!("{}", "=== 已登记节点 ===".cyan());
-                                let mut entries: Vec<(String, &PeerId, usize)> = known_addrs
-                                    .iter()
-                                    .map(|(p, addrs)| (p.to_string(), p, addrs.len()))
-                                    .collect();
-                                entries.sort();
-                                for (id_str, p, addr_n) in entries {
-                                    let pname = peer_name(p, &conversations, &contacts);
-                                    let who = if pname == p.to_string() {
-                                        "未知".to_string()
-                                    } else {
-                                        pname
-                                    };
-                                    let state = if focused == Some(*p) {
-                                        "当前会话"
-                                    } else if conn_count.contains_key(p) {
-                                        "已连接"
-                                    } else {
-                                        "离线"
-                                    };
-                                    let trust_badge = if contacts.verified(&id_str) {
-                                        "已信任".green()
-                                    } else {
-                                        "未信任".yellow()
-                                    };
-                                    println!(
-                                        "  {who}  {id_str}  [{}]  [{state}]  地址数 {addr_n}",
-                                        trust_badge
-                                    );
-                                }
-                            }
-                            if !groups.is_empty() {
-                                println!("{}", "=== 群聊 ===".cyan());
-                                for g in groups.values() {
-                                    let n = g.members.len();
-                                    let focus = if focused_group.as_deref()
-                                        == Some(g.id.as_str())
-                                    {
-                                        "  ← 当前群聊".green()
-                                    } else {
-                                        "".dimmed()
-                                    };
-                                    let resident = if g.resident {
-                                        " [常驻]".green()
-                                    } else {
-                                        "".dimmed()
-                                    };
-                                    println!(
-                                        "  {}（{} 人，名单版本 {}，群ID {}）{resident}{focus}",
-                                        g.name, n, g.version, g.id
-                                    );
-                                }
-                            }
-                        }
-                        ChatAction::Backup => {
-                            let my_id = swarm.local_peer_id().to_string();
-                            let stored = load_keystores();
-                            if let Some((ks, _)) =
-                                stored.iter().find(|(k, _)| k.peer_id == my_id)
-                            {
-                                println!("{}", "请输入密码以解锁本身份".yellow());
-                                let password =
-                                    read_secret(&mut stdin, interactive, "密码: ").await?;
-                                match decrypt_mnemonic(
-                                    &password,
-                                    &ks.salt,
-                                    &ks.nonce,
-                                    &ks.enc,
-                                    ks.kdf_m,
-                                    ks.kdf_t,
-                                    ks.kdf_p,
-                                ) {
-                                    Ok(phrase) => {
-                                        print_mnemonic_guide(&phrase);
-                                        println!(
-                                            "{}",
-                                            "助记词是唯一备份，请妥善保管".dimmed()
-                                        );
-                                    }
-                                    Err(reason) => eprintln!("{}", reason.red()),
-                                }
-                            } else {
-                                eprintln!(
-                                    "{}",
-                                    "未找到本身份的 keystore（身份未在本机加密保存过）".yellow()
-                                );
-                            }
-                        }
-                        ChatAction::Trust(target) => {
-                            let (untrust, target) = match target.strip_prefix('!') {
-                                Some(stripped) => (true, stripped.to_string()),
-                                None => (false, target),
-                            };
-                            let resolved = conversations
-                                .iter()
-                                .find(|(_, c)| c.name == target)
-                                .map(|(p, _)| *p)
-                                .or_else(|| target.parse::<PeerId>().ok());
-                            match resolved {
-                                Some(p) => {
-                                    let name = conversations
-                                        .get(&p)
-                                        .map(|c| c.name.clone())
-                                        .unwrap_or_else(|| "未知".to_string());
-                                    contacts.ensure_contact(&p, &name, !untrust);
-                                    if untrust {
-                                        println!(
-                                            "{}",
-                                            format!("已取消信任: {name}").yellow()
-                                        );
-                                    } else {
-                                        println!("{}", format!("已信任: {name}").green());
-                                    }
-                                }
-                                None => eprintln!(
-                                    "{}",
-                                    "未知节点，无法标记信任（用 /list 查看）".yellow()
-                                ),
-                            }
-                        }
-                        ChatAction::Discover(mode) => {
-                            match save_discovery_mode(swarm.local_peer_id(), mode) {
-                                Ok(()) => println!(
-                                    "{}",
-                                    format!(
-                                        "发现模式已设为 {}（下次进入聊天生效）",
-                                        mode.name()
-                                    )
-                                    .green()
-                                ),
-                                Err(e) => {
-                                    eprintln!("{}", format!("保存失败: {e}").yellow())
-                                }
-                            }
-                        }
-                        ChatAction::GroupNew(name) => {
-                            if groups.values().any(|g| g.name == name) {
-                                eprintln!(
-                                    "{}",
-                                    format!("已存在同名群: {name}").yellow()
-                                );
-                            } else {
-                                let id = format!("{:08x}", OsRng.next_u32());
-                                let creator = swarm.local_peer_id().to_string();
-                                groups.insert(
-                                    id.clone(),
-                                    Group {
-                                        id: id.clone(),
-                                        name: name.clone(),
-                                        members: vec![creator.clone()], // 群主也是成员
-                                        version: 0,
-                                        creator: creator.clone(),
-                                        resident: false, // 默认非常驻，用户显式 /group resident on
-                                    },
-                                );
-                                let _ = swarm
-                                    .behaviour_mut()
-                                    .gossipsub
-                                    .subscribe(&group_topic(&id));
-                                let _ = save_groups(swarm.local_peer_id(), &groups);
-                                focused_group = Some(id.clone());
-                                focused = None;
-                                println!(
-                                    "{}",
-                                    format!("已创建并聚焦群聊: {name}（群ID {id}，你是群主）").green()
-                                );
-                            }
-                        }
-                        ChatAction::GroupAdd { group, target } => {
-                            let gid = groups
-                                .iter()
-                                .find(|(_, g)| g.name == group)
-                                .map(|(id, _)| id.clone());
-                            match gid {
-                                Some(gid) => {
-                                    let my_id = swarm.local_peer_id().to_string();
-                                    if groups[&gid].creator != my_id {
-                                        eprintln!(
-                                            "{}",
-                                            "仅群主可邀请新成员".yellow()
-                                        );
-                                        continue;
-                                    }
-                                    let resolved = conversations
-                                        .iter()
-                                        .find(|(_, c)| c.name == target)
-                                        .map(|(p, _)| *p)
-                                        .or_else(|| target.parse::<PeerId>().ok());
-                                    match resolved {
-                                        Some(p) => {
-                                            if !contacts.verified(&p.to_string()) {
-                                                eprintln!(
-                                                    "{}",
-                                                    format!(
-                                                        "{target} 尚未验证，请先 /trust {target}"
-                                                    )
-                                                    .yellow()
-                                                );
-                                            } else if groups[&gid]
-                                                .members
-                                                .contains(&p.to_string())
-                                            {
-                                                println!(
-                                                    "{}",
-                                                    format!("{target} 已在群 {group} 中").dimmed()
-                                                );
-                                            } else {
-                                                let name = peer_name(
-                                                    &p,
-                                                    &conversations,
-                                                    &contacts,
-                                                );
-                                                groups.get_mut(&gid).unwrap().version += 1;
-                                                groups
-                                                    .get_mut(&gid)
-                                                    .unwrap()
-                                                    .members
-                                                    .push(p.to_string());
-                                                let _ = save_groups(
-                                                    swarm.local_peer_id(),
-                                                    &groups,
-                                                );
-                                                // 邀请新成员（携带当前版本 + 全量名单，入群即一致）
-                                                let g = &groups[&gid];
-                                                let invite = serde_cbor::to_vec(
-                                                    &AppPayload::GroupInvite {
-                                                        group_id: g.id.clone(),
-                                                        group_name: g.name.clone(),
-                                                        version: g.version,
-                                                        members: g.members.clone(),
-                                                    },
-                                                )
-                                                .unwrap_or_default();
-                                                swarm
-                                                    .behaviour_mut()
-                                                    .chat
-                                                    .send_request(
-                                                        &p,
-                                                        ChatRequest(Frame {
-                                                            control: None,
-                                                            text: None,
-                                                            binary: Some(invite),
-                                                        }),
-                                                    );
-                                                // 向其余成员（不含新人、不含自己）1v1 扇出名单更新
-                                                let g = &groups[&gid];
-                                                let others: Vec<PeerId> = g
-                                                    .members
-                                                    .iter()
-                                                    .filter(|m| {
-                                                        m.as_str() != &p.to_string()
-                                                            && m.as_str() != &my_id
-                                                    })
-                                                    .filter_map(|m| m.parse().ok())
-                                                    .collect();
-                                                fanout_member_list(
-                                                    &mut swarm,
-                                                    &g.id,
-                                                    g.version,
-                                                    &g.members,
-                                                    &others,
-                                                );
-                                                println!(
-                                                    "{}",
-                                                    format!(
-                                                        "已将 {name} 加入群 {group}（名单版本 {}）",
-                                                        g.version
-                                                    )
-                                                    .green()
-                                                );
-                                            }
-                                        }
-                                        None => eprintln!(
-                                            "{}",
-                                            format!(
-                                                "未知成员: {target}（须为已连接的角色名或节点ID）"
-                                            )
-                                            .yellow()
-                                        ),
-                                    }
-                                }
-                                None => eprintln!(
-                                    "{}",
-                                    format!("未知群: {group}（/group list 查看）").yellow()
-                                ),
-                            }
-                        }
-                        ChatAction::GroupList => {
-                            if groups.is_empty() {
-                                println!(
-                                    "{}",
-                                    "暂无群聊（/group new <群名> 创建）".dimmed()
-                                );
-                            } else {
-                                println!("{}", "=== 群聊 ===".cyan());
-                                for g in groups.values() {
-                                    let n = g.members.len();
-                                    let focus = if focused_group.as_deref()
-                                        == Some(g.id.as_str())
-                                    {
-                                        "  ← 当前群聊".green()
-                                    } else {
-                                        "".dimmed()
-                                    };
-                                    let resident = if g.resident {
-                                        " [常驻]".green()
-                                    } else {
-                                        "".dimmed()
-                                    };
-                                    println!(
-                                        "  {}（{} 人，名单版本 {}，群ID {}）{resident}{focus}",
-                                        g.name, n, g.version, g.id
-                                    );
-                                }
-                            }
-                        }
-                        ChatAction::GroupResident { group, enable } => {
-                            let gid = groups
-                                .iter()
-                                .find(|(_, g)| g.name == group)
-                                .map(|(id, _)| id.clone());
-                            match gid {
-                                Some(gid) => {
-                                    groups.get_mut(&gid).unwrap().resident = enable;
-                                    let _ =
-                                        save_groups(swarm.local_peer_id(), &groups);
-                                    let name = groups[&gid].name.clone();
-                                    if enable {
-                                        // 标记常驻：立即补连成员（上线后也会自动拨号）
-                                        let g = groups[&gid].clone();
-                                        let my_id = swarm.local_peer_id().clone();
-                                        dial_group_members(
-                                            &mut swarm,
-                                            &g,
-                                            &my_id,
-                                            &conn_count,
-                                            &mut known_addrs,
-                                            &mut reconnect_peer,
-                                            &mut reconnect_pending,
-                                            &mut reconnect_queue,
-                                            &mut dialing,
-                                        );
-                                    }
-                                    println!(
-                                        "{}",
-                                        format!(
-                                            "群 {name} 已设为{}常驻（成员上线自动连接维持接收）",
-                                            if enable { "" } else { "非" }
-                                        )
-                                        .green()
-                                    );
-                                }
-                                None => eprintln!(
-                                    "{}",
-                                    format!("未知群: {group}（/group list 查看）").yellow()
-                                ),
-                            }
-                        }
-                        ChatAction::GroupLeave(group) => {
-                            let gid = groups
-                                .iter()
-                                .find(|(_, g)| g.name == group)
-                                .map(|(id, _)| id.clone());
-                            match gid {
-                                Some(gid) => {
-                                    let creator: PeerId =
-                                        match groups[&gid].creator.parse() {
-                                            Ok(c) => c,
-                                            Err(_) => {
-                                                eprintln!(
-                                                    "{}",
-                                                    "该群缺少群主信息，无法退群".yellow()
-                                                );
-                                                continue;
-                                            }
-                                        };
-                                    // 通知群主划去自己
-                                    let leave = serde_cbor::to_vec(
-                                        &AppPayload::GroupLeave {
-                                            group_id: gid.clone(),
-                                        },
-                                    )
-                                    .unwrap_or_default();
-                                    swarm.behaviour_mut().chat.send_request(
-                                        &creator,
-                                        ChatRequest(Frame {
-                                            control: None,
-                                            text: None,
-                                            binary: Some(leave),
-                                        }),
-                                    );
-                                    // 本地移除群记录并退订 topic
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .gossipsub
-                                        .unsubscribe(&group_topic(&gid));
-                                    if focused_group.as_deref() == Some(gid.as_str()) {
-                                        focused_group = None;
-                                    }
-                                    groups.remove(&gid);
-                                    let _ =
-                                        save_groups(swarm.local_peer_id(), &groups);
-                                    println!(
-                                        "{}",
-                                        format!("已退出群聊 {group}（已通知群主）").yellow()
-                                    );
-                                }
-                                None => eprintln!(
-                                    "{}",
-                                    format!("未知群: {group}（/group list 查看）").yellow()
-                                ),
-                            }
-                        }
-                        ChatAction::GroupFocus(name) => {
-                            let gid = groups
-                                .iter()
-                                .find(|(_, g)| g.name == name)
-                                .map(|(id, _)| id.clone());
-                            match gid {
-                                Some(gid) => {
-                                    focused_group = Some(gid.clone());
-                                    focused = None;
-                                    let g = groups[&gid].clone();
-                                    let gname = g.name.clone();
-                                    // 聚焦即连：拨号群成员（常驻群维持 mesh，普通群按需连接）
-                                    let my_id = swarm.local_peer_id().clone();
-                                    dial_group_members(
-                                        &mut swarm,
-                                        &g,
-                                        &my_id,
-                                        &conn_count,
-                                        &mut known_addrs,
-                                        &mut reconnect_peer,
-                                        &mut reconnect_pending,
-                                        &mut reconnect_queue,
-                                        &mut dialing,
-                                    );
-                                    println!(
-                                        "{}",
-                                        format!("已切换到群聊: {gname}（输入直接发群里）").green()
-                                    );
-                                }
-                                None => eprintln!(
-                                    "{}",
-                                    format!("未知群: {name}（/group list 查看）").yellow()
-                                ),
-                            }
-                        }
-                        ChatAction::None => {}
+                    }
+                    if ctx.quit {
+                        // 等 Bye 帧送达（传输任务独立处理），再关闭传输任务
+                        tokio::time::sleep(BYE_HANDSHAKE_TIMEOUT).await;
+                        let _ = ctx.cmd_tx.send(P2pCommand::Shutdown).await;
+                        break;
                     }
                     continue;
                 }
+                // 非命令：作为消息发送给当前聊天对象
                 if let Some(gid) = &focused_group {
                     // 群消息：gossipsub 发布到群 topic
                     let g = match groups.get(gid) {
@@ -1608,23 +1005,20 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                     let payload = serde_json::to_vec(&GroupPayload::Text {
                         group_id: g.id.clone(),
                         text: line.to_string(),
-                        sender: my_name.clone(),
+                        sender: identity.my_name().to_string(),
                     })
                     .unwrap_or_default();
-                    match swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .publish(group_topic(&g.id), payload)
-                    {
-                        Ok(_) => println!("{}", format!("[我 -> {}] {line}", g.name).green()),
-                        Err(e) => {
-                            eprintln!("{}", format!("群消息发送失败: {e}").yellow())
-                        }
-                    }
+                    let _ = cmd_tx
+                        .send(P2pCommand::Publish {
+                            topic: group_topic(&g.id),
+                            data: payload,
+                        })
+                        .await;
+                    println!("{}", format!("[我 -> {}] {line}", g.name).green());
                 } else {
                     match focused {
                         Some(p) => {
-                            if !conn_count.contains_key(&p) {
+                            if !connected.contains(&p) {
                                 eprintln!(
                                     "{}",
                                     "当前会话未连接，请用 /chat 重连".yellow()
@@ -1643,14 +1037,16 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     line.to_string(),
                                 ))
                                 .unwrap_or_default();
-                                swarm.behaviour_mut().chat.send_request(
-                                    &p,
-                                    ChatRequest(Frame {
-                                        control: None,
-                                        text: None,
-                                        binary: Some(payload),
-                                    }),
-                                );
+                                let _ = cmd_tx
+                                    .send(P2pCommand::Send {
+                                        peer: p,
+                                        frame: Frame {
+                                            control: None,
+                                            text: None,
+                                            binary: Some(payload),
+                                        },
+                                    })
+                                    .await;
                                 println!("{}", format!("[我 -> {who}] {line}").green());
                             }
                         }
@@ -1661,312 +1057,97 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-            _ = heartbeat.tick() => {
-                if let Some(p) = focused {
-                    if let Some(conv) = conversations.get_mut(&p) {
-                        if !conv.bye {
-                            if conv.last_rx.is_some_and(|t| t.elapsed() > HEARTBEAT_TIMEOUT) {
-                                println!(
-                                    "{}",
-                                    format!(
-                                        "心跳超时（超过 {} 秒无响应），判定对方离线",
-                                        HEARTBEAT_TIMEOUT.as_secs()
-                                    )
-                                    .yellow()
-                                );
-                                conv.last_rx = None;
-                                let _ = swarm.disconnect_peer_id(p);
-                                continue;
-                            }
-                            swarm.behaviour_mut().chat.send_request(
-                                &p,
-                                ChatRequest(Frame {
-                                    control: Some(Control::Heartbeat),
-                                    text: None,
-                                    binary: None,
-                                }),
-                            );
-                        }
-                    }
-                }
-            }
-            discovered = async {
-                match stealth_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Some((found_id, addr)) = discovered {
-                    let local = swarm.local_peer_id().clone();
-                    on_peer_discovered(
-                        found_id,
-                        addr,
-                        &local,
-                        &mut swarm,
-                        &mut known_addrs,
-                        &conversations,
-                        &groups,
-                        &mut reconnect_peer,
-                        &mut reconnect_pending,
-                        &mut dialing,
-                        &conn_count,
-                        &mut reconnect_queue,
-                    );
-                }
-            }
-            event = swarm.select_next_some() => {
+            event = ev_rx.recv() => {
                 match event {
-                    SwarmEvent::NewListenAddr { address, .. } => {
-                        println!("{}", format!("监听地址: {address}/p2p/{}", swarm.local_peer_id()).green());
-                        if !v6_listen_issued
-                            && address.iter().any(|p| matches!(p, Protocol::Ip4(_)))
-                        {
-                            v6_listen_issued = true;
-                            let port = address.iter().find_map(|p| match p {
-                                Protocol::Tcp(port) => Some(port),
-                                _ => None,
-                            });
-                            let mut v6_addr = Multiaddr::empty();
-                            v6_addr.push(Protocol::Ip6(Ipv6Addr::UNSPECIFIED));
-                            v6_addr.push(Protocol::Tcp(port.unwrap_or(0)));
-                            if let Err(e) = swarm.listen_on(v6_addr) {
-                                eprintln!(
-                                    "{}",
-                                    format!("ip6 复用 ip4 端口监听失败({e})，改用随机端口").yellow()
-                                );
-                                if let Ok(fallback) = "/ip6/::/tcp/0".parse::<Multiaddr>() {
-                                    let _ = swarm.listen_on(fallback);
+                    Some(ev) => {
+                        match ev {
+                            P2pEvent::PeerConnected(peer) => {
+                                connected.insert(peer);
+                                if let Some(conv) = conversations.get_mut(&peer) {
+                                    conv.pending_dial = false;
                                 }
-                            }
-                        }
-                    }
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                        dialing.remove(&peer_id);
-                        if reconnect_peer == Some(peer_id) {
-                            reconnect_peer = None;
-                            reconnect_pending.clear();
-                            dial_next_reconnect(
-                                &mut swarm,
-                                &mut dialing,
-                                &mut reconnect_peer,
-                                &mut reconnect_pending,
-                                &mut known_addrs,
-                                &mut reconnect_queue,
-                            );
-                        }
-                        *conn_count.entry(peer_id).or_insert(0) += 1;
-                        let conv = conversations
-                            .entry(peer_id)
-                            .or_insert_with(Conversation::new);
-                        conv.pending_dial = false;
-                        conv.last_rx = Some(Instant::now());
-                        // 仅在无任何焦点（既非 1v1 也非群）时才自动聚焦首个连接，
-                        // 避免连上群成员时把 1v1 设为 focused 抢走群焦点
-                        if focused.is_none() && focused_group.is_none() {
-                            focused = Some(peer_id);
-                            if !conv.name.is_empty() {
-                                println!(
-                                    "{}",
-                                    format!(
-                                        "已切换到会话: {}（{peer_id}）",
-                                        conv.name
-                                    )
-                                    .green()
-                                );
-                            }
-                        }
-                        println!("{}", format!("已连接对端: {peer_id}").green());
-                        if !conv.greeted {
-                            swarm.behaviour_mut().chat.send_request(
-                                &peer_id,
-                                ChatRequest(Frame {
-                                    control: None,
-                                    text: Some(NodeMsg::Hello(my_name.clone())),
-                                    binary: None,
-                                }),
-                            );
-                            conv.greeted = true;
-                        }
-                    }
-                    SwarmEvent::ConnectionClosed {
-                        peer_id,
-                        num_established,
-                        cause,
-                        ..
-                    } => {
-                        let cause_text = match &cause {
-                            Some(c) => format!("，原因: {c}"),
-                            None => String::new(),
-                        };
-                        println!(
-                            "{}",
-                            format!("连接已关闭: {peer_id}（剩余连接 {num_established}{cause_text}）")
-                                .yellow()
-                        );
-                        if num_established == 0 {
-                            dialing.remove(&peer_id);
-                            if let Some(conv) = conversations.get_mut(&peer_id) {
-                                conv.greeted = false;
-                                conv.last_rx = None;
-                            }
-                            conn_count.remove(&peer_id);
-                            if focused == Some(peer_id) {
-                                focused = None;
-                                eprintln!(
-                                    "{}",
-                                    format!(
-                                        "当前会话已断开（{peer_id}），用 /chat 重新选择"
-                                    )
-                                    .yellow()
-                                );
-                            }
-                            let bye = conversations
-                                .get(&peer_id)
-                                .map(|c| c.bye)
-                                .unwrap_or(false);
-                            if bye {
-                                known_addrs.remove(&peer_id);
-                                println!("{}", "对方已正常退出，不进行重连".dimmed());
-                            } else if let Some(addrs) = known_addrs.get(&peer_id) {
-                                if !addrs.is_empty() {
-                                    println!(
-                                        "{}",
-                                        format!("尝试重连 {peer_id}...").cyan()
-                                    );
-                                    enqueue_reconnect(
-                                        peer_id,
-                                        &mut reconnect_queue,
-                                        &reconnect_peer,
-                                    );
-                                    dial_next_reconnect(
-                                        &mut swarm,
-                                        &mut dialing,
-                                        &mut reconnect_peer,
-                                        &mut reconnect_pending,
-                                        &mut known_addrs,
-                                        &mut reconnect_queue,
-                                    );
-                                }
-                            }
-                        } else {
-                            conn_count.insert(peer_id, num_established);
-                        }
-                    }
-                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                        if let Some(p) = peer_id {
-                            if user_dials.remove(&p) {
-                                eprintln!("{}", format!("拨号 {p} 失败: {error}").red());
-                            } else {
-                                eprintln!(
-                                    "{}",
-                                    format!("拨号 {p} 失败（自动恢复中）: {error}").dimmed()
-                                );
-                            }
-                            dialing.remove(&p);
-                            if reconnect_peer == Some(p) {
-                                dial_next_reconnect(
-                                    &mut swarm,
-                                    &mut dialing,
-                                    &mut reconnect_peer,
-                                    &mut reconnect_pending,
-                                    &mut known_addrs,
-                                    &mut reconnect_queue,
-                                );
-                            } else if focused.is_none() {
-                                if let Some(addrs) = known_addrs.get(&p) {
-                                    if !addrs.is_empty() {
+                                // 仅在没有 1v1/群焦点时自动聚焦首个连接，避免连上群成员时抢焦点
+                                if focused.is_none() && focused_group.is_none() {
+                                    focused = Some(peer);
+                                    let name = conversations
+                                        .get(&peer)
+                                        .map(|c| c.name.clone())
+                                        .unwrap_or_default();
+                                    if !name.is_empty() {
                                         println!(
                                             "{}",
-                                            format!("拨号失败，尝试 {p} 的其他已知地址...").cyan()
-                                        );
-                                        enqueue_reconnect(p, &mut reconnect_queue, &reconnect_peer);
-                                        dial_next_reconnect(
-                                            &mut swarm,
-                                            &mut dialing,
-                                            &mut reconnect_peer,
-                                            &mut reconnect_pending,
-                                            &mut known_addrs,
-                                            &mut reconnect_queue,
+                                            format!("已切换到会话: {}（{peer}）", name).green()
                                         );
                                     }
                                 }
-                            }
-                        } else {
-                            eprintln!("{}", format!("拨号失败: {error}").red());
-                        }
-                    }
-                    SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                        let local = swarm.local_peer_id().clone();
-                        for (found_id, addr) in list {
-                            on_peer_discovered(
-                                found_id,
-                                addr,
-                                &local,
-                                &mut swarm,
-                                &mut known_addrs,
-                                &conversations,
-                                &groups,
-                                &mut reconnect_peer,
-                                &mut reconnect_pending,
-                                &mut dialing,
-                                &conn_count,
-                                &mut reconnect_queue,
-                            );
-                        }
-                    }
-                    SwarmEvent::Behaviour(NodeBehaviourEvent::Gossipsub(
-                        gossipsub::Event::Message { message, .. },
-                    )) => {
-                        let Some(src) = message.source else {
-                            continue;
-                        };
-                        let Ok(payload) =
-                            serde_json::from_slice::<GroupPayload>(&message.data)
-                        else {
-                            continue;
-                        };
-                        let group_id = match &payload {
-                            GroupPayload::Text { group_id, .. } => group_id.clone(),
-                        };
-                        let Some(g) = groups.get(&group_id) else {
-                            continue;
-                        };
-                        match payload {
-                            GroupPayload::Text {
-                                group_id,
-                                text,
-                                sender,
-                            } => {
-                                // 本地注册表模型：成员由群主背书（加人时须已验证联系人）。
-                                // 接收端依赖 Signed 签名保证来源真实；显示名用发送者自报，
-                                // 回退到本地方言名/节点ID
-                                let who = if !sender.is_empty() {
-                                    sender
-                                } else {
-                                    peer_name(&src, &conversations, &contacts)
-                                };
-                                if focused_group.as_deref() == Some(group_id.as_str()) {
-                                    println!(
-                                        "{}",
-                                        format!("[{who}] {text}").bright_cyan()
-                                    );
-                                } else {
-                                    println!(
-                                        "{}",
-                                        format!("[{}] [{who}] {text}", g.name).bright_cyan()
-                                    );
+                                println!("{}", format!("已连接对端: {peer}").green());
+                                let conv = conversations
+                                    .entry(peer)
+                                    .or_insert_with(Conversation::new);
+                                if !conv.greeted {
+                                    let _ = cmd_tx
+                                        .send(P2pCommand::Send {
+                                            peer,
+                                            frame: Frame {
+                                                control: None,
+                                                text: Some(NodeMsg::Hello(
+                                                    identity.my_name().to_string(),
+                                                )),
+                                                binary: None,
+                                            },
+                                        })
+                                        .await;
+                                    conv.greeted = true;
                                 }
                             }
-                        }
-                    }
-                    SwarmEvent::Behaviour(NodeBehaviourEvent::Chat(request_response::Event::Message { peer: from, message, .. })) => {
-                        match message {
-                            request_response::Message::Request { request, channel, .. } => {
+                            P2pEvent::PeerDisconnected { peer, bye } => {
+                                connected.remove(&peer);
+                                if let Some(conv) = conversations.get_mut(&peer) {
+                                    conv.greeted = false;
+                                }
+                                if focused == Some(peer) {
+                                    focused = None;
+                                    eprintln!(
+                                        "{}",
+                                        format!(
+                                            "当前会话已断开（{peer}），用 /chat 重新选择"
+                                        )
+                                        .yellow()
+                                    );
+                                }
+                                if bye {
+                                    registered.remove(&peer);
+                                    println!("{}", "对方已正常退出，不进行重连".dimmed());
+                                }
+                            }
+                            P2pEvent::PeerDiscovered { peer, addr } => {
+                                let recorded = registered.entry(peer).or_default();
+                                if !recorded.contains(&addr) {
+                                    recorded.push(addr.clone());
+                                }
+                                // 待接呼叫 或 常驻群成员：上线即拨号（决策归 L3，动作经 DialPeer 命令）
+                                let pending_dial = conversations
+                                    .get(&peer)
+                                    .map(|c| c.pending_dial)
+                                    .unwrap_or(false);
+                                let resident_member = groups.values().any(|g| {
+                                    g.resident
+                                        && g.members.iter().any(|m| m == &peer.to_string())
+                                });
+                                if (pending_dial || resident_member)
+                                    && !connected.contains(&peer)
+                                {
+                                    println!(
+                                        "{}",
+                                        format!("发现可连接节点，拨号 {peer}").cyan()
+                                    );
+                                    let _ = cmd_tx.send(P2pCommand::DialPeer(peer)).await;
+                                }
+                            }
+                            P2pEvent::Message { from, frame } => {
                                 let conv = conversations
                                     .entry(from)
                                     .or_insert_with(Conversation::new);
-                                conv.last_rx = Some(Instant::now());
-                                let frame = request.0;
                                 // 通道路由：control（传输控制）→ text（节点信号）→ binary（用户内容）
                                 if let Some(ctrl) = frame.control {
                                     match ctrl {
@@ -1980,54 +1161,23 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                                 "{}",
                                                 format!("对方已上线: {name}").green()
                                             );
-                                            let pid = from.to_string();
-                                            if contacts.get(&pid).is_none() {
-                                                // 首次接触：TOFU 指纹核对。
-                                                // 交互终端须人工确认；管道环境（脚本/自动化）
-                                                // 无法交互，采用 SSH accept-new 语义自动信任
-                                                if interactive {
-                                                    println!(
-                                                        "{}",
-                                                        "首次连接，请核对对方身份指纹:".yellow()
-                                                    );
-                                                    println!(
-                                                        "  指纹: {}",
-                                                        fingerprint_of(&from).dimmed()
-                                                    );
-                                                    println!("  节点ID: {pid}");
-                                                    let ans = read_line(
-                                                        &mut stdin,
-                                                        "是否信任该节点（记录为联系人）? (y/n): ",
-                                                    )
-                                                    .await?;
-                                                    let trusted =
-                                                        ans.trim().eq_ignore_ascii_case("y");
-                                                    contacts.ensure_contact(
-                                                        &from,
-                                                        &name,
-                                                        trusted,
-                                                    );
-                                                    if trusted {
-                                                        println!(
-                                                            "{}",
-                                                            format!("已记录并信任: {name}").green()
-                                                        );
-                                                    } else {
-                                                        println!(
-                                                            "{}",
-                                                            format!("已记录但未信任: {name}").yellow()
-                                                        );
-                                                    }
-                                                } else {
-                                                    contacts.ensure_contact(&from, &name, true);
-                                                }
-                                            } else {
-                                                contacts.ensure_contact(&from, &name, false);
-                                            }
+                                            identity
+                                                .on_peer_hello(
+                                                    &mut stdin,
+                                                    interactive,
+                                                    &from,
+                                                    &name,
+                                                )
+                                                .await?;
                                         }
                                         NodeMsg::Bye => {
+                                            let _ = identity.on_peer_bye(&from);
                                             println!("{}", "对方已正常退出".yellow());
                                             conv.bye = true;
+                                            // L1 策略：标记 bye → 不再心跳、断开后不重连
+                                            let _ = cmd_tx
+                                                .send(P2pCommand::MarkBye(from))
+                                                .await;
                                         }
                                     }
                                 } else if let Some(bin) = frame.binary {
@@ -2076,19 +1226,15 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                                         resident: false, // 入群默认非常驻
                                                     },
                                                 );
-                                                let _ = save_groups(
-                                                    swarm.local_peer_id(),
-                                                    &groups,
-                                                );
-                                                let _ = swarm
-                                                    .behaviour_mut()
-                                                    .gossipsub
-                                                    .subscribe(&group_topic(&group_id));
+                                                let _ = save_groups(identity.my_id(), &groups);
+                                                let _ = cmd_tx
+                                                    .send(P2pCommand::Subscribe {
+                                                        topic: group_topic(&group_id),
+                                                    })
+                                                    .await;
                                             }
-                                            let sender = contacts
-                                                .get(&from.to_string())
-                                                .map(|e| e.name.clone())
-                                                .filter(|n| !n.is_empty())
+                                            let sender = identity
+                                                .contact_name(&from)
                                                 .unwrap_or_else(|| from.to_string());
                                             println!(
                                                 "{}",
@@ -2103,7 +1249,11 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                             // 成员主动退群：校验发送者确为成员，移除并推进版本，向剩余成员扇出
                                             let is_member = groups
                                                 .get(&group_id)
-                                                .map(|g| g.members.iter().any(|m| m == &from.to_string()))
+                                                .map(|g| {
+                                                    g.members
+                                                        .iter()
+                                                        .any(|m| m == &from.to_string())
+                                                })
                                                 .unwrap_or(false);
                                             if !is_member {
                                                 continue;
@@ -2111,30 +1261,26 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                             if let Some(g) = groups.get_mut(&group_id) {
                                                 g.version += 1;
                                                 g.members.retain(|m| m != &from.to_string());
-                                                let _ = save_groups(
-                                                    swarm.local_peer_id(),
-                                                    &groups,
-                                                );
-                                                let name = contacts
-                                                    .get(&from.to_string())
-                                                    .map(|e| e.name.clone())
-                                                    .filter(|n| !n.is_empty())
+                                                let _ = save_groups(identity.my_id(), &groups);
+                                                let name = identity
+                                                    .contact_name(&from)
                                                     .unwrap_or_else(|| from.to_string());
                                                 let g = &groups[&group_id];
-                                                let my_id = swarm.local_peer_id().to_string();
+                                                let my_id = identity.my_id().to_string();
                                                 let remaining: Vec<PeerId> = g
                                                     .members
                                                     .iter()
                                                     .filter(|m| m.as_str() != &my_id)
                                                     .filter_map(|m| m.parse().ok())
                                                     .collect();
-                                                fanout_member_list(
-                                                    &mut swarm,
+                                                fanout_member_list_async(
+                                                    &cmd_tx,
                                                     &g.id,
                                                     g.version,
                                                     &g.members,
                                                     &remaining,
-                                                );
+                                                )
+                                                .await;
                                                 println!(
                                                     "{}",
                                                     format!(
@@ -2164,10 +1310,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                                     g.version = version;
                                                     g.members = members.clone();
                                                 }
-                                                let _ = save_groups(
-                                                    swarm.local_peer_id(),
-                                                    &groups,
-                                                );
+                                                let _ = save_groups(identity.my_id(), &groups);
                                                 println!(
                                                     "{}",
                                                     format!(
@@ -2180,28 +1323,68 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                         }
                                     }
                                 }
-                                let _ = swarm.behaviour_mut().chat.send_response(channel, ChatResponse(true));
                             }
-                            request_response::Message::Response { .. } => {
-                                let conv = conversations
-                                    .entry(from)
-                                    .or_insert_with(Conversation::new);
-                                conv.last_rx = Some(Instant::now());
+                            P2pEvent::Gossip { source, data } => {
+                                let Ok(payload) =
+                                    serde_json::from_slice::<GroupPayload>(&data)
+                                else {
+                                    continue;
+                                };
+                                let group_id = match &payload {
+                                    GroupPayload::Text { group_id, .. } => group_id.clone(),
+                                };
+                                let Some(g) = groups.get(&group_id) else {
+                                    continue;
+                                };
+                                match payload {
+                                    GroupPayload::Text {
+                                        group_id,
+                                        text,
+                                        sender,
+                                    } => {
+                                        // 本地注册表模型：成员由群主背书（加人时须已验证联系人）。
+                                        // 接收端依赖 Signed 签名保证来源真实；显示名用发送者自报，
+                                        // 回退到本地方言名/节点ID
+                                        let who = if !sender.is_empty() {
+                                            sender
+                                        } else {
+                                            peer_name(&source, &conversations, &identity)
+                                        };
+                                        if focused_group.as_deref() == Some(group_id.as_str()) {
+                                            println!(
+                                                "{}",
+                                                format!("[{who}] {text}").bright_cyan()
+                                            );
+                                        } else {
+                                            println!(
+                                                "{}",
+                                                format!("[{}] [{who}] {text}", g.name)
+                                                    .bright_cyan()
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            P2pEvent::SendFailure { peer, error } => {
+                                let bye = conversations
+                                    .get(&peer)
+                                    .map(|c| c.bye)
+                                    .unwrap_or(false);
+                                if bye || focused != Some(peer) {
+                                    eprintln!(
+                                        "{}",
+                                        format!(
+                                            "发送到 {peer} 失败（对方正在退出或已离线）: {error}"
+                                        )
+                                        .dimmed()
+                                    );
+                                } else {
+                                    eprintln!("{}", format!("发送到 {peer} 失败: {error}").red());
+                                }
                             }
                         }
                     }
-                    SwarmEvent::Behaviour(NodeBehaviourEvent::Chat(request_response::Event::OutboundFailure { peer: p, error, .. })) => {
-                        let bye = conversations.get(&p).map(|c| c.bye).unwrap_or(false);
-                        if bye || focused != Some(p) {
-                            eprintln!(
-                                "{}",
-                                format!("发送到 {p} 失败（对方正在退出或已离线）: {error}").dimmed()
-                            );
-                        } else {
-                            eprintln!("{}", format!("发送到 {p} 失败: {error}").red());
-                        }
-                    }
-                    _ => {}
+                    None => break,
                 }
             }
         }
@@ -2281,24 +1464,5 @@ mod tests {
     fn reject_bad_peer_id() {
         let e = parse_dial_addr("/ip4/1.2.3.4/tcp/1/p2p/not-a-peer-id").unwrap_err();
         assert!(e.contains("节点ID无效"));
-    }
-
-    #[test]
-    fn birthday_normalization() {
-        assert_eq!(normalize_birthday("1990-1-1").unwrap(), "1990-01-01");
-        assert_eq!(normalize_birthday(" 2000-12-05 ").unwrap(), "2000-12-05");
-        assert!(normalize_birthday("1990/1/1").is_err());
-        assert!(normalize_birthday("1899-01-01").is_err());
-        assert!(normalize_birthday("1990-13-01").is_err());
-        assert!(normalize_birthday("1990-01-32").is_err());
-    }
-
-    #[test]
-    fn gender_normalization() {
-        assert_eq!(normalize_gender("男").unwrap(), 'M');
-        assert_eq!(normalize_gender("m").unwrap(), 'M');
-        assert_eq!(normalize_gender("女").unwrap(), 'F');
-        assert_eq!(normalize_gender("保密").unwrap(), 'O');
-        assert!(normalize_gender("x").is_err());
     }
 }

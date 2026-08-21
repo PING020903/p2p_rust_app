@@ -662,9 +662,50 @@ fn group_chat_scenario() {
     c.kill();
 }
 
+/// 场景10：应用任务卡在交互 await（/backup 密码提示未回答），传输任务须独立维持心跳，
+/// 连接不被心跳超时断开——这是三层架构（L1 传输任务）的核心验收点。
+fn app_blocked_heartbeat_still_alive_scenario() {
+    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache_a = scenario_cache_dir("s10_a");
+    let cache_b = scenario_cache_dir("s10_b");
+    let (cred_a, cred_b) = load_creds();
+    println!("=== 场景10: 应用卡在密码交互，传输任务心跳仍存活 ===");
+
+    let (mut a, a_listen) = spawn_into_chat(bin, &cache_a, &cred_a, MNEMONIC_USER1);
+    let a_addr = listen_addr(&a_listen);
+    let a_id = parse_peer_id(&a_listen);
+
+    let (mut b, b_listen) = spawn_into_chat(bin, &cache_b, &cred_b, MNEMONIC_USER2);
+    let b_id = parse_peer_id(&b_listen);
+    b.send(&format!("/dial {a_addr}"));
+    a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
+    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+
+    println!("=== A 触发 /backup 并故意不输密码 → 应用任务阻塞 ===");
+    a.send("/backup");
+    a.wait_for("请输入密码以解锁本身份", WAIT);
+
+    println!("=== 阻塞 17 秒（> 心跳超时 15s）：传输任务应保持 A-B 心跳 ===");
+    let timed_out = b
+        .wait_for_optional("心跳超时", Duration::from_secs(17))
+        .is_some();
+    assert!(!timed_out, "A 的传输任务被应用阻塞连累：B 判定 A 心跳超时");
+
+    println!("=== 补输密码解锁 A 应用任务 ===");
+    a.send(&cred_a.password);
+    a.wait_for("助记词是唯一备份", WAIT);
+
+    println!("=== 连接仍存活：A 发消息 B 收到 ===");
+    a.send("alive after app block");
+    b.wait_for("[对方] alive after app block", WAIT);
+
+    a.kill();
+    b.kill();
+}
+
 #[test]
 fn p2p_chat_e2e_suite() {
-    // 九场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
+    // 十场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
     basic_chat_scenario();
     chat_by_name_scenario();
     graceful_offline_online_scenario();
@@ -674,4 +715,5 @@ fn p2p_chat_e2e_suite() {
     discovery_mode_scenario();
     multi_session_scenario();
     group_chat_scenario();
+    app_blocked_heartbeat_still_alive_scenario();
 }
