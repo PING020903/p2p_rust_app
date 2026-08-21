@@ -560,6 +560,12 @@ fn multi_session_scenario() {
     a.wait_for("[对方] msg from C", WAIT);
 
     println!("=== /list 同时见 B、C 两会话 ===");
+    // 显式登记 B/C 地址（/dial 会先记地址再拨，已连接则重复连接无害），
+    // 避免 mDNS 时序抖动导致 /list 缺项
+    let b_addr = listen_addr(&b_listen);
+    let c_addr = listen_addr(&c_listen);
+    a.send(&format!("/dial {c_addr}"));
+    a.send(&format!("/dial {b_addr}"));
     a.send("/list");
     a.wait_for("=== 已登记节点 ===", WAIT);
     // /list 按节点ID排序，C（12D3KooWH…）排在 B（12D3KooWPCy…）前，按序断言
@@ -606,6 +612,11 @@ fn group_chat_scenario() {
     a.wait_for(&format!("已将 {c_name} 加入群"), WAIT);
     c.wait_for(&format!("被邀请加入群聊: {group}"), WAIT);
 
+    println!("=== B 收到群主 1v1 扇出的名单更新（成员 3 人，版本 2）===");
+    b.wait_for(&format!("成员名单已更新（版本 2"), WAIT);
+    b.send("/group list");
+    b.wait_for(&format!("{group}（3 人，名单版本 2"), WAIT);
+
     // 等 gossipsub 网格形成（heartbeat ~1s），再发群消息
     thread::sleep(Duration::from_secs(2));
 
@@ -621,9 +632,23 @@ fn group_chat_scenario() {
     a.wait_for(&format!("[{c_name}] hi from C"), Duration::from_secs(40));
     b.wait_for(&format!("[{group}] [{c_name}] hi from C"), Duration::from_secs(40));
 
-    println!("=== /group list 列出群 ===");
+    println!("=== /group list 列出群（A：成员 3 人）===");
     a.send("/group list");
-    a.wait_for(&format!("{group}（"), WAIT);
+    a.wait_for(&format!("{group}（3 人，名单版本 2"), WAIT);
+
+    println!("=== C 退群：通知群主划去自己，A 处理并扇出更新名单 ===");
+    c.send(&format!("/group leave {group}"));
+    c.wait_for(&format!("已退出群聊 {group}"), WAIT);
+    a.wait_for(&format!("成员 {c_name} 已退出群 {group}"), WAIT);
+
+    println!("=== B 收到退群后的名单更新（成员 2 人，版本 3）===");
+    b.wait_for(&format!("成员名单已更新（版本 3"), WAIT);
+    b.send("/group list");
+    b.wait_for(&format!("{group}（2 人，名单版本 3"), WAIT);
+
+    println!("=== C 本地群已删除 ===");
+    c.send("/group list");
+    c.wait_for("暂无群聊", WAIT);
 
     a.kill();
     b.kill();

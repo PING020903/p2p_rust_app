@@ -35,13 +35,26 @@ enum Control {
     Bye,
 }
 
-/// 数据面（Text/Binary/群邀请）+ 控制面（Control）
+/// 数据面（Text/Binary/群管理）+ 控制面（Control）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum ChatPayload {
     Text(String),
     Binary { name: String, data: Vec<u8> },
-    /// 群聊邀请（经 1v1 送达，接收方自动建群记录并订阅 gossipsub topic）
-    GroupInvite { group_id: String, group_name: String },
+    /// 群聊邀请（经 1v1 送达；携带群主身份/当前版本/全量名单，入群即一致）
+    GroupInvite {
+        group_id: String,
+        group_name: String,
+        version: u64,
+        members: Vec<String>,
+    },
+    /// 成员主动退群通知（成员 → 群主）
+    GroupLeave { group_id: String },
+    /// 群主向成员扇出的成员名单更新（1v1，版本化整体替换）
+    GroupMemberList {
+        group_id: String,
+        version: u64,
+        members: Vec<String>,
+    },
     Control(Control),
 }
 
@@ -105,17 +118,22 @@ impl Conversation {
     }
 }
 
-/// 群：本地注册表（id/name/members），成员须为已验证联系人。
-/// gossipsub 按 `/group/<id>/v1` topic 分发消息
+/// 群：本地注册表（id/name/members）。**群主为中心**的单一权威模型：
+/// 群主（creator）是成员表唯一权威——仅群主可邀请新成员、处理成员退群；
+/// 每次成员变更版本 +1，并向最新名单所有成员 1v1 扇出全量名单（版本化整体替换）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Group {
     id: String,
     name: String,
     members: Vec<String>, // peer_id 字符串
+    #[serde(default)]
+    version: u64, // 成员变更计数，仅接受更高版本
+    #[serde(default)]
+    creator: String, // 群主 peer_id（唯一权威）
 }
 
 /// 群消息载荷（gossipsub data，JSON 编码）。
-/// 本地注册表不同步：A 加人时发布 Members 名单，接收方合并本地成员表
+/// 群文本经 gossipsub 分发；成员名单由群主 1v1 扇出（见 GroupMemberList），不走 gossip
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum GroupPayload {
@@ -125,11 +143,28 @@ enum GroupPayload {
         /// 发送者自己的显示名（Signed 签名保证来源真实，名字是展示元数据）
         sender: String,
     },
-    Members { group_id: String, members: Vec<String> },
 }
 
 fn group_topic(group_id: &str) -> IdentTopic {
     IdentTopic::new(format!("/group/{group_id}/v1"))
+}
+
+/// 群主向目标成员 1v1 扇出名单更新（版本化整体替换）
+fn fanout_member_list(
+    swarm: &mut Swarm<NodeBehaviour>,
+    group_id: &str,
+    version: u64,
+    members: &[String],
+    targets: &[PeerId],
+) {
+    let request = ChatRequest(ChatPayload::GroupMemberList {
+        group_id: group_id.to_string(),
+        version,
+        members: members.to_vec(),
+    });
+    for p in targets {
+        let _ = swarm.behaviour_mut().chat.send_request(p, request.clone());
+    }
 }
 
 fn groups_path(my_peer_id: &PeerId) -> PathBuf {
@@ -312,13 +347,13 @@ fn build_tree() -> CmdTree<ChatCtx> {
         if args.is_empty() {
             eprintln!(
                 "{}",
-                "群聊: /group new <群名> 建群 | /group add <群名> <角色|节点ID> 加人 | /group list 列群 | /group <群名> 聚焦".yellow()
+                "群聊: /group new <群名> 建群 | /group add <群名> <角色|节点ID> 加人(仅群主) | /group leave <群名> 退群 | /group list 列群 | /group <群名> 聚焦".yellow()
             );
             return;
         }
         ctx.action = ChatAction::Group(args.join(" "));
     });
-    tree.set_help(group, "群聊：/group new/add/list/<群名>");
+    tree.set_help(group, "群聊：/group new/add/leave/list/<群名>");
     tree
 }
 
@@ -680,7 +715,7 @@ fn build_swarm(keypair: Keypair, mode: DiscoveryMode) -> Result<Swarm<NodeBehavi
                 gossipsub,
                 ping: ping::Behaviour::default(),
                 chat: request_response::cbor::Behaviour::new(
-                    [(StreamProtocol::new("/chat/5.0.0"), ProtocolSupport::Full)],
+                    [(StreamProtocol::new("/chat/6.0.0"), ProtocolSupport::Full)],
                     request_response::Config::default(),
                 ),
             })
@@ -1138,12 +1173,15 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                         );
                                     } else {
                                         let id = format!("{:08x}", OsRng.next_u32());
+                                        let creator = swarm.local_peer_id().to_string();
                                         groups.insert(
                                             id.clone(),
                                             Group {
                                                 id: id.clone(),
                                                 name: name.clone(),
-                                                members: Vec::new(),
+                                                members: vec![creator.clone()], // 群主也是成员
+                                                version: 0,
+                                                creator: creator.clone(),
                                             },
                                         );
                                         let _ = swarm
@@ -1156,7 +1194,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                         focused = None;
                                         println!(
                                             "{}",
-                                            format!("已创建并聚焦群聊: {name}（群ID {id}）").green()
+                                            format!("已创建并聚焦群聊: {name}（群ID {id}，你是群主）").green()
                                         );
                                     }
                                 }
@@ -1169,6 +1207,14 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                         .map(|(id, _)| id.clone());
                                     match gid {
                                         Some(gid) => {
+                                            let my_id = swarm.local_peer_id().to_string();
+                                            if groups[&gid].creator != my_id {
+                                                eprintln!(
+                                                    "{}",
+                                                    "仅群主可邀请新成员".yellow()
+                                                );
+                                                continue;
+                                            }
                                             let resolved = conversations
                                                 .iter()
                                                 .find(|(_, c)| c.name == target)
@@ -1201,6 +1247,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                                             &conversations,
                                                             &contacts,
                                                         );
+                                                        groups.get_mut(&gid).unwrap().version += 1;
                                                         groups
                                                             .get_mut(&gid)
                                                             .unwrap()
@@ -1210,6 +1257,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                                             swarm.local_peer_id(),
                                                             &groups,
                                                         );
+                                                        // 邀请新成员（携带当前版本 + 全量名单，入群即一致）
                                                         let g = &groups[&gid];
                                                         swarm
                                                             .behaviour_mut()
@@ -1219,32 +1267,35 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                                                 ChatRequest(
                                                                     ChatPayload::GroupInvite {
                                                                         group_id: g.id.clone(),
-                                                                        group_name: g
-                                                                            .name
-                                                                            .clone(),
+                                                                        group_name: g.name.clone(),
+                                                                        version: g.version,
+                                                                        members: g.members.clone(),
                                                                     },
                                                                 ),
                                                             );
-                                                        // 向全群发布最新成员名单（本地注册表同步）
+                                                        // 向其余成员（不含新人、不含自己）1v1 扇出名单更新
                                                         let g = &groups[&gid];
-                                                        let payload = serde_json::to_vec(
-                                                            &GroupPayload::Members {
-                                                                group_id: g.id.clone(),
-                                                                members: g.members.clone(),
-                                                            },
-                                                        )
-                                                        .unwrap_or_default();
-                                                        let _ = swarm
-                                                            .behaviour_mut()
-                                                            .gossipsub
-                                                            .publish(
-                                                                group_topic(&g.id),
-                                                                payload,
-                                                            );
+                                                        let others: Vec<PeerId> = g
+                                                            .members
+                                                            .iter()
+                                                            .filter(|m| {
+                                                                m.as_str() != &p.to_string()
+                                                                    && m.as_str() != &my_id
+                                                            })
+                                                            .filter_map(|m| m.parse().ok())
+                                                            .collect();
+                                                        fanout_member_list(
+                                                            &mut swarm,
+                                                            &g.id,
+                                                            g.version,
+                                                            &g.members,
+                                                            &others,
+                                                        );
                                                         println!(
                                                             "{}",
                                                             format!(
-                                                                "已将 {name} 加入群 {gname} 并发送邀请"
+                                                                "已将 {name} 加入群 {gname}（名单版本 {}）",
+                                                                g.version
                                                             )
                                                             .green()
                                                         );
@@ -1283,10 +1334,61 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                                 "".dimmed()
                                             };
                                             println!(
-                                                "  {}（{} 人，群ID {}）{focus}",
-                                                g.name, n, g.id
+                                                "  {}（{} 人，名单版本 {}，群ID {}）{focus}",
+                                                g.name, n, g.version, g.id
                                             );
                                         }
+                                    }
+                                }
+                                "leave" => {
+                                    let gname = parts.next().unwrap_or("");
+                                    let gid = groups
+                                        .iter()
+                                        .find(|(_, g)| g.name == gname)
+                                        .map(|(id, _)| id.clone());
+                                    match gid {
+                                        Some(gid) => {
+                                            let creator: PeerId =
+                                                match groups[&gid].creator.parse() {
+                                                    Ok(c) => c,
+                                                    Err(_) => {
+                                                        eprintln!(
+                                                            "{}",
+                                                            "该群缺少群主信息，无法退群".yellow()
+                                                        );
+                                                        continue;
+                                                    }
+                                                };
+                                            // 通知群主划去自己
+                                            swarm.behaviour_mut().chat.send_request(
+                                                &creator,
+                                                ChatRequest(ChatPayload::GroupLeave {
+                                                    group_id: gid.clone(),
+                                                }),
+                                            );
+                                            // 本地移除群记录并退订 topic
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .gossipsub
+                                                .unsubscribe(&group_topic(&gid));
+                                            if focused_group.as_deref() == Some(gid.as_str()) {
+                                                focused_group = None;
+                                            }
+                                            groups.remove(&gid);
+                                            let _ =
+                                                save_groups(swarm.local_peer_id(), &groups);
+                                            println!(
+                                                "{}",
+                                                format!(
+                                                    "已退出群聊 {gname}（已通知群主）"
+                                                )
+                                                .yellow()
+                                            );
+                                        }
+                                        None => eprintln!(
+                                            "{}",
+                                            format!("未知群: {gname}（/group list 查看）").yellow()
+                                        ),
                                     }
                                 }
                                 _ => {
@@ -1635,29 +1737,11 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                         };
                         let group_id = match &payload {
                             GroupPayload::Text { group_id, .. } => group_id.clone(),
-                            GroupPayload::Members { group_id, .. } => group_id.clone(),
                         };
                         let Some(g) = groups.get(&group_id) else {
                             continue;
                         };
                         match payload {
-                            GroupPayload::Members {
-                                group_id,
-                                members,
-                            } => {
-                                // 成员名单同步：仅接受当前成员发来的更新，并入本地表
-                                if !g.members.iter().any(|m| m == &src.to_string()) {
-                                    continue;
-                                }
-                                if let Some(gg) = groups.get_mut(&group_id) {
-                                    for m in members {
-                                        if !gg.members.contains(&m) {
-                                            gg.members.push(m);
-                                        }
-                                    }
-                                    let _ = save_groups(swarm.local_peer_id(), &groups);
-                                }
-                            }
                             GroupPayload::Text {
                                 group_id,
                                 text,
@@ -1724,14 +1808,21 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     ChatPayload::GroupInvite {
                                         group_id,
                                         group_name,
+                                        version,
+                                        members,
                                     } => {
-                                        if !groups.contains_key(&group_id) {
+                                        // 群主（邀请者 from）发来的邀请：携带当前版本 + 全量名单，入群即一致
+                                        if !groups.contains_key(&group_id)
+                                            || groups[&group_id].version < version
+                                        {
                                             groups.insert(
                                                 group_id.clone(),
                                                 Group {
                                                     id: group_id.clone(),
                                                     name: group_name.clone(),
-                                                    members: vec![from.to_string()],
+                                                    members: members.clone(),
+                                                    version,
+                                                    creator: from.to_string(),
                                                 },
                                             );
                                             let _ = save_groups(
@@ -1751,10 +1842,90 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                         println!(
                                             "{}",
                                             format!(
-                                                "被邀请加入群聊: {group_name}（邀请者 {sender}）"
+                                                "被邀请加入群聊: {group_name}（邀请者 {sender}，成员 {} 人）",
+                                                members.len()
                                             )
                                             .green()
                                         );
+                                    }
+                                    ChatPayload::GroupLeave { group_id } => {
+                                        // 成员主动退群：校验发送者确为成员，移除并推进版本，向剩余成员扇出
+                                        let is_member = groups
+                                            .get(&group_id)
+                                            .map(|g| g.members.iter().any(|m| m == &from.to_string()))
+                                            .unwrap_or(false);
+                                        if !is_member {
+                                            continue;
+                                        }
+                                        if let Some(g) = groups.get_mut(&group_id) {
+                                            g.version += 1;
+                                            g.members.retain(|m| m != &from.to_string());
+                                            let _ = save_groups(
+                                                swarm.local_peer_id(),
+                                                &groups,
+                                            );
+                                            let name = contacts
+                                                .get(&from.to_string())
+                                                .map(|e| e.name.clone())
+                                                .filter(|n| !n.is_empty())
+                                                .unwrap_or_else(|| from.to_string());
+                                            let g = &groups[&group_id];
+                                            let my_id = swarm.local_peer_id().to_string();
+                                            let remaining: Vec<PeerId> = g
+                                                .members
+                                                .iter()
+                                                .filter(|m| m.as_str() != &my_id)
+                                                .filter_map(|m| m.parse().ok())
+                                                .collect();
+                                            fanout_member_list(
+                                                &mut swarm,
+                                                &g.id,
+                                                g.version,
+                                                &g.members,
+                                                &remaining,
+                                            );
+                                            println!(
+                                                "{}",
+                                                format!(
+                                                    "成员 {name} 已退出群 {}（名单版本 {}）",
+                                                    g.name, g.version
+                                                )
+                                                .yellow()
+                                            );
+                                        }
+                                    }
+                                    ChatPayload::GroupMemberList {
+                                        group_id,
+                                        version,
+                                        members,
+                                    } => {
+                                        // 群主 1v1 扇出名单：版本更高才整体替换（防乱序/重复）
+                                        let newer = groups
+                                            .get(&group_id)
+                                            .map(|g| version > g.version)
+                                            .unwrap_or(false);
+                                        if newer {
+                                            let gname = groups
+                                                .get(&group_id)
+                                                .map(|g| g.name.clone())
+                                                .unwrap_or_default();
+                                            if let Some(g) = groups.get_mut(&group_id) {
+                                                g.version = version;
+                                                g.members = members.clone();
+                                            }
+                                            let _ = save_groups(
+                                                swarm.local_peer_id(),
+                                                &groups,
+                                            );
+                                            println!(
+                                                "{}",
+                                                format!(
+                                                    "群 {gname} 成员名单已更新（版本 {version}，{} 人）",
+                                                    members.len()
+                                                )
+                                                .dimmed()
+                                            );
+                                        }
                                     }
                                     ChatPayload::Control(ctrl) => match ctrl {
                                         Control::Heartbeat => {}
