@@ -29,6 +29,13 @@ enum AppPayload {
         version: u64,
         members: Vec<String>,
     },
+    /// 群主退群时一步顺位转移：携带新群主 + 移除群主后的名单（版本门控整体替换）
+    GroupOwnerTransfer {
+        group_id: String,
+        new_creator: String,
+        version: u64,
+        members: Vec<String>,
+    },
 }
 
 /// 命令 handler 产出的异步动作：同步逻辑跑在指令树 handler 里，真正需要 `.await`
@@ -229,7 +236,10 @@ fn load_groups(my_peer_id: &PeerId) -> HashMap<String, Group> {
         .and_then(|s| serde_json::from_str::<Vec<Group>>(&s).ok())
         .unwrap_or_default()
         .into_iter()
-        .map(|g| (g.id.clone(), g))
+        .map(|mut g| {
+            dedup_members(&mut g.members);
+            (g.id.clone(), g)
+        })
         .collect()
 }
 
@@ -241,6 +251,23 @@ fn save_groups(my_peer_id: &PeerId, groups: &HashMap<String, Group>) -> Result<(
     let list: Vec<&Group> = groups.values().collect();
     let s = serde_json::to_string_pretty(&list).map_err(|e| format!("群序列化失败: {e}"))?;
     std::fs::write(&path, s).map_err(|e| format!("写入群注册表失败: {e}"))
+}
+
+/// 保序去重成员名单（幽灵/重复防御：加载、接收名单、处理退群后统一归一化）
+fn dedup_members(members: &mut Vec<String>) {
+    let mut seen: HashSet<String> = HashSet::new();
+    members.retain(|m| seen.insert(m.clone()));
+}
+
+/// 群主顺位转移的"下一位"：members 数组里群主之后的下一个成员；
+/// 群主在末尾时回卷取第一个非群主成员；名单只有群主返回 None（解散）
+fn next_creator(members: &[String], creator: &str) -> Option<String> {
+    let pos = members.iter().position(|m| m == creator)?;
+    members[pos + 1..]
+        .iter()
+        .find(|m| *m != creator)
+        .or_else(|| members[..pos].iter().find(|m| *m != creator))
+        .cloned()
 }
 
 /// 由 peer 解析显示名：先查 1v1 会话名，再查 L2 联系人，兜底完整节点ID
@@ -808,43 +835,148 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                         return;
                     }
                 };
-                // 通知群主划去自己
-                let leave = serde_cbor::to_vec(&AppPayload::GroupLeave {
-                    group_id: gid.clone(),
-                })
-                .unwrap_or_default();
-                push_cmd(
-                    &mut ctx.ops,
-                    P2pCommand::Send {
-                        peer: creator,
-                        frame: Frame {
-                            control: None,
-                            text: None,
-                            binary: Some(leave),
+                let my_id = *ctx.identity.my_id();
+                if my_id == creator {
+                    // 群主退群：一步顺位转移（名单 >1）或解散（仅自己）
+                    let members = ctx.groups[&gid].members.clone();
+                    if members.len() > 1 {
+                        let new_creator =
+                            match next_creator(&members, &creator.to_string()) {
+                                Some(nc) => nc,
+                                None => {
+                                    eprintln!("{}", "无法确定继任群主，退群失败".yellow());
+                                    return;
+                                }
+                            };
+                        // 本地：换新群主、移除自己、版本 +1
+                        {
+                            let g = ctx.groups.get_mut(&gid).unwrap();
+                            g.version += 1;
+                            g.creator = new_creator.clone();
+                            g.members.retain(|m| m != &creator.to_string());
+                            dedup_members(&mut g.members);
+                        }
+                        let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
+                        // 1v1 扇出 GroupOwnerTransfer 给剩余成员（新名单 + 新群主）
+                        let g = &ctx.groups[&gid];
+                        let payload = serde_cbor::to_vec(&AppPayload::GroupOwnerTransfer {
+                            group_id: g.id.clone(),
+                            new_creator: new_creator.clone(),
+                            version: g.version,
+                            members: g.members.clone(),
+                        })
+                        .unwrap_or_default();
+                        let targets: Vec<PeerId> = g
+                            .members
+                            .iter()
+                            .filter_map(|m| m.parse().ok())
+                            .collect();
+                        for t in targets {
+                            push_cmd(
+                                &mut ctx.ops,
+                                P2pCommand::Send {
+                                    peer: t,
+                                    frame: Frame {
+                                        control: None,
+                                        text: None,
+                                        binary: Some(payload.clone()),
+                                    },
+                                },
+                            );
+                        }
+                        let new_creator_peer: PeerId =
+                            match new_creator.parse() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    eprintln!("{}", "继任群主解析失败".yellow());
+                                    return;
+                                }
+                            };
+                        let new_name = ctx
+                            .conversations
+                            .get(&new_creator_peer)
+                            .map(|c| c.name.clone())
+                            .filter(|n| !n.is_empty())
+                            .unwrap_or_else(|| new_creator_peer.to_string());
+                        // 退订 + 本地删群
+                        push_cmd(
+                            &mut ctx.ops,
+                            P2pCommand::Unsubscribe {
+                                topic: group_topic(&gid),
+                            },
+                        );
+                        if ctx.focused_group.as_deref() == Some(gid.as_str()) {
+                            *ctx.focused_group = None;
+                        }
+                        ctx.groups.remove(&gid);
+                        let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
+                        println!(
+                            "{}",
+                            format!("已退出群聊 {group}，群主已顺位转移给 {new_name}").green()
+                        );
+                    } else {
+                        // 仅自己：解散
+                        push_cmd(
+                            &mut ctx.ops,
+                            P2pCommand::Unsubscribe {
+                                topic: group_topic(&gid),
+                            },
+                        );
+                        if ctx.focused_group.as_deref() == Some(gid.as_str()) {
+                            *ctx.focused_group = None;
+                        }
+                        ctx.groups.remove(&gid);
+                        let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
+                        println!(
+                            "{}",
+                            format!("已解散群聊 {group}（你是唯一成员）").yellow()
+                        );
+                    }
+                } else if !ctx.connected.contains(&creator) {
+                    // 单写者一致性：群主不在线禁止退群（防止名单发散/幽灵）
+                    eprintln!(
+                        "{}",
+                        format!("群主不在线，无法退群 {group}（请等群主上线后再试）").yellow()
+                    );
+                } else {
+                    // 普通成员：通知群主划去自己
+                    let leave = serde_cbor::to_vec(&AppPayload::GroupLeave {
+                        group_id: gid.clone(),
+                    })
+                    .unwrap_or_default();
+                    push_cmd(
+                        &mut ctx.ops,
+                        P2pCommand::Send {
+                            peer: creator,
+                            frame: Frame {
+                                control: None,
+                                text: None,
+                                binary: Some(leave),
+                            },
                         },
-                    },
-                );
-                // 本地移除群记录并退订 topic
-                push_cmd(
-                    &mut ctx.ops,
-                    P2pCommand::Unsubscribe {
-                        topic: group_topic(&gid),
-                    },
-                );
-                if ctx.focused_group.as_deref() == Some(gid.as_str()) {
-                    *ctx.focused_group = None;
+                    );
+                    // 本地移除群记录并退订 topic
+                    push_cmd(
+                        &mut ctx.ops,
+                        P2pCommand::Unsubscribe {
+                            topic: group_topic(&gid),
+                        },
+                    );
+                    if ctx.focused_group.as_deref() == Some(gid.as_str()) {
+                        *ctx.focused_group = None;
+                    }
+                    ctx.groups.remove(&gid);
+                    let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
+                    println!(
+                        "{}",
+                        format!("已退出群聊 {group}（已通知群主）").yellow()
+                    );
                 }
-                ctx.groups.remove(&gid);
-                let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
-                println!(
-                    "{}",
-                    format!("已退出群聊 {group}（已通知群主）").yellow()
-                );
             }
             None => eprintln!("{}", format!("未知群: {group}（/group list 查看）").yellow()),
         }
     });
-    tree.set_help(g_leave, "退群（通知群主划去）");
+    tree.set_help(g_leave, "退群（群主须在线；群主退群自动顺位转移）");
     let g_list = tree.register(group, "list", |ctx, _| {
         if ctx.groups.is_empty() {
             println!("{}", "暂无群聊（/group new <群名> 创建）".dimmed());
@@ -1211,7 +1343,10 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                             version,
                                             members,
                                         } => {
-                                            // 群主（邀请者 from）发来的邀请：携带当前版本 + 全量名单，入群即一致
+                                            // 群主（邀请者 from）发来的邀请：携带当前版本 + 全量名单，入群即一致。
+                                            // 名单先归一化去重（幽灵/重复防御）
+                                            let mut members = members;
+                                            dedup_members(&mut members);
                                             if !groups.contains_key(&group_id)
                                                 || groups[&group_id].version < version
                                             {
@@ -1261,6 +1396,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                             if let Some(g) = groups.get_mut(&group_id) {
                                                 g.version += 1;
                                                 g.members.retain(|m| m != &from.to_string());
+                                                dedup_members(&mut g.members);
                                                 let _ = save_groups(identity.my_id(), &groups);
                                                 let name = identity
                                                     .contact_name(&from)
@@ -1296,7 +1432,10 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                             version,
                                             members,
                                         } => {
-                                            // 群主 1v1 扇出名单：版本更高才整体替换（防乱序/重复）
+                                            // 群主 1v1 扇出名单：版本更高才整体替换（防乱序/重复）。
+                                            // 名单先归一化去重（幽灵/重复防御）
+                                            let mut members = members;
+                                            dedup_members(&mut members);
                                             let newer = groups
                                                 .get(&group_id)
                                                 .map(|g| version > g.version)
@@ -1319,6 +1458,65 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                                     )
                                                     .dimmed()
                                                 );
+                                            }
+                                        }
+                                        AppPayload::GroupOwnerTransfer {
+                                            group_id,
+                                            new_creator,
+                                            version,
+                                            members,
+                                        } => {
+                                            // 群主退群顺位转移：校验来源确为当前群主，版本更高才整体替换。
+                                            // 名单先归一化去重（幽灵/重复防御）
+                                            let mut members = members;
+                                            dedup_members(&mut members);
+                                            let is_creator = groups
+                                                .get(&group_id)
+                                                .map(|g| g.creator == from.to_string())
+                                                .unwrap_or(false);
+                                            let newer = groups
+                                                .get(&group_id)
+                                                .map(|g| version > g.version)
+                                                .unwrap_or(false);
+                                            if is_creator && newer {
+                                                let was_creator_of = groups
+                                                    .get(&group_id)
+                                                    .map(|g| g.name.clone())
+                                                    .unwrap_or_default();
+                                                let new_is_me =
+                                                    new_creator == identity.my_id().to_string();
+                                                if let Some(g) = groups.get_mut(&group_id) {
+                                                    g.version = version;
+                                                    g.creator = new_creator.clone();
+                                                    g.members = members.clone();
+                                                }
+                                                let _ = save_groups(identity.my_id(), &groups);
+                                                if new_is_me {
+                                                    println!(
+                                                        "{}",
+                                                        format!(
+                                                            "群 {was_creator_of} 的群主已转移给你，你已成为群主（可 /group add 邀请）"
+                                                        )
+                                                        .green()
+                                                    );
+                                                } else {
+                                                    let nc_name = identity
+                                                        .contact_name(
+                                                            &new_creator.parse().unwrap_or(
+                                                                from,
+                                                            ),
+                                                        )
+                                                        .unwrap_or_else(|| new_creator.clone());
+                                                    println!(
+                                                        "{}",
+                                                        format!(
+                                                            "群 {was_creator_of} 群主已顺位转移给 {nc_name}（名单版本 {}，{} 人）",
+                                                            version,
+                                                            members.len()
+                                                        )
+                                                        .dimmed()
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -1464,5 +1662,29 @@ mod tests {
     fn reject_bad_peer_id() {
         let e = parse_dial_addr("/ip4/1.2.3.4/tcp/1/p2p/not-a-peer-id").unwrap_err();
         assert!(e.contains("节点ID无效"));
+    }
+
+    #[test]
+    fn dedup_members_keeps_order_and_removes_dups() {
+        let mut m = vec!["A".into(), "B".into(), "A".into(), "C".into(), "B".into()];
+        dedup_members(&mut m);
+        assert_eq!(m, vec!["A", "B", "C"]);
+        let mut single = vec!["X".into()];
+        dedup_members(&mut single);
+        assert_eq!(single, vec!["X"]);
+    }
+
+    #[test]
+    fn next_creator_wraps_after_owner() {
+        let members: Vec<String> = vec!["A".into(), "B".into(), "C".into()];
+        assert_eq!(next_creator(&members, "A").as_deref(), Some("B"));
+        assert_eq!(next_creator(&members, "B").as_deref(), Some("C"));
+        // 群主在末尾：回卷取第一个非群主
+        assert_eq!(next_creator(&members, "C").as_deref(), Some("A"));
+        // 仅自己：无下一位（解散）
+        let solo = vec!["A".into()];
+        assert_eq!(next_creator(&solo, "A"), None);
+        // 群主不在名单（数据异常防御）：不猜测继任者
+        assert_eq!(next_creator(&members, "Z"), None);
     }
 }

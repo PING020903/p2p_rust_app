@@ -9,6 +9,7 @@ const CYCLES_GRACEFUL: usize = 15;
 const CYCLES_KILL: usize = 5;
 const WAIT: Duration = Duration::from_secs(20);
 
+#[derive(Clone)]
 struct Creds {
     name: String,
     birthday: String,
@@ -20,17 +21,35 @@ struct Creds {
 /// 文件格式：`userN-name / userN-age / userN-sex / userN-password` 键值行，
 /// age 值允许带 "(YYYY-MM-DD)" 格式提示，解析时剥离。
 fn load_creds() -> (Creds, Creds) {
-    let (a, b, _) = load_creds3();
-    (a, b)
+    let all = load_creds_n(2);
+    (all[0].clone(), all[1].clone())
 }
 
 /// user1/user2/user3（3 号用于三节点多会话/群聊场景，要求名字互不相同）
 fn load_creds3() -> (Creds, Creds, Creds) {
+    let all = load_creds_n(3);
+    (all[0].clone(), all[1].clone(), all[2].clone())
+}
+
+/// user1..user4（4 号用于四节点群主转移场景）
+fn load_creds4() -> (Creds, Creds, Creds, Creds) {
+    let all = load_creds_n(4);
+    (
+        all[0].clone(),
+        all[1].clone(),
+        all[2].clone(),
+        all[3].clone(),
+    )
+}
+
+fn load_creds_n(n: usize) -> Vec<Creds> {
     let path = format!("{}/tests/users.txt", env!("CARGO_MANIFEST_DIR"));
     let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!("读取 {path} 失败: {e}（请复制 tests/users.template.txt 为 tests/users.txt 并填写）")
     });
     let mut fields: HashMap<String, String> = HashMap::new();
+    // 防御 UTF-8 BOM（\u{feff}）：部分编辑器/写盘会带 BOM，污染首行键名
+    let content = content.trim_start_matches('\u{feff}');
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -53,7 +72,7 @@ fn load_creds3() -> (Creds, Creds, Creds) {
         gender: take(user, "sex"),
         password: take(user, "password"),
     };
-    (cred("user1"), cred("user2"), cred("user3"))
+    (1..=n).map(|i| cred(&format!("user{i}"))).collect()
 }
 
 /// 每场景独立的身份缓存临时目录（保证登录菜单行为确定）
@@ -202,6 +221,8 @@ const MNEMONIC_USER2: &str =
     "legal winner thank year wave sausage worth useful legal winner thank yellow";
 const MNEMONIC_USER3: &str =
     "ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic";
+const MNEMONIC_USER4: &str =
+    "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
 
 /// 从助记词恢复身份登录（r 路径）：喂 r → 助记词 → 四项资料 → 密码
 fn login_restore(node: &mut Node, creds: &Creds, mnemonic: &str) {
@@ -703,9 +724,92 @@ fn app_blocked_heartbeat_still_alive_scenario() {
     b.kill();
 }
 
+/// 场景11：群主离线禁止退群（单写者一致性，防名单发散/幽灵）+ 群主退群一步顺位转移 +
+/// 新群主能加人（群不冻结）
+fn owner_offline_leave_ban_and_transfer_scenario() {
+    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache_a = scenario_cache_dir("s11_a");
+    let cache_b = scenario_cache_dir("s11_b");
+    let cache_c = scenario_cache_dir("s11_c");
+    let cache_d = scenario_cache_dir("s11_d");
+    let (cred_a, cred_b, cred_c, cred_d) = load_creds4();
+    let b_name = cred_b.name.clone();
+    let c_name = cred_c.name.clone();
+    let d_name = cred_d.name.clone();
+    let group = "testgrp";
+    println!("=== 场景11: 群主离线退群被拒 + 顺位转移 + 新群主加人 ===");
+
+    println!("=== 启动 A/B/C，A 建群加 B、C ===");
+    let (mut a, a_listen) = spawn_into_chat(bin, &cache_a, &cred_a, MNEMONIC_USER1);
+    let a_addr = listen_addr(&a_listen);
+    let a_id = parse_peer_id(&a_listen);
+    let (mut b, b_listen) = spawn_into_chat(bin, &cache_b, &cred_b, MNEMONIC_USER2);
+    let b_addr = listen_addr(&b_listen);
+    let b_id = parse_peer_id(&b_listen);
+    let (mut c, c_listen) = spawn_into_chat(bin, &cache_c, &cred_c, MNEMONIC_USER3);
+    let c_id = parse_peer_id(&c_listen);
+
+    b.send(&format!("/dial {a_addr}"));
+    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+    c.send(&format!("/dial {a_addr}"));
+    c.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+
+    a.send(&format!("/group new {group}"));
+    a.wait_for(&format!("已创建并聚焦群聊: {group}"), WAIT);
+    a.send(&format!("/group add {group} {b_name}"));
+    a.wait_for(&format!("已将 {b_name} 加入群"), WAIT);
+    b.wait_for(&format!("被邀请加入群聊: {group}"), WAIT);
+    a.send(&format!("/group add {group} {c_name}"));
+    a.wait_for(&format!("已将 {c_name} 加入群"), WAIT);
+    c.wait_for(&format!("被邀请加入群聊: {group}"), WAIT);
+
+    println!("=== 群主 A 离线：B 退群被拒（单写者一致性，防幽灵）===");
+    a.kill();
+    b.wait_for(&format!("连接已关闭: {a_id}"), WAIT);
+    b.send(&format!("/group leave {group}"));
+    b.wait_for("群主不在线，无法退群", WAIT);
+    b.send("/group list");
+    b.wait_for(&format!("{group}（3 人，名单版本 2"), WAIT);
+
+    println!("=== A 重新登录，B/C 重连 A ===");
+    let mut a = Node::spawn(bin, &cache_a);
+    a.wait_for("=== 主菜单 ===", Duration::from_secs(10));
+    let a_listen2 = enter_chat(&mut a, &cred_a);
+    let a_addr2 = listen_addr(&a_listen2);
+    b.send(&format!("/dial {a_addr2}"));
+    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+    c.send(&format!("/dial {a_addr2}"));
+    c.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+    a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
+    a.wait_for(&format!("已连接对端: {c_id}"), WAIT);
+
+    println!("=== A 退群：一步顺位转移给名单下一位 B ===");
+    a.send(&format!("/group leave {group}"));
+    a.wait_for(&format!("群主已顺位转移给 {b_name}"), WAIT);
+    b.wait_for("群主已转移给你，你已成为群主", WAIT);
+    c.wait_for("群主已顺位转移给", WAIT);
+
+    println!("=== 新群主 B 加人 D：群不再冻结 ===");
+    let (mut d, d_listen) = spawn_into_chat(bin, &cache_d, &cred_d, MNEMONIC_USER4);
+    let d_id = parse_peer_id(&d_listen);
+    d.send(&format!("/dial {b_addr}"));
+    d.wait_for(&format!("已连接对端: {b_id}"), WAIT);
+    b.wait_for(&format!("已连接对端: {d_id}"), WAIT);
+    b.wait_for(&format!("对方已上线: {d_name}"), WAIT);
+    b.send(&format!("/group add {group} {d_name}"));
+    b.wait_for(&format!("已将 {d_name} 加入群 {group}（名单版本 4"), WAIT);
+    d.wait_for(&format!("被邀请加入群聊: {group}"), WAIT);
+    c.wait_for(&format!("成员名单已更新（版本 4"), WAIT);
+
+    a.kill();
+    b.kill();
+    c.kill();
+    d.kill();
+}
+
 #[test]
 fn p2p_chat_e2e_suite() {
-    // 十场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
+    // 十一场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
     basic_chat_scenario();
     chat_by_name_scenario();
     graceful_offline_online_scenario();
@@ -716,4 +820,5 @@ fn p2p_chat_e2e_suite() {
     multi_session_scenario();
     group_chat_scenario();
     app_blocked_heartbeat_still_alive_scenario();
+    owner_offline_leave_ban_and_transfer_scenario();
 }

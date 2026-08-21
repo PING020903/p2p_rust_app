@@ -5,6 +5,31 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.15.0] - 2026-08-22
+
+### 变更（群成员一致性加固：单写者模型收口）
+
+- **群主不在线禁止退群**（单写者一致性优先）：普通成员 `/group leave` 前校验群主是否
+  在线，不在线则拒绝并提示——把名单维护收敛为"仅群主写"，从根源防止名单发散/幽灵成员
+- **群主退群一步顺位转移**：群主 `/group leave` 时自动把群主职位转移给名单中**下一位**
+  成员（members 数组群主之后第一个；群主在末尾则回卷取第一个非群主；仅自己则解散），
+  携带新名单 1v1 扇出 `GroupOwnerTransfer`；群不再因群主离开而冻结，新群主立即可加人
+- **幽灵/重复成员防御**：`load_groups` 加载时、接收 `GroupInvite`/`GroupMemberList`/
+  `GroupOwnerTransfer` 时、群主处理退群后均做保序去重（`dedup_members`）
+- `AppPayload` 新增 `GroupOwnerTransfer` 变体（cbor 末尾，向后兼容）；协议仍为 `/chat/7.0.0`
+  （CRDT 版本才需 bump `/chat/8.0.0`）
+
+### 测试
+
+- 新增 e2e 场景 11（四节点）：群主离线退群被拒 + 群主退群顺位转移给下一位 + 新群主加人成功
+- 单测 36 个（新增 `dedup_members`/`next_creator`）
+- 凭据支持 user1..user4（users.txt/template 补 4 号）；users.txt 解析防御 UTF-8 BOM
+
+### 路线图
+
+- 新增 `docs/GROUP_CRDT_ROADMAP.md`：群成员名单 OR-Set CRDT 演进方向（去单点权威、
+  退群去中心化、add-wins 防幽灵），未来版本据此推进
+
 ## [0.14.0] - 2026-08-22
 
 ### 变更（三层架构落地）

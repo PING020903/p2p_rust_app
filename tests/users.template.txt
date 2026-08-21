@@ -1,7 +1,7 @@
 # 测试凭据模板
 # 用法：复制本文件为 tests/users.txt 后自行填写；users.txt 已被 git 忽略，不会上传
-# 格式说明：userN-字段:值，N 取 1、2、3（3 号用于三节点多会话/群聊场景）；age 值后的 (YYYY-MM-DD) 为格式提示，解析时自动剥离
-# 注意：请勿在 users.txt 中填写真实的姓名/生日/密码；多会话场景要求三个名字互不相同
+# 格式说明：userN-字段:值，N 取 1、2、3、4（3 号用于三节点多会话/群聊，4 号用于四节点群主转移）；age 值后的 (YYYY-MM-DD) 为格式提示，解析时自动剥离
+# 注意：请勿在 users.txt 中填写真实的姓名/生日/密码；多会话场景要求各名字互不相同
 
 user1-name:张三
 user1-age:1990-01-01(YYYY-MM-DD)
@@ -17,3 +17,8 @@ user3-name:王五
 user3-age:1988-11-11(YYYY-MM-DD)
 user3-sex:M
 user3-password:change-me-3
+
+user4-name:赵六
+user4-age:1995-07-07(YYYY-MM-DD)
+user4-sex:F
+user4-password:change-me-4
