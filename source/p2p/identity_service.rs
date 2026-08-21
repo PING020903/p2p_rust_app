@@ -96,9 +96,24 @@ impl IdentityService {
             .filter(|n| !n.is_empty())
     }
 
-    /// 标记/取消信任联系人
+    /// 标记/取消信任联系人（显式置位：`/trust !名` 真正取消）
     pub fn trust(&mut self, peer: &PeerId, name: &str, verified: bool) {
-        self.contacts.ensure_contact(peer, name, verified);
+        self.contacts.ensure_contact(peer, name, false);
+        self.contacts.set_verified(peer, verified);
+    }
+
+    /// 按联系人名反查 peer（允许重名时取第一个；用于 /trust /chat 等按名解析）
+    pub fn contact_by_name(&self, name: &str) -> Option<PeerId> {
+        self.contacts
+            .find_by_name(name)
+            .and_then(|e| e.peer_id.parse().ok())
+    }
+
+    /// 联系人指纹（无记录则现算；供人工复核）
+    pub fn fingerprint(&self, peer: &PeerId) -> String {
+        self.contact(peer)
+            .map(|e| e.fingerprint.clone())
+            .unwrap_or_else(|| fingerprint_of(peer))
     }
 
     /// 对方上线（Hello）的存在处理：首次接触做 TOFU 指纹核对（交互终端人工确认、
@@ -479,11 +494,16 @@ mod tests {
         assert!(!svc.is_verified(&peer));
         assert!(svc.contact(&peer).is_none());
         assert_eq!(svc.contact_name(&peer), None);
+        assert_eq!(svc.contact_by_name("bob"), None);
         svc.trust(&peer, "bob", true);
         assert!(svc.is_verified(&peer));
         assert_eq!(svc.contact_name(&peer), Some("bob".into()));
+        assert_eq!(svc.contact_by_name("bob"), Some(peer));
+        assert!(!svc.fingerprint(&peer).is_empty());
+        // 显式取消信任（新语义：/trust !名 真正取消）
         svc.trust(&peer, "bob", false);
-        assert!(svc.is_verified(&peer));
+        assert!(!svc.is_verified(&peer));
+        assert_eq!(svc.contact_by_name("bob"), Some(peer));
         assert!(svc.on_peer_bye(&peer));
         let _ = std::fs::remove_dir_all(&dir);
         unsafe {

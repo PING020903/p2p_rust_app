@@ -65,12 +65,13 @@ struct ChatCtx<'a> {
 }
 
 impl<'a> ChatCtx<'a> {
-    /// 按名字/节点ID 解析目标 peer（先查 1v1 会话名，再按节点ID解析）
+    /// 按名字/节点ID 解析目标 peer：会话名 → 联系人名（L2）→ 直接解析节点ID
     fn resolve(&self, target: &str) -> Option<PeerId> {
         self.conversations
             .iter()
             .find(|(_, c)| c.name == target)
             .map(|(p, _)| *p)
+            .or_else(|| self.identity.contact_by_name(target))
             .or_else(|| target.parse::<PeerId>().ok())
     }
 
@@ -80,6 +81,15 @@ impl<'a> ChatCtx<'a> {
             .iter()
             .find(|(_, g)| g.name == name)
             .map(|(id, _)| id.clone())
+    }
+}
+
+/// 信任徽标文本（与 /list 一致的 [已信任]/[未信任]）
+fn trust_badge(verified: bool) -> colored::ColoredString {
+    if verified {
+        "  [已信任]".green()
+    } else {
+        "  [未信任]".yellow()
     }
 }
 
@@ -94,6 +104,7 @@ struct Conversation {
     greeted: bool,      // 是否已发过 Hello（重连后重置，避免漏问候）
     bye: bool,          // 对方已主动退出（不再心跳/重连）
     pending_dial: bool, // /chat 后尚无地址，等待 mDNS 发现自动拨号
+    send_confirmed: bool, // 未信任联系人首次发消息是否已确认（D3）
 }
 
 impl Conversation {
@@ -103,6 +114,7 @@ impl Conversation {
             greeted: false,
             bye: false,
             pending_dial: false,
+            send_confirmed: false,
         }
     }
 }
@@ -287,6 +299,18 @@ fn peer_name(
     peer.to_string()
 }
 
+/// 群主标签：`群主 {昵称} ({peerID})`（昵称用 peer_name 解析；解析失败直接显 raw id）
+fn group_owner_label(
+    g: &Group,
+    conversations: &HashMap<PeerId, Conversation>,
+    identity: &IdentityService,
+) -> String {
+    match g.creator.parse::<PeerId>() {
+        Ok(owner) => format!("群主 {} ({owner})", peer_name(&owner, conversations, identity)),
+        Err(_) => format!("群主 {}", g.creator),
+    }
+}
+
 fn print_dial_template() {
     println!("{}", "地址格式:".yellow());
     println!("  /ip4/<IPv4地址>/tcp/<端口>/p2p/<节点ID>");
@@ -400,17 +424,15 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                         .get(&p)
                         .map(|c| c.name.clone())
                         .unwrap_or_default();
+                    let who = if name.is_empty() {
+                        target.as_str()
+                    } else {
+                        name.as_str()
+                    };
+                    let badge = trust_badge(ctx.identity.is_verified(&p));
                     println!(
                         "{}",
-                        format!(
-                            "已切换到会话: {}（{p}）",
-                            if name.is_empty() {
-                                target.as_str()
-                            } else {
-                                name.as_str()
-                            }
-                        )
-                        .green()
+                        format!("已切换到会话: {who}（{p}）{badge}").green()
                     );
                 } else {
                     // 未连接：建/复用会话并拨号（或待接）
@@ -499,8 +521,9 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                 } else {
                     "".dimmed()
                 };
+                let owner = group_owner_label(g, ctx.conversations, ctx.identity);
                 println!(
-                    "  {}（{} 人，名单版本 {}，群ID {}）{resident}{focus}",
+                    "  {}（{} 人，名单版本 {}，群ID {}，{owner}）{resident}{focus}",
                     g.name, n, g.version, g.id
                 );
             }
@@ -574,15 +597,17 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
         };
         match ctx.resolve(&target) {
             Some(p) => {
-                let name = ctx
-                    .conversations
-                    .get(&p)
-                    .map(|c| c.name.clone())
-                    .unwrap_or_else(|| "未知".to_string());
-                ctx.identity.trust(&p, &name, !untrust);
+                // 名字统一走 peer_name（会话名 → 联系人名 → 节点ID），避免"未知"
+                let name = peer_name(&p, ctx.conversations, ctx.identity);
                 if untrust {
+                    ctx.identity.trust(&p, &name, false);
                     println!("{}", format!("已取消信任: {name}").yellow());
                 } else {
+                    // D4：信任前展示节点ID + 指纹，供人工复核（允许重名时核对）
+                    println!("{}", "请核对对方身份:".yellow());
+                    println!("  节点ID: {p}");
+                    println!("  指纹: {}", ctx.identity.fingerprint(&p).dimmed());
+                    ctx.identity.trust(&p, &name, true);
                     println!("{}", format!("已信任: {name}").green());
                 }
             }
@@ -717,7 +742,31 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                                 format!("{target} 尚未验证，请先 /trust {target}").yellow()
                             );
                         } else if ctx.groups[&gid].members.contains(&p.to_string()) {
-                            println!("{}", format!("{target} 已在群 {group} 中").dimmed());
+                            // 已在名单中：仍重发邀请——对方 cache 可能被意外清理（群记录/topic 丢失），
+                            // 重发让其重新入群+订阅；cache 完好者收等版本邀请无副作用（版本相等不重插）
+                            let g = &ctx.groups[&gid];
+                            let invite = serde_cbor::to_vec(&AppPayload::GroupInvite {
+                                group_id: g.id.clone(),
+                                group_name: g.name.clone(),
+                                version: g.version,
+                                members: g.members.clone(),
+                            })
+                            .unwrap_or_default();
+                            push_cmd(
+                                &mut ctx.ops,
+                                P2pCommand::Send {
+                                    peer: p,
+                                    frame: Frame {
+                                        control: None,
+                                        text: None,
+                                        binary: Some(invite),
+                                    },
+                                },
+                            );
+                            println!(
+                                "{}",
+                                format!("{target} 已在群 {group} 中，已重发邀请确认对方同步").dimmed()
+                            );
                         } else {
                             let name = peer_name(&p, ctx.conversations, ctx.identity);
                             ctx.groups.get_mut(&gid).unwrap().version += 1;
@@ -994,8 +1043,9 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                 } else {
                     "".dimmed()
                 };
+                let owner = group_owner_label(g, ctx.conversations, ctx.identity);
                 println!(
-                    "  {}（{} 人，名单版本 {}，群ID {}）{resident}{focus}",
+                    "  {}（{} 人，名单版本 {}，群ID {}，{owner}）{resident}{focus}",
                     g.name, n, g.version, g.id
                 );
             }
@@ -1165,6 +1215,29 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                 } else {
                                     name
                                 };
+                                // D3：未信任联系人首次发消息确认（仅交互终端；管道/e2e 自动放行）
+                                if !identity.is_verified(&p) {
+                                    if interactive && !conversations[&p].send_confirmed {
+                                        println!(
+                                            "{}",
+                                            format!("对方 {who} 未信任（未经验证），确认发送？(y/n)").yellow()
+                                        );
+                                        let ans = match stdin.next_line().await {
+                                            Ok(Some(l)) => l.trim().to_string(),
+                                            _ => String::new(),
+                                        };
+                                        if !ans.eq_ignore_ascii_case("y") {
+                                            println!("{}", "已取消发送".dimmed());
+                                            continue;
+                                        }
+                                        conversations.get_mut(&p).unwrap().send_confirmed = true;
+                                    } else if !interactive {
+                                        println!(
+                                            "{}",
+                                            format!("对方 {who} 未信任，消息仍已发送").yellow()
+                                        );
+                                    }
+                                }
                                 let payload = serde_cbor::to_vec(&AppPayload::Text(
                                     line.to_string(),
                                 ))
@@ -1206,9 +1279,11 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                         .map(|c| c.name.clone())
                                         .unwrap_or_default();
                                     if !name.is_empty() {
+                                        let badge = trust_badge(identity.is_verified(&peer));
                                         println!(
                                             "{}",
-                                            format!("已切换到会话: {}（{peer}）", name).green()
+                                            format!("已切换到会话: {}（{peer}）{badge}", name)
+                                                .green()
                                         );
                                     }
                                 }
@@ -1466,19 +1541,30 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                             version,
                                             members,
                                         } => {
-                                            // 群主退群顺位转移：校验来源确为当前群主，版本更高才整体替换。
+                                            // 群主退群顺位转移：版本更高才整体替换。
+                                            // 门控放宽为"from 是群成员"（不再要求 == 当前 creator）——
+                                            // 漏收中间转移的节点收到任一后续转移即可自愈，creator 不再永久错位。
                                             // 名单先归一化去重（幽灵/重复防御）
                                             let mut members = members;
                                             dedup_members(&mut members);
-                                            let is_creator = groups
-                                                .get(&group_id)
-                                                .map(|g| g.creator == from.to_string())
-                                                .unwrap_or(false);
+                                            let from_is_member = members
+                                                .iter()
+                                                .any(|m| m == &from.to_string())
+                                                || groups
+                                                    .get(&group_id)
+                                                    .map(|g| {
+                                                        g.members
+                                                            .iter()
+                                                            .any(|m| m == &from.to_string())
+                                                    })
+                                                    .unwrap_or(false);
+                                            let new_in_list =
+                                                members.iter().any(|m| m == &new_creator);
                                             let newer = groups
                                                 .get(&group_id)
                                                 .map(|g| version > g.version)
                                                 .unwrap_or(false);
-                                            if is_creator && newer {
+                                            if from_is_member && new_in_list && newer {
                                                 let was_creator_of = groups
                                                     .get(&group_id)
                                                     .map(|g| g.name.clone())

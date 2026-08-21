@@ -5,6 +5,31 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.16.0] - 2026-08-22
+
+### 变更（1v1 信任管理 + 群主可见 + 转移自愈）
+
+- **修复取消信任**：`/trust !名` 之前是空操作（`ensure_contact` 对已存在条目只 OR 置真）。
+  新增 `ContactBook::set_verified` 显式置位，`/trust !名` 真正取消——`/list` 徽标变未信任、
+  群加人被"尚未验证"门控拒绝
+- **联系人名解析**：`ChatCtx::resolve` 三级（会话名 → 联系人名 `contact_by_name` → 节点ID），
+  `/trust`、`/chat`、`/group add` 均能按已记录联系人名解析（重启后无会话也能用）
+- **D2 会话信任徽标**：`/chat` 聚焦与自动聚焦提示显示 `[已信任]`/`[未信任]`
+- **D3 未信任首次发消息确认**：交互终端给未信任联系人首次发消息弹 `(y/n)` 确认
+  （`Conversation.send_confirmed` 记录）；管道/e2e 自动放行
+- **D4 指纹复核**：`/trust <名>` 信任前展示 `节点ID` + `指纹`，供人工比对（允许重名）
+- **群主可见**：`/list` 与 `/group list` 群聊行显示 `群主 {昵称} ({peerID})`
+- **群主转移自愈**：`GroupOwnerTransfer` 接收门控放宽——只要 `from` 是群成员、
+  `new_creator` 在名单内、版本更高即整体替换（不再要求 == 当前 creator）；
+  漏收中间转移的节点收到任一后续转移即自愈到最新群主，不再永久错位导致"无法退群"
+- **邀请重发**：`/group add` 目标已在名单中时仍重发 `GroupInvite`（不 bump 版本），
+  对方 cache 被意外清理时重新入群+订阅
+
+### 测试
+
+- 新增 e2e 场景 12：取消信任→徽标+加人门控、重新信任显示指纹、重启后按联系人名 /trust /chat
+- 单测 36 个（新增 `set_verified`/`find_by_name`；`contact_by_name` 并入既有测试）
+
 ## [0.15.0] - 2026-08-22
 
 ### 变更（群成员一致性加固：单写者模型收口）

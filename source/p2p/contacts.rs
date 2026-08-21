@@ -85,6 +85,11 @@ impl ContactBook {
         self.entries.get(peer_id).map(|e| e.verified).unwrap_or(false)
     }
 
+    /// 按名字精确查找联系人（返回条目；允许多个联系人同名时取第一个）
+    pub fn find_by_name(&self, name: &str) -> Option<&ContactEntry> {
+        self.entries.values().find(|e| e.name == name)
+    }
+
     /// 仅刷新最近见时间（存在层记录；不改变名字与信任状态）
     pub fn mark_seen(&mut self, peer: &PeerId) {
         let pid = peer.to_string();
@@ -123,6 +128,20 @@ impl ContactBook {
             }
         }
         self.save();
+    }
+
+    /// 显式置位信任状态（true/false）。条目不存在时先按 OR 合并插入兜底。
+    /// 与 `ensure_contact` 的 OR 合并（只会置真）不同：`/trust !名` 取消信任走这里。
+    pub fn set_verified(&mut self, peer: &PeerId, verified: bool) {
+        let pid = peer.to_string();
+        if !self.entries.contains_key(&pid) {
+            self.ensure_contact(peer, "", false);
+        }
+        if let Some(e) = self.entries.get_mut(&pid) {
+            e.verified = verified;
+            e.last_seen = unix_now();
+            self.save();
+        }
     }
 }
 
@@ -171,6 +190,63 @@ mod tests {
         let entry = book.get(&b_id.to_string()).unwrap();
         assert_eq!(entry.name, "bob");
         assert!(!entry.fingerprint.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("P2P_ID_CACHE_DIR");
+        }
+    }
+
+    #[test]
+    fn set_verified_can_untrust_and_retrust() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("p2p_set_ver_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("P2P_ID_CACHE_DIR", &dir);
+        }
+        let a = keypair_from_mnemonic(MNEMONIC_A).unwrap();
+        let a_id = a.public().to_peer_id();
+        let b = keypair_from_mnemonic(MNEMONIC_B).unwrap();
+        let b_id = b.public().to_peer_id();
+
+        let mut book = ContactBook::load(&a_id);
+        book.ensure_contact(&b_id, "bob", true);
+        assert!(book.verified(&b_id.to_string()));
+        // ensure_contact OR 合并不会降级
+        book.ensure_contact(&b_id, "bob", false);
+        assert!(book.verified(&b_id.to_string()));
+        // set_verified 显式取消
+        book.set_verified(&b_id, false);
+        assert!(!book.verified(&b_id.to_string()));
+        // 重新信任
+        book.set_verified(&b_id, true);
+        assert!(book.verified(&b_id.to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("P2P_ID_CACHE_DIR");
+        }
+    }
+
+    #[test]
+    fn find_by_name_matches_contact_name() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("p2p_find_name_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("P2P_ID_CACHE_DIR", &dir);
+        }
+        let a = keypair_from_mnemonic(MNEMONIC_A).unwrap();
+        let a_id = a.public().to_peer_id();
+        let b = keypair_from_mnemonic(MNEMONIC_B).unwrap();
+        let b_id = b.public().to_peer_id();
+
+        let mut book = ContactBook::load(&a_id);
+        book.ensure_contact(&b_id, "bob", true);
+        let found = book.find_by_name("bob").expect("按名字应能找到");
+        assert_eq!(found.peer_id, b_id.to_string());
+        assert!(book.find_by_name("alice").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
         unsafe {

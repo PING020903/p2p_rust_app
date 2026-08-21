@@ -807,9 +807,65 @@ fn owner_offline_leave_ban_and_transfer_scenario() {
     d.kill();
 }
 
+/// 场景12：1v1 信任管理——取消信任真正生效（/list 徽标 + 群加人门控）、重新信任显示指纹复核（D4）、
+/// 联系人名解析（重启后无会话仍能按联系人名 /trust /chat）
+fn trust_management_and_contact_name_resolution_scenario() {
+    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache_a = scenario_cache_dir("s12_a");
+    let cache_b = scenario_cache_dir("s12_b");
+    let (cred_a, cred_b) = load_creds();
+    let b_name = cred_b.name.clone();
+    let group = "grp1";
+    println!("=== 场景12: 信任管理 + 联系人名解析 ===");
+
+    println!("=== A/B 连接，A 建群 ===");
+    let (mut a, a_listen) = spawn_into_chat(bin, &cache_a, &cred_a, MNEMONIC_USER1);
+    let a_addr = listen_addr(&a_listen);
+    let a_id = parse_peer_id(&a_listen);
+    let (mut b, b_listen) = spawn_into_chat(bin, &cache_b, &cred_b, MNEMONIC_USER2);
+    let b_id = parse_peer_id(&b_listen);
+    b.send(&format!("/dial {a_addr}"));
+    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+    a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
+    // 等 A 处理完 B 的 Hello（会话名 + 联系人记录就绪），否则 /trust 按名解析不到
+    a.wait_for(&format!("对方已上线: {b_name}"), WAIT);
+    a.send(&format!("/group new {group}"));
+    a.wait_for(&format!("已创建并聚焦群聊: {group}"), WAIT);
+
+    println!("=== A 取消信任 B → /list 徽标变未信任 + 群加人被门控拒绝 ===");
+    a.send(&format!("/trust !{b_name}"));
+    a.wait_for(&format!("已取消信任: {b_name}"), WAIT);
+    a.send("/list");
+    a.wait_for("=== 已登记节点 ===", WAIT);
+    a.wait_for(&format!("{b_id}  [未信任]"), WAIT);
+    a.send(&format!("/group add {group} {b_name}"));
+    a.wait_for("尚未验证，请先 /trust", WAIT);
+
+    println!("=== A 重新信任 B：显示指纹复核（D4）→ 加人成功 ===");
+    a.send(&format!("/trust {b_name}"));
+    a.wait_for("请核对对方身份", WAIT);
+    a.wait_for("指纹: ", WAIT);
+    a.wait_for(&format!("已信任: {b_name}"), WAIT);
+    a.send(&format!("/group add {group} {b_name}"));
+    a.wait_for(&format!("已将 {b_name} 加入群 {group}"), WAIT);
+    b.wait_for(&format!("被邀请加入群聊: {group}"), WAIT);
+
+    println!("=== 联系人名解析：A 重启后无会话，仍按联系人名 /trust /chat ===");
+    a.send("/q");
+    a.wait_for("=== 主菜单 ===", WAIT);
+    enter_chat(&mut a, &cred_a);
+    a.send(&format!("/trust {b_name}"));
+    a.wait_for("请核对对方身份", WAIT);
+    a.send(&format!("/chat {b_name}"));
+    a.wait_for(&format!("已连接对端: {b_id}"), Duration::from_secs(40));
+
+    a.kill();
+    b.kill();
+}
+
 #[test]
 fn p2p_chat_e2e_suite() {
-    // 十一场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
+    // 十二场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
     basic_chat_scenario();
     chat_by_name_scenario();
     graceful_offline_online_scenario();
@@ -821,4 +877,5 @@ fn p2p_chat_e2e_suite() {
     group_chat_scenario();
     app_blocked_heartbeat_still_alive_scenario();
     owner_offline_leave_ban_and_transfer_scenario();
+    trust_management_and_contact_name_resolution_scenario();
 }
