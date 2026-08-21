@@ -5,6 +5,15 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.13.1] - 2026-08-22
+
+### 变更
+
+- `group` 子命令装入指令树：`/group new/add/resident/leave/list/<群名>` 注册为嵌套路由节点
+  （指令树最深命中分词），`ChatAction::Group(String)` 的手写 `split_whitespace` 解析改为
+  类型化变体（`GroupNew/GroupAdd/GroupResident/GroupLeave/GroupList/GroupFocus`）
+  —— 纯重构，无行为变更
+
 ## [0.13.0] - 2026-08-22
 
 ### 新增
