@@ -309,7 +309,8 @@ fn chat_by_name_scenario() {
     enter_chat(&mut b, &cred_b);
 
     a.send(&format!("/chat {}", cred_b.name));
-    a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
+    // 待接呼叫依赖 A 的 mDNS 重新发现 B 的新地址，放宽超时抗时序抖动
+    a.wait_for(&format!("已连接对端: {b_id}"), Duration::from_secs(40));
     b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
     b.wait_for(&format!("对方已上线: {}", cred_a.name), WAIT);
 

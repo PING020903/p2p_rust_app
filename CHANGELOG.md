@@ -5,6 +5,22 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.12.0] - 2026-08-20
+
+### 变更
+
+- **消息帧重构：`ChatPayload` → `Frame{control/text/binary}` 三通道**
+  （协议 `/chat/6.0.0` → `/chat/7.0.0`）
+  - `control`：传输层控制指令（心跳 `Heartbeat`）
+  - `text`：节点间短消息（`NodeMsg::Hello` 上线 / `NodeMsg::Bye` 下线），**非用户内容**
+  - `binary`：用户内容负载（`AppPayload`：`Text` 聊天文本 + 群管理
+    `GroupInvite/GroupLeave/GroupMemberList`），应用层自描述（cbor 序列化）
+  - 删除原 `Binary{name,data}` 占位（从未使用）
+- 接收端改为**通道路由**：`control` → `text` → `binary` 依次分发
+  （硬编码 match；handler 注册表化留作后续迭代）
+- 群文本仍走 gossipsub（`GroupPayload`），不进 1v1 帧
+- 新增 `serde_cbor` 依赖；e2e 场景 2 待接呼叫等待放宽至 40s（抗 mDNS 时序抖动）
+
 ## [0.11.0] - 2026-08-20
 
 ### 变更
