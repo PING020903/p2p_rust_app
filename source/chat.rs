@@ -1055,10 +1055,12 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     .collect();
                                 entries.sort();
                                 for (id_str, p, addr_n) in entries {
-                                    let who = conversations
-                                        .get(p)
-                                        .map(|c| c.name.as_str())
-                                        .unwrap_or("未知");
+                                    let pname = peer_name(p, &conversations, &contacts);
+                                    let who = if pname == p.to_string() {
+                                        "未知".to_string()
+                                    } else {
+                                        pname
+                                    };
                                     let state = if focused == Some(*p) {
                                         "当前会话"
                                     } else if conn_count.contains_key(p) {
@@ -1089,8 +1091,8 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                         "".dimmed()
                                     };
                                     println!(
-                                        "  {}（{} 人，群ID {}）{focus}",
-                                        g.name, n, g.id
+                                        "  {}（{} 人，名单版本 {}，群ID {}）{focus}",
+                                        g.name, n, g.version, g.id
                                     );
                                 }
                             }
