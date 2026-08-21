@@ -138,6 +138,10 @@ struct Group {
     version: u64, // 成员变更计数，仅接受更高版本
     #[serde(default)]
     creator: String, // 群主 peer_id（唯一权威）
+    /// 常驻接收（per-node 本地偏好，不随名单传播）：常驻群成员上线自动拨号维持 mesh，
+    /// 普通群只在聚焦时按需连接（防"所有群都 mesh"的通讯风暴）
+    #[serde(default)]
+    resident: bool,
 }
 
 /// 群消息载荷（gossipsub data，JSON 编码）。
@@ -179,6 +183,43 @@ fn fanout_member_list(
     for p in targets {
         let _ = swarm.behaviour_mut().chat.send_request(p, request.clone());
     }
+}
+
+/// 拨号群成员（跳过自己/已连接/已在途）：常驻群保持 mesh 与聚焦群按需连接的共用入口
+fn dial_group_members(
+    swarm: &mut Swarm<NodeBehaviour>,
+    g: &Group,
+    my_id: &PeerId,
+    conn_count: &HashMap<PeerId, u32>,
+    known_addrs: &mut HashMap<PeerId, Vec<Multiaddr>>,
+    reconnect_peer: &mut Option<PeerId>,
+    reconnect_pending: &mut Vec<Multiaddr>,
+    reconnect_queue: &mut VecDeque<PeerId>,
+    dialing: &mut HashSet<PeerId>,
+) {
+    let my_id_str = my_id.to_string();
+    for m in &g.members {
+        if m == &my_id_str {
+            continue;
+        }
+        let Ok(pid) = m.parse::<PeerId>() else {
+            continue;
+        };
+        if conn_count.contains_key(&pid) || *reconnect_peer == Some(pid) {
+            continue;
+        }
+        if known_addrs.get(&pid).map(|a| !a.is_empty()).unwrap_or(false) {
+            enqueue_reconnect(pid, reconnect_queue, reconnect_peer);
+        }
+    }
+    dial_next_reconnect(
+        swarm,
+        dialing,
+        reconnect_peer,
+        reconnect_pending,
+        known_addrs,
+        reconnect_queue,
+    );
 }
 
 fn groups_path(my_peer_id: &PeerId) -> PathBuf {
@@ -361,13 +402,13 @@ fn build_tree() -> CmdTree<ChatCtx> {
         if args.is_empty() {
             eprintln!(
                 "{}",
-                "群聊: /group new <群名> 建群 | /group add <群名> <角色|节点ID> 加人(仅群主) | /group leave <群名> 退群 | /group list 列群 | /group <群名> 聚焦".yellow()
+                "群聊: /group new <群名> 建群 | /group add <群名> <角色|节点ID> 加人(仅群主) | /group resident <群名> on|off 常驻接收 | /group leave <群名> 退群 | /group list 列群 | /group <群名> 聚焦".yellow()
             );
             return;
         }
         ctx.action = ChatAction::Group(args.join(" "));
     });
-    tree.set_help(group, "群聊：/group new/add/leave/list/<群名>");
+    tree.set_help(group, "群聊：/group new/add/resident/leave/list/<群名>");
     tree
 }
 
@@ -417,7 +458,7 @@ fn dial_next_reconnect(
     }
 }
 
-/// 节点被发现（mDNS 广播 或 隐身监听）的公共处理：登记地址 + 待接呼叫自动拨号
+/// 节点被发现（mDNS 广播 或 隐身监听）的公共处理：登记地址 + 待接呼叫/常驻群成员自动拨号
 fn on_peer_discovered(
     found_id: PeerId,
     addr: Multiaddr,
@@ -425,6 +466,7 @@ fn on_peer_discovered(
     swarm: &mut Swarm<NodeBehaviour>,
     known_addrs: &mut HashMap<PeerId, Vec<Multiaddr>>,
     conversations: &HashMap<PeerId, Conversation>,
+    groups: &HashMap<String, Group>,
     reconnect_peer: &mut Option<PeerId>,
     reconnect_pending: &mut Vec<Multiaddr>,
     dialing: &mut HashSet<PeerId>,
@@ -443,11 +485,15 @@ fn on_peer_discovered(
         .get(&found_id)
         .map(|c| c.pending_dial)
         .unwrap_or(false);
-    if pending_dial
+    // 常驻群成员：上线即自动拨号维持 mesh（防通讯风暴，仅常驻群生效）
+    let resident_member = groups.values().any(|g| {
+        g.resident && g.members.iter().any(|m| m == &found_id.to_string())
+    });
+    if (pending_dial || resident_member)
         && *reconnect_peer != Some(found_id)
         && !conn_count.contains_key(&found_id)
     {
-        println!("{}", format!("发现待接呼叫节点，拨号 {found_id}").cyan());
+        println!("{}", format!("发现可连接节点，拨号 {found_id}").cyan());
         enqueue_reconnect(found_id, queue, reconnect_peer);
         dial_next_reconnect(
             swarm,
@@ -1090,8 +1136,13 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     } else {
                                         "".dimmed()
                                     };
+                                    let resident = if g.resident {
+                                        " [常驻]".green()
+                                    } else {
+                                        "".dimmed()
+                                    };
                                     println!(
-                                        "  {}（{} 人，名单版本 {}，群ID {}）{focus}",
+                                        "  {}（{} 人，名单版本 {}，群ID {}）{resident}{focus}",
                                         g.name, n, g.version, g.id
                                     );
                                 }
@@ -1202,6 +1253,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                                 members: vec![creator.clone()], // 群主也是成员
                                                 version: 0,
                                                 creator: creator.clone(),
+                                                resident: false, // 默认非常驻，用户显式 /group resident on
                                             },
                                         );
                                         let _ = swarm
@@ -1359,11 +1411,72 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                             } else {
                                                 "".dimmed()
                                             };
+                                            let resident = if g.resident {
+                                                " [常驻]".green()
+                                            } else {
+                                                "".dimmed()
+                                            };
                                             println!(
-                                                "  {}（{} 人，名单版本 {}，群ID {}）{focus}",
+                                                "  {}（{} 人，名单版本 {}，群ID {}）{resident}{focus}",
                                                 g.name, n, g.version, g.id
                                             );
                                         }
+                                    }
+                                }
+                                "resident" => {
+                                    let gname = parts.next().unwrap_or("");
+                                    let onoff = parts.next().unwrap_or("");
+                                    let gid = groups
+                                        .iter()
+                                        .find(|(_, g)| g.name == gname)
+                                        .map(|(id, _)| id.clone());
+                                    match gid {
+                                        Some(gid) => {
+                                            let enable = match onoff {
+                                                "on" => true,
+                                                "off" => false,
+                                                _ => {
+                                                    eprintln!(
+                                                        "{}",
+                                                        "用法: /group resident <群名> on|off".yellow()
+                                                    );
+                                                    continue;
+                                                }
+                                            };
+                                            groups.get_mut(&gid).unwrap().resident = enable;
+                                            let _ =
+                                                save_groups(swarm.local_peer_id(), &groups);
+                                            let name = groups[&gid].name.clone();
+                                            if enable {
+                                                // 标记常驻：立即补连成员（上线后也会自动拨号）
+                                                let g = groups[&gid].clone();
+                                                let my_id =
+                                                    swarm.local_peer_id().clone();
+                                                dial_group_members(
+                                                    &mut swarm,
+                                                    &g,
+                                                    &my_id,
+                                                    &conn_count,
+                                                    &mut known_addrs,
+                                                    &mut reconnect_peer,
+                                                    &mut reconnect_pending,
+                                                    &mut reconnect_queue,
+                                                    &mut dialing,
+                                                );
+                                            }
+                                            println!(
+                                                "{}",
+                                                format!(
+                                                    "群 {name} 已设为{}常驻（成员上线自动连接维持接收）",
+                                                    if enable { "" } else { "非" }
+                                                )
+                                                .green()
+                                            );
+                                        }
+                                        None => eprintln!(
+                                            "{}",
+                                            format!("未知群: {gname}（/group list 查看）").yellow()
+                                        ),
                                     }
                                 }
                                 "leave" => {
@@ -1434,7 +1547,21 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                         Some(gid) => {
                                             focused_group = Some(gid.clone());
                                             focused = None;
-                                            let name = groups[&gid].name.clone();
+                                            let g = groups[&gid].clone();
+                                            let name = g.name.clone();
+                                            // 聚焦即连：拨号群成员（常驻群维持 mesh，普通群按需连接）
+                                            let my_id = swarm.local_peer_id().clone();
+                                            dial_group_members(
+                                                &mut swarm,
+                                                &g,
+                                                &my_id,
+                                                &conn_count,
+                                                &mut known_addrs,
+                                                &mut reconnect_peer,
+                                                &mut reconnect_pending,
+                                                &mut reconnect_queue,
+                                                &mut dialing,
+                                            );
                                             println!(
                                                 "{}",
                                                 format!(
@@ -1567,6 +1694,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                         &mut swarm,
                         &mut known_addrs,
                         &conversations,
+                        &groups,
                         &mut reconnect_peer,
                         &mut reconnect_pending,
                         &mut dialing,
@@ -1621,7 +1749,9 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                             .or_insert_with(Conversation::new);
                         conv.pending_dial = false;
                         conv.last_rx = Some(Instant::now());
-                        if focused.is_none() {
+                        // 仅在无任何焦点（既非 1v1 也非群）时才自动聚焦首个连接，
+                        // 避免连上群成员时把 1v1 设为 focused 抢走群焦点
+                        if focused.is_none() && focused_group.is_none() {
                             focused = Some(peer_id);
                             if !conv.name.is_empty() {
                                 println!(
@@ -1764,6 +1894,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                 &mut swarm,
                                 &mut known_addrs,
                                 &conversations,
+                                &groups,
                                 &mut reconnect_peer,
                                 &mut reconnect_pending,
                                 &mut dialing,
@@ -1931,6 +2062,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                                         members: members.clone(),
                                                         version,
                                                         creator: from.to_string(),
+                                                        resident: false, // 入群默认非常驻
                                                     },
                                                 );
                                                 let _ = save_groups(

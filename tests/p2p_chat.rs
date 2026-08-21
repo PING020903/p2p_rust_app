@@ -637,6 +637,12 @@ fn group_chat_scenario() {
     a.send("/group list");
     a.wait_for(&format!("{group}（3 人，名单版本 2"), WAIT);
 
+    println!("=== A 标记 testgrp 为常驻，/group list 显示 [常驻] ===");
+    a.send(&format!("/group resident {group} on"));
+    a.wait_for(&format!("群 {group} 已设为常驻"), WAIT);
+    a.send("/group list");
+    a.wait_for("[常驻]", WAIT);
+
     println!("=== C 退群：通知群主划去自己，A 处理并扇出更新名单 ===");
     c.send(&format!("/group leave {group}"));
     c.wait_for(&format!("已退出群聊 {group}"), WAIT);
