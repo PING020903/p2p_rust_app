@@ -26,6 +26,9 @@ P2P 传输层产品化方向规划。以"身份验证 + 连接"为根基，聊�
   群主可见（/list 群聊行）+ 群主转移自愈 + 邀请重发
 - **0.17.0** 语义注册表：`NodeMsg::Custom` + `SignalRegistry`——text 通道成为可注册协议语义通道，
   chat 业务拆为 5 个注册 tag（`/chat/8.0.0`）；新应用（文件/固件升级）= 注册 tag + handler
+- **0.18.0** 帧分发内核化：`Frame.text` 统一为字符串标签（`/frame/1.0.0`），`SignalRegistry`
+  升级 async 分发，事件分支无 match；L2 映射 hello/bye 存在语义 + L3 钩子分析"谁上线"，
+  L3 只注册 handler/钩子
 
 ## 后续规划
 
@@ -43,9 +46,10 @@ P2P 传输层产品化方向规划。以"身份验证 + 连接"为根基，聊�
   （`AppPayload` 自描述，cbor）；协议 `/chat/7.0.0`
 - **心跳（保活）进传输层**（✅ 0.14.0）：L1 对全部已连接非 bye peer 保活，超时判离线；
   上线/离线通知（`PeerConnected/PeerDisconnected`）与名字握手（Hello/Bye 归 L2）分属传输/身份层
-- **handler 注册表**（✅ 0.17.0）：`NodeMsg::Custom(String)` + `SignalRegistry`——
-  text 通道成为"可注册协议语义"通道；chat 业务拆为 5 个注册 tag + 负载（`/chat/8.0.0`）；
-  新业务（文件/固件升级）= 注册 tag + handler，不动核心（为嵌入式固件升级打基础）
+- **handler 注册表**（✅ 0.17.0 → 0.18.0 完善）：`Frame.text` 统一为字符串标签（`/frame/1.0.0`），
+  `SignalRegistry` async 分发，事件分支**无 match**（查表即分发）；L2 映射 hello/bye 存在语义 +
+  L3 钩子分析"谁上线"；新业务（文件/固件升级）= 注册 tag + handler，不动核心
+  （为嵌入式固件升级打基础）
 
 ### 文件传输（`/file/1.0.0`）
 - 复用身份验证 + 联系人簿：发送前校验接收方是**已验证联系人**（"发给谁"由传输层保证）

@@ -5,6 +5,26 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.18.0] - 2026-08-22
+
+### 变更（帧分发内核化：L3 不再 match frame.text）
+
+- **`Frame.text` 改为 `Option<String>` 统一标签**：删除 `NodeMsg` 枚举；hello 帧
+  `text="hello"` + `binary=cbor(名字)`，bye 帧 `text="bye"`；chat 业务 `text="chat.*"`。
+  L1 纯透传不解释；协议 id `/frame/1.0.0`（同机升级）
+- **`SignalRegistry` 升级为 async 分发**：`register(tag, async_handler)` +
+  `dispatch(tag, from, payload)`（await handler）；事件分支**无 match**，收到帧查表分发，
+  未注册 tag 报"未处理语义"
+- **L2 映射存在语义 + L3 钩子分析"谁上线"**：`"hello"`/`"bye"` 分发条目调 L2
+  `handle_peer_hello/handle_peer_bye`（TOFU/联系人簿，默认行为），L3 通过钩子解析负载
+  （名字）判断谁上线/下线并反应（会话名/打印/MarkBye）；L3 不再直接处理原始帧
+- **handler 为 async**：可直接 await（TOFU 读输入 / 发命令），AppCtx 扩展 `stdin`/
+  `interactive`/`cmd_tx`；事件侧不再用 ops 队列（命令侧 ChatCtx 的 ops 保留）
+
+### 测试
+
+- 37 单测 + 12 e2e 全绿——Hello/Bye 钩子路径与 chat 业务经 async 分发后行为不变
+
 ## [0.17.0] - 2026-08-22
 
 ### 变更（语义注册表：L1 通用语义通道落地）

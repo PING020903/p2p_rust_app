@@ -158,6 +158,34 @@ impl IdentityService {
         known
     }
 
+    /// L2 处理对方上线（Hello）：先做存在层处理（TOFU/联系人簿），
+    /// 再触发 L3 注册的钩子（参数回调，可在运行时替换）。L3 不直接处理原始帧。
+    pub async fn handle_peer_hello<H>(
+        &mut self,
+        stdin: &mut StdinLines,
+        interactive: bool,
+        peer: &PeerId,
+        name: &str,
+        mut on_hello: H,
+    ) -> Result<(), Box<dyn Error>>
+    where
+        H: FnMut(&PeerId, &str),
+    {
+        self.on_peer_hello(stdin, interactive, peer, name).await?;
+        on_hello(peer, name);
+        Ok(())
+    }
+
+    /// L2 处理对方下线（Bye）：先做存在层处理（记录最近见），
+    /// 再触发 L3 注册的钩子（参数回调，可在运行时替换）。
+    pub fn handle_peer_bye<B>(&mut self, peer: &PeerId, mut on_bye: B)
+    where
+        B: FnMut(&PeerId),
+    {
+        self.on_peer_bye(peer);
+        on_bye(peer);
+    }
+
     /// /backup：重新查看本身份助记词（需再输密码解锁 keystore）
     pub async fn backup(
         &mut self,
@@ -505,6 +533,57 @@ mod tests {
         assert!(!svc.is_verified(&peer));
         assert_eq!(svc.contact_by_name("bob"), Some(peer));
         assert!(svc.on_peer_bye(&peer));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("P2P_ID_CACHE_DIR");
+        }
+    }
+
+    /// L2 存在钩子：handle_peer_hello/bye 在 L2 处理后触发 L3 提供的钩子（参数回调）
+    #[tokio::test]
+    async fn presence_hooks_fire_after_l2_processing() {
+        use crate::p2p::contacts::CACHE_TEST_LOCK;
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("p2p_presence_hook_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("P2P_ID_CACHE_DIR", &dir);
+        }
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let keypair = keypair_from_mnemonic(phrase).unwrap();
+        let my_id = keypair.public().to_peer_id();
+        let peer = {
+            let kp = keypair_from_mnemonic(
+                "legal winner thank year wave sausage worth useful legal winner thank yellow",
+            )
+            .unwrap();
+            kp.public().to_peer_id()
+        };
+        let mut svc = IdentityService {
+            keypair,
+            my_id,
+            info: IdentityInfo {
+                name: "alice".into(),
+                birthday: "1990-01-01".into(),
+                gender: 'M',
+            },
+            contacts: ContactBook::load(&my_id),
+        };
+        // 管道模式（interactive=false）下 hello 不读 stdin，可直接喂未使用的 stdin
+        use tokio::io::AsyncBufReadExt;
+        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        // hello 钩子触发 + 收到名字
+        let mut hello_calls: Vec<(String, String)> = Vec::new();
+        svc.handle_peer_hello(&mut stdin, false, &peer, "bob", |p, n| {
+            hello_calls.push((p.to_string(), n.to_string()));
+        })
+        .await
+        .unwrap();
+        assert_eq!(hello_calls, vec![(peer.to_string(), "bob".into())]);
+        // bye 钩子触发
+        let mut bye_calls: Vec<String> = Vec::new();
+        svc.handle_peer_bye(&peer, |p| bye_calls.push(p.to_string()));
+        assert_eq!(bye_calls, vec![peer.to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
         unsafe {
             std::env::remove_var("P2P_ID_CACHE_DIR");

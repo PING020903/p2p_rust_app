@@ -4,14 +4,16 @@ use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
+use std::future::Future;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::pin::Pin;
 use tokio::io::AsyncBufReadExt;
 
 use crate::cmd_tree::{CmdError, CmdTree, ROOT};
 use crate::p2p::{cache_dir, load_discovery_mode, save_discovery_mode, DiscoveryMode};
 use crate::p2p::identity_service::{IdentityService, StdinLines};
-use crate::p2p::node::{Control, Frame, NodeMsg, P2pCommand, P2pEvent, P2pNode, BYE_HANDSHAKE_TIMEOUT};
+use crate::p2p::node::{Control, Frame, P2pCommand, P2pEvent, P2pNode, BYE_HANDSHAKE_TIMEOUT};
 
 // ---- 语义注册表（L3 应用层）：text=Custom(tag) 承载协议语义，binary 承载负载 ----
 //
@@ -61,11 +63,11 @@ struct GroupOwnerTransferPayload {
     members: Vec<String>,
 }
 
-/// 构造一个"自定义语义"帧：text=Custom(tag) + binary=负载
+/// 构造一个"协议语义"帧：text=标签字符串 + binary=负载
 fn custom_frame(tag: &str, payload: Vec<u8>) -> Frame {
     Frame {
         control: None,
-        text: Some(NodeMsg::Custom(tag.to_string())),
+        text: Some(tag.to_string()),
         binary: Some(payload),
     }
 }
@@ -130,12 +132,19 @@ fn push_cmd(ops: &mut VecDeque<AsyncOp>, cmd: P2pCommand) {
     ops.push_back(AsyncOp::Cmd(cmd));
 }
 
-/// 语义信号处理器：处理一个自定义语义（text=Custom(tag)）的 binary 负载。
-/// 返回是否成功处理（当前仅作诊断；未来文件等场景可决定对端响应）。
-type SignalHandler =
-    Box<dyn for<'a> FnMut(&mut AppCtx<'a>, &PeerId, Option<&[u8]>) -> bool>;
+/// 语义信号处理器（async）：处理一个协议语义（frame.text 标签）的 binary 负载。
+/// `'borrow` 是 handler 调用时的借用生命周期，`'ctx` 是 AppCtx 内部引用的生命周期。
+/// 返回是否成功处理（未注册/解析失败返回 false）。
+type SignalHandler = Box<
+    dyn for<'borrow, 'ctx> FnMut(
+            &'borrow mut AppCtx<'ctx>,
+            &'borrow PeerId,
+            Option<&'borrow [u8]>,
+        ) -> Pin<Box<dyn Future<Output = bool> + 'borrow>>,
+>;
 
-/// 语义注册表：tag → handler，按标签分发。L3 应用注册自定义语义值 + 处理器。
+/// 语义注册表：tag → async handler，按标签分发（查表，无 match）。
+/// L2 注册存在语义（hello/bye），L3 应用注册自定义语义（chat.* / file.*）。
 struct SignalRegistry {
     handlers: HashMap<String, SignalHandler>,
 }
@@ -149,13 +158,18 @@ impl SignalRegistry {
 
     fn register<H>(&mut self, tag: &str, handler: H)
     where
-        H: for<'a> FnMut(&mut AppCtx<'a>, &PeerId, Option<&[u8]>) -> bool + 'static,
+        H: for<'borrow, 'ctx> FnMut(
+                &'borrow mut AppCtx<'ctx>,
+                &'borrow PeerId,
+                Option<&'borrow [u8]>,
+            ) -> Pin<Box<dyn Future<Output = bool> + 'borrow>>
+            + 'static,
     {
         self.handlers.insert(tag.to_string(), Box::new(handler));
     }
 
-    /// 按标签分发；未注册的 tag 返回 false
-    fn dispatch(
+    /// 按标签分发并 await handler；未注册的 tag 返回 false
+    async fn dispatch(
         &mut self,
         tag: &str,
         from: &PeerId,
@@ -163,26 +177,69 @@ impl SignalRegistry {
         ctx: &mut AppCtx<'_>,
     ) -> bool {
         match self.handlers.get_mut(tag) {
-            Some(h) => h(ctx, from, payload),
+            Some(h) => {
+                let fut = h(ctx, from, payload);
+                fut.await
+            }
             None => false,
         }
     }
 }
 
 /// 事件处理上下文：收到 P2pEvent::Message 时一次性构造，供语义 handler 读写。
-/// handler 是同步的，需要 `.await` 的动作（发命令）排进 `ops` 队列，
-/// 由事件分支统一消费（同 ring buffer 解耦模式）。
+/// handler 是 async 的，可直接 await（TOFU 读输入 / 发命令）。
 struct AppCtx<'a> {
     identity: &'a mut IdentityService,
     conversations: &'a mut HashMap<PeerId, Conversation>,
     groups: &'a mut HashMap<String, Group>,
     focused: &'a mut Option<PeerId>,
-    ops: VecDeque<AsyncOp>,
+    stdin: &'a mut StdinLines,
+    interactive: bool,
+    cmd_tx: &'a tokio::sync::mpsc::Sender<P2pCommand>,
 }
 
 // ---- chat 业务语义 handler（注册到 SignalRegistry）----
+// ---- 语义 handler（注册到 SignalRegistry）----
+//
+// L2 存在语义：hello/bye 由 L2 映射（TOFU/联系人簿，默认行为），
+// L3 通过钩子分析"谁上线/下线"并反应。chat 业务由 L3 注册 handler。
 
-fn on_chat_text(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
+/// hello（对方上线）：L2 处理存在 + 触发 L3 钩子（解析名字，分析谁上线）
+async fn on_peer_hello_signal(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
+    let Some(bytes) = payload else {
+        return false;
+    };
+    let Ok(name) = serde_cbor::from_slice::<String>(bytes) else {
+        return false;
+    };
+    // 分离字段借用，让钩子闭包能访问 conversations 而不与 handle_peer_hello 冲突
+    let conversations = &mut *ctx.conversations;
+    ctx.identity
+        .handle_peer_hello(ctx.stdin, ctx.interactive, from, &name, |peer, name| {
+            let conv = conversations.entry(*peer).or_insert_with(Conversation::new);
+            conv.name = name.to_string();
+            println!("{}", format!("对方已上线: {name}").green());
+        })
+        .await
+        .is_ok()
+}
+
+/// bye（对方下线）：L2 处理存在 + 触发 L3 钩子（标记会话 + 打印），再发 MarkBye
+async fn on_peer_bye_signal(ctx: &mut AppCtx<'_>, from: &PeerId, _payload: Option<&[u8]>) -> bool {
+    let conversations = &mut *ctx.conversations;
+    let cmd_tx = ctx.cmd_tx;
+    ctx.identity.handle_peer_bye(from, |peer| {
+        if let Some(conv) = conversations.get_mut(peer) {
+            conv.bye = true;
+        }
+        println!("{}", "对方已正常退出".yellow());
+    });
+    // L1 策略：标记 bye → 不再心跳、断开后不重连
+    let _ = cmd_tx.send(P2pCommand::MarkBye(*from)).await;
+    true
+}
+
+async fn on_chat_text(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
     let Some(bytes) = payload else {
         return false;
     };
@@ -206,7 +263,7 @@ fn on_chat_text(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> 
     true
 }
 
-fn on_group_invite(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
+async fn on_group_invite(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
     let Some(bytes) = payload else {
         return false;
     };
@@ -230,12 +287,12 @@ fn on_group_invite(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) 
             },
         );
         let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
-        push_cmd(
-            &mut ctx.ops,
-            P2pCommand::Subscribe {
+        let _ = ctx
+            .cmd_tx
+            .send(P2pCommand::Subscribe {
                 topic: group_topic(&p.group_id),
-            },
-        );
+            })
+            .await;
     }
     let sender = ctx
         .identity
@@ -253,7 +310,7 @@ fn on_group_invite(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) 
     true
 }
 
-fn on_group_leave(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
+async fn on_group_leave(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
     let Some(bytes) = payload else {
         return false;
     };
@@ -286,7 +343,7 @@ fn on_group_leave(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -
             .filter(|m| m.as_str() != &my_id)
             .filter_map(|m| m.parse().ok())
             .collect();
-        fanout_member_list(&mut ctx.ops, &g.id, g.version, &g.members, &remaining);
+        fanout_member_list_async(ctx.cmd_tx, &g.id, g.version, &g.members, &remaining).await;
         println!(
             "{}",
             format!(
@@ -299,8 +356,7 @@ fn on_group_leave(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -
     true
 }
 
-fn on_group_member_list(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
-    let _ = from;
+async fn on_group_member_list(ctx: &mut AppCtx<'_>, _from: &PeerId, payload: Option<&[u8]>) -> bool {
     let Some(bytes) = payload else {
         return false;
     };
@@ -339,7 +395,7 @@ fn on_group_member_list(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u
     true
 }
 
-fn on_group_owner_transfer(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
+async fn on_group_owner_transfer(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
     let Some(bytes) = payload else {
         return false;
     };
@@ -479,6 +535,31 @@ fn fanout_member_list(
             peer: *p,
             frame: frame.clone(),
         }));
+    }
+}
+
+/// 事件 handler（async）用的异步扇出：直接 await cmd_tx
+async fn fanout_member_list_async(
+    cmd_tx: &tokio::sync::mpsc::Sender<P2pCommand>,
+    group_id: &str,
+    version: u64,
+    members: &[String],
+    targets: &[PeerId],
+) {
+    let payload = serde_cbor::to_vec(&GroupMemberListPayload {
+        group_id: group_id.to_string(),
+        version,
+        members: members.to_vec(),
+    })
+    .unwrap_or_default();
+    let frame = custom_frame(TAG_GROUP_MEMBER_LIST, payload);
+    for p in targets {
+        let _ = cmd_tx
+            .send(P2pCommand::Send {
+                peer: *p,
+                frame: frame.clone(),
+            })
+            .await;
     }
 }
 
@@ -815,7 +896,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                     peer: p,
                     frame: Frame {
                         control: None,
-                        text: Some(NodeMsg::Bye),
+                        text: Some("bye".to_string()),
                         binary: None,
                     },
                 },
@@ -839,7 +920,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                     peer: p,
                     frame: Frame {
                         control: None,
-                        text: Some(NodeMsg::Bye),
+                        text: Some("bye".to_string()),
                         binary: None,
                     },
                 },
@@ -1362,14 +1443,30 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
     let mut connected: HashSet<PeerId> = HashSet::new();
     let mut registered: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
 
-    // 语义注册表：chat 应用注册自定义语义 tag + handler。
-    // 基础语义 Hello/Bye 由 L2 在事件分支直接处理，不进注册表。
+    // 语义注册表：L2 存在语义（hello/bye 默认行为）+ L3 chat 业务 handler。
+    // 收到 frame.text 标签即查表分发（无 match）。
     let mut registry = SignalRegistry::new();
-    registry.register(TAG_CHAT_TEXT, on_chat_text);
-    registry.register(TAG_GROUP_INVITE, on_group_invite);
-    registry.register(TAG_GROUP_LEAVE, on_group_leave);
-    registry.register(TAG_GROUP_MEMBER_LIST, on_group_member_list);
-    registry.register(TAG_GROUP_OWNER_TRANSFER, on_group_owner_transfer);
+    registry.register("hello", |ctx, from, payload| {
+        Box::pin(on_peer_hello_signal(ctx, from, payload))
+    });
+    registry.register("bye", |ctx, from, payload| {
+        Box::pin(on_peer_bye_signal(ctx, from, payload))
+    });
+    registry.register(TAG_CHAT_TEXT, |ctx, from, payload| {
+        Box::pin(on_chat_text(ctx, from, payload))
+    });
+    registry.register(TAG_GROUP_INVITE, |ctx, from, payload| {
+        Box::pin(on_group_invite(ctx, from, payload))
+    });
+    registry.register(TAG_GROUP_LEAVE, |ctx, from, payload| {
+        Box::pin(on_group_leave(ctx, from, payload))
+    });
+    registry.register(TAG_GROUP_MEMBER_LIST, |ctx, from, payload| {
+        Box::pin(on_group_member_list(ctx, from, payload))
+    });
+    registry.register(TAG_GROUP_OWNER_TRANSFER, |ctx, from, payload| {
+        Box::pin(on_group_owner_transfer(ctx, from, payload))
+    });
 
     println!(
         "{}",
@@ -1552,15 +1649,17 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     .entry(peer)
                                     .or_insert_with(Conversation::new);
                                 if !conv.greeted {
+                                    // hello 存在信号：text="hello" + binary=cbor(名字)
+                                    let my_name = identity.my_name().to_string();
+                                    let name_bin =
+                                        serde_cbor::to_vec(&my_name).unwrap_or_default();
                                     let _ = cmd_tx
                                         .send(P2pCommand::Send {
                                             peer,
                                             frame: Frame {
                                                 control: None,
-                                                text: Some(NodeMsg::Hello(
-                                                    identity.my_name().to_string(),
-                                                )),
-                                                binary: None,
+                                                text: Some("hello".to_string()),
+                                                binary: Some(name_bin),
                                             },
                                         })
                                         .await;
@@ -1612,76 +1711,32 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                             P2pEvent::Message { from, frame } => {
-                                // 通道路由：control（L1 传输控制）→ text（语义信号）——
-                                // 基础 Hello/Bye 交 L2 存在处理；Custom(tag) 查 SignalRegistry 分发，
-                                // binary 负载由对应应用（chat 业务 handler）解释。
+                                // 通道路由：control（L1 心跳，L3 无感）→ text（协议语义标签）。
+                                // 无 match：构造应用上下文，按 text 标签查 SignalRegistry 分发，
+                                // await 注册的 handler（hello/bye 由 L2 存在语义映射 + L3 钩子分析；
+                                // chat.* 由 chat 业务 handler 处理）。
                                 if let Some(ctrl) = frame.control {
                                     match ctrl {
                                         Control::Heartbeat => {}
                                     }
-                                } else if let Some(msg) = frame.text {
-                                    match msg {
-                                        NodeMsg::Hello(name) => {
-                                            let conv = conversations
-                                                .entry(from)
-                                                .or_insert_with(Conversation::new);
-                                            conv.name = name.clone();
-                                            println!(
-                                                "{}",
-                                                format!("对方已上线: {name}").green()
-                                            );
-                                            identity
-                                                .on_peer_hello(
-                                                    &mut stdin,
-                                                    interactive,
-                                                    &from,
-                                                    &name,
-                                                )
-                                                .await?;
-                                        }
-                                        NodeMsg::Bye => {
-                                            let _ = identity.on_peer_bye(&from);
-                                            println!("{}", "对方已正常退出".yellow());
-                                            if let Some(conv) = conversations.get_mut(&from) {
-                                                conv.bye = true;
-                                            }
-                                            // L1 策略：标记 bye → 不再心跳、断开后不重连
-                                            let _ = cmd_tx
-                                                .send(P2pCommand::MarkBye(from))
-                                                .await;
-                                        }
-                                        NodeMsg::Custom(tag) => {
-                                            // 构造应用上下文，按标签分发到注册的语义 handler。
-                                            // handler 是同步的，需要 await 的动作排入 ops 队列，
-                                            // 分发后统一消费（同 ring buffer 解耦模式）
-                                            let mut actx = AppCtx {
-                                                identity: &mut identity,
-                                                conversations: &mut conversations,
-                                                groups: &mut groups,
-                                                focused: &mut focused,
-                                                ops: VecDeque::new(),
-                                            };
-                                            let handled = registry.dispatch(
-                                                &tag,
-                                                &from,
-                                                frame.binary.as_deref(),
-                                                &mut actx,
-                                            );
-                                            while let Some(op) = actx.ops.pop_front() {
-                                                match op {
-                                                    AsyncOp::Cmd(c) => {
-                                                        let _ = cmd_tx.send(c).await;
-                                                    }
-                                                    AsyncOp::Backup => {}
-                                                }
-                                            }
-                                            if !handled {
-                                                eprintln!(
-                                                    "{}",
-                                                    format!("未处理的自定义语义: {tag}").yellow()
-                                                );
-                                            }
-                                        }
+                                } else if let Some(tag) = frame.text {
+                                    let mut actx = AppCtx {
+                                        identity: &mut identity,
+                                        conversations: &mut conversations,
+                                        groups: &mut groups,
+                                        focused: &mut focused,
+                                        stdin: &mut stdin,
+                                        interactive,
+                                        cmd_tx: &cmd_tx,
+                                    };
+                                    let handled = registry
+                                        .dispatch(&tag, &from, frame.binary.as_deref(), &mut actx)
+                                        .await;
+                                    if !handled {
+                                        eprintln!(
+                                            "{}",
+                                            format!("未处理的自定义语义: {tag}").yellow()
+                                        );
                                     }
                                 }
                             }
