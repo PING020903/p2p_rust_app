@@ -13,29 +13,61 @@ use crate::p2p::{cache_dir, load_discovery_mode, save_discovery_mode, DiscoveryM
 use crate::p2p::identity_service::{IdentityService, StdinLines};
 use crate::p2p::node::{Control, Frame, NodeMsg, P2pCommand, P2pEvent, P2pNode, BYE_HANDSHAKE_TIMEOUT};
 
-/// binary 字段：用户内容负载（应用层自描述，cbor 序列化后放入 binary）
+// ---- 语义注册表（L3 应用层）：text=Custom(tag) 承载协议语义，binary 承载负载 ----
+//
+// 基础语义 Hello/Bye 由 L2（IdentityService）直接在事件分支处理；
+// chat 业务注册为自定义语义 tag，按 tag 分发到注册的 handler。
+// 新应用（文件传输/固件升级）注册自己的 tag + handler，不动核心。
+
+/// chat 应用注册的自定义语义标签
+const TAG_CHAT_TEXT: &str = "chat.text";
+const TAG_GROUP_INVITE: &str = "chat.group_invite";
+const TAG_GROUP_LEAVE: &str = "chat.group_leave";
+const TAG_GROUP_MEMBER_LIST: &str = "chat.group_member_list";
+const TAG_GROUP_OWNER_TRANSFER: &str = "chat.group_owner_transfer";
+
+/// chat 业务负载结构（各自 tag 的 binary 负载，cbor 序列化）
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum AppPayload {
-    Text(String), // 用户聊天文本
-    GroupInvite {
-        group_id: String,
-        group_name: String,
-        version: u64,
-        members: Vec<String>,
-    },
-    GroupLeave { group_id: String },
-    GroupMemberList {
-        group_id: String,
-        version: u64,
-        members: Vec<String>,
-    },
-    /// 群主退群时一步顺位转移：携带新群主 + 移除群主后的名单（版本门控整体替换）
-    GroupOwnerTransfer {
-        group_id: String,
-        new_creator: String,
-        version: u64,
-        members: Vec<String>,
-    },
+struct ChatTextPayload {
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GroupInvitePayload {
+    group_id: String,
+    group_name: String,
+    version: u64,
+    members: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GroupLeavePayload {
+    group_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GroupMemberListPayload {
+    group_id: String,
+    version: u64,
+    members: Vec<String>,
+}
+
+/// 群主退群时一步顺位转移：携带新群主 + 移除群主后的名单（版本门控整体替换）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GroupOwnerTransferPayload {
+    group_id: String,
+    new_creator: String,
+    version: u64,
+    members: Vec<String>,
+}
+
+/// 构造一个"自定义语义"帧：text=Custom(tag) + binary=负载
+fn custom_frame(tag: &str, payload: Vec<u8>) -> Frame {
+    Frame {
+        control: None,
+        text: Some(NodeMsg::Custom(tag.to_string())),
+        binary: Some(payload),
+    }
 }
 
 /// 命令 handler 产出的异步动作：同步逻辑跑在指令树 handler 里，真正需要 `.await`
@@ -96,6 +128,278 @@ fn trust_badge(verified: bool) -> colored::ColoredString {
 /// 向命令队列排入"发命令"动作（字段级借用，可在 handler 持有其它字段借用时调用）
 fn push_cmd(ops: &mut VecDeque<AsyncOp>, cmd: P2pCommand) {
     ops.push_back(AsyncOp::Cmd(cmd));
+}
+
+/// 语义信号处理器：处理一个自定义语义（text=Custom(tag)）的 binary 负载。
+/// 返回是否成功处理（当前仅作诊断；未来文件等场景可决定对端响应）。
+type SignalHandler =
+    Box<dyn for<'a> FnMut(&mut AppCtx<'a>, &PeerId, Option<&[u8]>) -> bool>;
+
+/// 语义注册表：tag → handler，按标签分发。L3 应用注册自定义语义值 + 处理器。
+struct SignalRegistry {
+    handlers: HashMap<String, SignalHandler>,
+}
+
+impl SignalRegistry {
+    fn new() -> Self {
+        SignalRegistry {
+            handlers: HashMap::new(),
+        }
+    }
+
+    fn register<H>(&mut self, tag: &str, handler: H)
+    where
+        H: for<'a> FnMut(&mut AppCtx<'a>, &PeerId, Option<&[u8]>) -> bool + 'static,
+    {
+        self.handlers.insert(tag.to_string(), Box::new(handler));
+    }
+
+    /// 按标签分发；未注册的 tag 返回 false
+    fn dispatch(
+        &mut self,
+        tag: &str,
+        from: &PeerId,
+        payload: Option<&[u8]>,
+        ctx: &mut AppCtx<'_>,
+    ) -> bool {
+        match self.handlers.get_mut(tag) {
+            Some(h) => h(ctx, from, payload),
+            None => false,
+        }
+    }
+}
+
+/// 事件处理上下文：收到 P2pEvent::Message 时一次性构造，供语义 handler 读写。
+/// handler 是同步的，需要 `.await` 的动作（发命令）排进 `ops` 队列，
+/// 由事件分支统一消费（同 ring buffer 解耦模式）。
+struct AppCtx<'a> {
+    identity: &'a mut IdentityService,
+    conversations: &'a mut HashMap<PeerId, Conversation>,
+    groups: &'a mut HashMap<String, Group>,
+    focused: &'a mut Option<PeerId>,
+    ops: VecDeque<AsyncOp>,
+}
+
+// ---- chat 业务语义 handler（注册到 SignalRegistry）----
+
+fn on_chat_text(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
+    let Some(bytes) = payload else {
+        return false;
+    };
+    let Ok(p) = serde_cbor::from_slice::<ChatTextPayload>(bytes) else {
+        return false;
+    };
+    let conv = ctx
+        .conversations
+        .entry(*from)
+        .or_insert_with(Conversation::new);
+    if *ctx.focused == Some(*from) {
+        println!("{}", format!("[对方] {}", p.text).bright_cyan());
+    } else {
+        let who = if conv.name.is_empty() {
+            from.to_string()
+        } else {
+            conv.name.clone()
+        };
+        println!("{}", format!("[{who}] {}", p.text).bright_cyan());
+    }
+    true
+}
+
+fn on_group_invite(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
+    let Some(bytes) = payload else {
+        return false;
+    };
+    let Ok(p) = serde_cbor::from_slice::<GroupInvitePayload>(bytes) else {
+        return false;
+    };
+    // 群主（邀请者 from）发来的邀请：携带当前版本 + 全量名单，入群即一致。
+    // 名单先归一化去重（幽灵/重复防御）
+    let mut members = p.members.clone();
+    dedup_members(&mut members);
+    if !ctx.groups.contains_key(&p.group_id) || ctx.groups[&p.group_id].version < p.version {
+        ctx.groups.insert(
+            p.group_id.clone(),
+            Group {
+                id: p.group_id.clone(),
+                name: p.group_name.clone(),
+                members: members.clone(),
+                version: p.version,
+                creator: from.to_string(),
+                resident: false, // 入群默认非常驻
+            },
+        );
+        let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
+        push_cmd(
+            &mut ctx.ops,
+            P2pCommand::Subscribe {
+                topic: group_topic(&p.group_id),
+            },
+        );
+    }
+    let sender = ctx
+        .identity
+        .contact_name(from)
+        .unwrap_or_else(|| from.to_string());
+    println!(
+        "{}",
+        format!(
+            "被邀请加入群聊: {}（邀请者 {sender}，成员 {} 人）",
+            p.group_name,
+            p.members.len()
+        )
+        .green()
+    );
+    true
+}
+
+fn on_group_leave(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
+    let Some(bytes) = payload else {
+        return false;
+    };
+    let Ok(p) = serde_cbor::from_slice::<GroupLeavePayload>(bytes) else {
+        return false;
+    };
+    // 成员主动退群：校验发送者确为成员，移除并推进版本，向剩余成员扇出
+    let is_member = ctx
+        .groups
+        .get(&p.group_id)
+        .map(|g| g.members.iter().any(|m| m == &from.to_string()))
+        .unwrap_or(false);
+    if !is_member {
+        return false;
+    }
+    if let Some(g) = ctx.groups.get_mut(&p.group_id) {
+        g.version += 1;
+        g.members.retain(|m| m != &from.to_string());
+        dedup_members(&mut g.members);
+        let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
+        let name = ctx
+            .identity
+            .contact_name(from)
+            .unwrap_or_else(|| from.to_string());
+        let g = &ctx.groups[&p.group_id];
+        let my_id = ctx.identity.my_id().to_string();
+        let remaining: Vec<PeerId> = g
+            .members
+            .iter()
+            .filter(|m| m.as_str() != &my_id)
+            .filter_map(|m| m.parse().ok())
+            .collect();
+        fanout_member_list(&mut ctx.ops, &g.id, g.version, &g.members, &remaining);
+        println!(
+            "{}",
+            format!(
+                "成员 {name} 已退出群 {}（名单版本 {}）",
+                g.name, g.version
+            )
+            .yellow()
+        );
+    }
+    true
+}
+
+fn on_group_member_list(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
+    let _ = from;
+    let Some(bytes) = payload else {
+        return false;
+    };
+    let Ok(p) = serde_cbor::from_slice::<GroupMemberListPayload>(bytes) else {
+        return false;
+    };
+    // 群主 1v1 扇出名单：版本更高才整体替换（防乱序/重复）。名单先归一化去重
+    let mut members = p.members.clone();
+    dedup_members(&mut members);
+    let newer = ctx
+        .groups
+        .get(&p.group_id)
+        .map(|g| p.version > g.version)
+        .unwrap_or(false);
+    if newer {
+        let gname = ctx
+            .groups
+            .get(&p.group_id)
+            .map(|g| g.name.clone())
+            .unwrap_or_default();
+        if let Some(g) = ctx.groups.get_mut(&p.group_id) {
+            g.version = p.version;
+            g.members = members.clone();
+        }
+        let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
+        println!(
+            "{}",
+            format!(
+                "群 {gname} 成员名单已更新（版本 {}，{} 人）",
+                p.version,
+                p.members.len()
+            )
+            .dimmed()
+        );
+    }
+    true
+}
+
+fn on_group_owner_transfer(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
+    let Some(bytes) = payload else {
+        return false;
+    };
+    let Ok(p) = serde_cbor::from_slice::<GroupOwnerTransferPayload>(bytes) else {
+        return false;
+    };
+    // 群主退群顺位转移：版本更高才整体替换。门控放宽为"from 是群成员"——
+    // 漏收中间转移的节点收到任一后续转移即可自愈，creator 不再永久错位。
+    let mut members = p.members.clone();
+    dedup_members(&mut members);
+    let from_is_member = members.iter().any(|m| m == &from.to_string())
+        || ctx
+            .groups
+            .get(&p.group_id)
+            .map(|g| g.members.iter().any(|m| m == &from.to_string()))
+            .unwrap_or(false);
+    let new_in_list = members.iter().any(|m| m == &p.new_creator);
+    let newer = ctx
+        .groups
+        .get(&p.group_id)
+        .map(|g| p.version > g.version)
+        .unwrap_or(false);
+    if from_is_member && new_in_list && newer {
+        let was_creator_of = ctx
+            .groups
+            .get(&p.group_id)
+            .map(|g| g.name.clone())
+            .unwrap_or_default();
+        let new_is_me = p.new_creator == ctx.identity.my_id().to_string();
+        if let Some(g) = ctx.groups.get_mut(&p.group_id) {
+            g.version = p.version;
+            g.creator = p.new_creator.clone();
+            g.members = members.clone();
+        }
+        let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
+        if new_is_me {
+            println!(
+                "{}",
+                format!(
+                    "群 {was_creator_of} 的群主已转移给你，你已成为群主（可 /group add 邀请）"
+                )
+                .green()
+            );
+        } else {
+            let nc_name = ctx
+                .identity
+                .contact_name(&p.new_creator.parse().unwrap_or(*from))
+                .unwrap_or_else(|| p.new_creator.clone());
+            println!(
+                "{}",
+                format!(
+                    "群 {was_creator_of} 群主已顺位转移给 {nc_name}（名单版本 {}，{} 人）",
+                    p.version,
+                    p.members.len()
+                )
+                .dimmed()
+            );
+        }
+    }
+    true
 }
 
 /// 一个 1v1 会话：与某 peer 的聊天上下文（连接可多路共存）
@@ -163,51 +467,18 @@ fn fanout_member_list(
     members: &[String],
     targets: &[PeerId],
 ) {
-    let payload = serde_cbor::to_vec(&AppPayload::GroupMemberList {
+    let payload = serde_cbor::to_vec(&GroupMemberListPayload {
         group_id: group_id.to_string(),
         version,
         members: members.to_vec(),
     })
     .unwrap_or_default();
-    let frame = Frame {
-        control: None,
-        text: None,
-        binary: Some(payload),
-    };
+    let frame = custom_frame(TAG_GROUP_MEMBER_LIST, payload);
     for p in targets {
         ops.push_back(AsyncOp::Cmd(P2pCommand::Send {
             peer: *p,
             frame: frame.clone(),
         }));
-    }
-}
-
-/// 事件分支（主循环内、已有命令发送器）用的异步扇出
-async fn fanout_member_list_async(
-    cmd_tx: &tokio::sync::mpsc::Sender<P2pCommand>,
-    group_id: &str,
-    version: u64,
-    members: &[String],
-    targets: &[PeerId],
-) {
-    let payload = serde_cbor::to_vec(&AppPayload::GroupMemberList {
-        group_id: group_id.to_string(),
-        version,
-        members: members.to_vec(),
-    })
-    .unwrap_or_default();
-    let frame = Frame {
-        control: None,
-        text: None,
-        binary: Some(payload),
-    };
-    for p in targets {
-        let _ = cmd_tx
-            .send(P2pCommand::Send {
-                peer: *p,
-                frame: frame.clone(),
-            })
-            .await;
     }
 }
 
@@ -745,7 +1016,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                             // 已在名单中：仍重发邀请——对方 cache 可能被意外清理（群记录/topic 丢失），
                             // 重发让其重新入群+订阅；cache 完好者收等版本邀请无副作用（版本相等不重插）
                             let g = &ctx.groups[&gid];
-                            let invite = serde_cbor::to_vec(&AppPayload::GroupInvite {
+                            let invite = serde_cbor::to_vec(&GroupInvitePayload {
                                 group_id: g.id.clone(),
                                 group_name: g.name.clone(),
                                 version: g.version,
@@ -756,11 +1027,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                                 &mut ctx.ops,
                                 P2pCommand::Send {
                                     peer: p,
-                                    frame: Frame {
-                                        control: None,
-                                        text: None,
-                                        binary: Some(invite),
-                                    },
+                                    frame: custom_frame(TAG_GROUP_INVITE, invite),
                                 },
                             );
                             println!(
@@ -774,7 +1041,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                             let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
                             // 邀请新成员（携带当前版本 + 全量名单，入群即一致）
                             let g = &ctx.groups[&gid];
-                            let invite = serde_cbor::to_vec(&AppPayload::GroupInvite {
+                            let invite = serde_cbor::to_vec(&GroupInvitePayload {
                                 group_id: g.id.clone(),
                                 group_name: g.name.clone(),
                                 version: g.version,
@@ -785,11 +1052,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                                 &mut ctx.ops,
                                 P2pCommand::Send {
                                     peer: p,
-                                    frame: Frame {
-                                        control: None,
-                                        text: None,
-                                        binary: Some(invite),
-                                    },
+                                    frame: custom_frame(TAG_GROUP_INVITE, invite),
                                 },
                             );
                             // 向其余成员（不含新人、不含自己）1v1 扇出名单更新
@@ -908,7 +1171,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                         let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
                         // 1v1 扇出 GroupOwnerTransfer 给剩余成员（新名单 + 新群主）
                         let g = &ctx.groups[&gid];
-                        let payload = serde_cbor::to_vec(&AppPayload::GroupOwnerTransfer {
+                        let payload = serde_cbor::to_vec(&GroupOwnerTransferPayload {
                             group_id: g.id.clone(),
                             new_creator: new_creator.clone(),
                             version: g.version,
@@ -925,11 +1188,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                                 &mut ctx.ops,
                                 P2pCommand::Send {
                                     peer: t,
-                                    frame: Frame {
-                                        control: None,
-                                        text: None,
-                                        binary: Some(payload.clone()),
-                                    },
+                                    frame: custom_frame(TAG_GROUP_OWNER_TRANSFER, payload.clone()),
                                 },
                             );
                         }
@@ -989,7 +1248,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                     );
                 } else {
                     // 普通成员：通知群主划去自己
-                    let leave = serde_cbor::to_vec(&AppPayload::GroupLeave {
+                    let leave = serde_cbor::to_vec(&GroupLeavePayload {
                         group_id: gid.clone(),
                     })
                     .unwrap_or_default();
@@ -997,11 +1256,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                         &mut ctx.ops,
                         P2pCommand::Send {
                             peer: creator,
-                            frame: Frame {
-                                control: None,
-                                text: None,
-                                binary: Some(leave),
-                            },
+                            frame: custom_frame(TAG_GROUP_LEAVE, leave),
                         },
                     );
                     // 本地移除群记录并退订 topic
@@ -1106,6 +1361,15 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
     let mut focused: Option<PeerId> = None;
     let mut connected: HashSet<PeerId> = HashSet::new();
     let mut registered: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+
+    // 语义注册表：chat 应用注册自定义语义 tag + handler。
+    // 基础语义 Hello/Bye 由 L2 在事件分支直接处理，不进注册表。
+    let mut registry = SignalRegistry::new();
+    registry.register(TAG_CHAT_TEXT, on_chat_text);
+    registry.register(TAG_GROUP_INVITE, on_group_invite);
+    registry.register(TAG_GROUP_LEAVE, on_group_leave);
+    registry.register(TAG_GROUP_MEMBER_LIST, on_group_member_list);
+    registry.register(TAG_GROUP_OWNER_TRANSFER, on_group_owner_transfer);
 
     println!(
         "{}",
@@ -1238,18 +1502,14 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                         );
                                     }
                                 }
-                                let payload = serde_cbor::to_vec(&AppPayload::Text(
-                                    line.to_string(),
-                                ))
+                                let payload = serde_cbor::to_vec(&ChatTextPayload {
+                                    text: line.to_string(),
+                                })
                                 .unwrap_or_default();
                                 let _ = cmd_tx
                                     .send(P2pCommand::Send {
                                         peer: p,
-                                        frame: Frame {
-                                            control: None,
-                                            text: None,
-                                            binary: Some(payload),
-                                        },
+                                        frame: custom_frame(TAG_CHAT_TEXT, payload),
                                     })
                                     .await;
                                 println!("{}", format!("[我 -> {who}] {line}").green());
@@ -1352,10 +1612,9 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                             P2pEvent::Message { from, frame } => {
-                                let conv = conversations
-                                    .entry(from)
-                                    .or_insert_with(Conversation::new);
-                                // 通道路由：control（传输控制）→ text（节点信号）→ binary（用户内容）
+                                // 通道路由：control（L1 传输控制）→ text（语义信号）——
+                                // 基础 Hello/Bye 交 L2 存在处理；Custom(tag) 查 SignalRegistry 分发，
+                                // binary 负载由对应应用（chat 业务 handler）解释。
                                 if let Some(ctrl) = frame.control {
                                     match ctrl {
                                         Control::Heartbeat => {}
@@ -1363,6 +1622,9 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                 } else if let Some(msg) = frame.text {
                                     match msg {
                                         NodeMsg::Hello(name) => {
+                                            let conv = conversations
+                                                .entry(from)
+                                                .or_insert_with(Conversation::new);
                                             conv.name = name.clone();
                                             println!(
                                                 "{}",
@@ -1380,229 +1642,44 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                         NodeMsg::Bye => {
                                             let _ = identity.on_peer_bye(&from);
                                             println!("{}", "对方已正常退出".yellow());
-                                            conv.bye = true;
+                                            if let Some(conv) = conversations.get_mut(&from) {
+                                                conv.bye = true;
+                                            }
                                             // L1 策略：标记 bye → 不再心跳、断开后不重连
                                             let _ = cmd_tx
                                                 .send(P2pCommand::MarkBye(from))
                                                 .await;
                                         }
-                                    }
-                                } else if let Some(bin) = frame.binary {
-                                    let Ok(payload) =
-                                        serde_cbor::from_slice::<AppPayload>(&bin)
-                                    else {
-                                        continue;
-                                    };
-                                    match payload {
-                                        AppPayload::Text(text) => {
-                                            if focused == Some(from) {
-                                                println!(
-                                                    "{}",
-                                                    format!("[对方] {text}").bright_cyan()
-                                                );
-                                            } else {
-                                                let who = if conv.name.is_empty() {
-                                                    from.to_string()
-                                                } else {
-                                                    conv.name.clone()
-                                                };
-                                                println!(
-                                                    "{}",
-                                                    format!("[{who}] {text}").bright_cyan()
-                                                );
-                                            }
-                                        }
-                                        AppPayload::GroupInvite {
-                                            group_id,
-                                            group_name,
-                                            version,
-                                            members,
-                                        } => {
-                                            // 群主（邀请者 from）发来的邀请：携带当前版本 + 全量名单，入群即一致。
-                                            // 名单先归一化去重（幽灵/重复防御）
-                                            let mut members = members;
-                                            dedup_members(&mut members);
-                                            if !groups.contains_key(&group_id)
-                                                || groups[&group_id].version < version
-                                            {
-                                                groups.insert(
-                                                    group_id.clone(),
-                                                    Group {
-                                                        id: group_id.clone(),
-                                                        name: group_name.clone(),
-                                                        members: members.clone(),
-                                                        version,
-                                                        creator: from.to_string(),
-                                                        resident: false, // 入群默认非常驻
-                                                    },
-                                                );
-                                                let _ = save_groups(identity.my_id(), &groups);
-                                                let _ = cmd_tx
-                                                    .send(P2pCommand::Subscribe {
-                                                        topic: group_topic(&group_id),
-                                                    })
-                                                    .await;
-                                            }
-                                            let sender = identity
-                                                .contact_name(&from)
-                                                .unwrap_or_else(|| from.to_string());
-                                            println!(
-                                                "{}",
-                                                format!(
-                                                    "被邀请加入群聊: {group_name}（邀请者 {sender}，成员 {} 人）",
-                                                    members.len()
-                                                )
-                                                .green()
+                                        NodeMsg::Custom(tag) => {
+                                            // 构造应用上下文，按标签分发到注册的语义 handler。
+                                            // handler 是同步的，需要 await 的动作排入 ops 队列，
+                                            // 分发后统一消费（同 ring buffer 解耦模式）
+                                            let mut actx = AppCtx {
+                                                identity: &mut identity,
+                                                conversations: &mut conversations,
+                                                groups: &mut groups,
+                                                focused: &mut focused,
+                                                ops: VecDeque::new(),
+                                            };
+                                            let handled = registry.dispatch(
+                                                &tag,
+                                                &from,
+                                                frame.binary.as_deref(),
+                                                &mut actx,
                                             );
-                                        }
-                                        AppPayload::GroupLeave { group_id } => {
-                                            // 成员主动退群：校验发送者确为成员，移除并推进版本，向剩余成员扇出
-                                            let is_member = groups
-                                                .get(&group_id)
-                                                .map(|g| {
-                                                    g.members
-                                                        .iter()
-                                                        .any(|m| m == &from.to_string())
-                                                })
-                                                .unwrap_or(false);
-                                            if !is_member {
-                                                continue;
+                                            while let Some(op) = actx.ops.pop_front() {
+                                                match op {
+                                                    AsyncOp::Cmd(c) => {
+                                                        let _ = cmd_tx.send(c).await;
+                                                    }
+                                                    AsyncOp::Backup => {}
+                                                }
                                             }
-                                            if let Some(g) = groups.get_mut(&group_id) {
-                                                g.version += 1;
-                                                g.members.retain(|m| m != &from.to_string());
-                                                dedup_members(&mut g.members);
-                                                let _ = save_groups(identity.my_id(), &groups);
-                                                let name = identity
-                                                    .contact_name(&from)
-                                                    .unwrap_or_else(|| from.to_string());
-                                                let g = &groups[&group_id];
-                                                let my_id = identity.my_id().to_string();
-                                                let remaining: Vec<PeerId> = g
-                                                    .members
-                                                    .iter()
-                                                    .filter(|m| m.as_str() != &my_id)
-                                                    .filter_map(|m| m.parse().ok())
-                                                    .collect();
-                                                fanout_member_list_async(
-                                                    &cmd_tx,
-                                                    &g.id,
-                                                    g.version,
-                                                    &g.members,
-                                                    &remaining,
-                                                )
-                                                .await;
-                                                println!(
+                                            if !handled {
+                                                eprintln!(
                                                     "{}",
-                                                    format!(
-                                                        "成员 {name} 已退出群 {}（名单版本 {}）",
-                                                        g.name, g.version
-                                                    )
-                                                    .yellow()
+                                                    format!("未处理的自定义语义: {tag}").yellow()
                                                 );
-                                            }
-                                        }
-                                        AppPayload::GroupMemberList {
-                                            group_id,
-                                            version,
-                                            members,
-                                        } => {
-                                            // 群主 1v1 扇出名单：版本更高才整体替换（防乱序/重复）。
-                                            // 名单先归一化去重（幽灵/重复防御）
-                                            let mut members = members;
-                                            dedup_members(&mut members);
-                                            let newer = groups
-                                                .get(&group_id)
-                                                .map(|g| version > g.version)
-                                                .unwrap_or(false);
-                                            if newer {
-                                                let gname = groups
-                                                    .get(&group_id)
-                                                    .map(|g| g.name.clone())
-                                                    .unwrap_or_default();
-                                                if let Some(g) = groups.get_mut(&group_id) {
-                                                    g.version = version;
-                                                    g.members = members.clone();
-                                                }
-                                                let _ = save_groups(identity.my_id(), &groups);
-                                                println!(
-                                                    "{}",
-                                                    format!(
-                                                        "群 {gname} 成员名单已更新（版本 {version}，{} 人）",
-                                                        members.len()
-                                                    )
-                                                    .dimmed()
-                                                );
-                                            }
-                                        }
-                                        AppPayload::GroupOwnerTransfer {
-                                            group_id,
-                                            new_creator,
-                                            version,
-                                            members,
-                                        } => {
-                                            // 群主退群顺位转移：版本更高才整体替换。
-                                            // 门控放宽为"from 是群成员"（不再要求 == 当前 creator）——
-                                            // 漏收中间转移的节点收到任一后续转移即可自愈，creator 不再永久错位。
-                                            // 名单先归一化去重（幽灵/重复防御）
-                                            let mut members = members;
-                                            dedup_members(&mut members);
-                                            let from_is_member = members
-                                                .iter()
-                                                .any(|m| m == &from.to_string())
-                                                || groups
-                                                    .get(&group_id)
-                                                    .map(|g| {
-                                                        g.members
-                                                            .iter()
-                                                            .any(|m| m == &from.to_string())
-                                                    })
-                                                    .unwrap_or(false);
-                                            let new_in_list =
-                                                members.iter().any(|m| m == &new_creator);
-                                            let newer = groups
-                                                .get(&group_id)
-                                                .map(|g| version > g.version)
-                                                .unwrap_or(false);
-                                            if from_is_member && new_in_list && newer {
-                                                let was_creator_of = groups
-                                                    .get(&group_id)
-                                                    .map(|g| g.name.clone())
-                                                    .unwrap_or_default();
-                                                let new_is_me =
-                                                    new_creator == identity.my_id().to_string();
-                                                if let Some(g) = groups.get_mut(&group_id) {
-                                                    g.version = version;
-                                                    g.creator = new_creator.clone();
-                                                    g.members = members.clone();
-                                                }
-                                                let _ = save_groups(identity.my_id(), &groups);
-                                                if new_is_me {
-                                                    println!(
-                                                        "{}",
-                                                        format!(
-                                                            "群 {was_creator_of} 的群主已转移给你，你已成为群主（可 /group add 邀请）"
-                                                        )
-                                                        .green()
-                                                    );
-                                                } else {
-                                                    let nc_name = identity
-                                                        .contact_name(
-                                                            &new_creator.parse().unwrap_or(
-                                                                from,
-                                                            ),
-                                                        )
-                                                        .unwrap_or_else(|| new_creator.clone());
-                                                    println!(
-                                                        "{}",
-                                                        format!(
-                                                            "群 {was_creator_of} 群主已顺位转移给 {nc_name}（名单版本 {}，{} 人）",
-                                                            version,
-                                                            members.len()
-                                                        )
-                                                        .dimmed()
-                                                    );
-                                                }
                                             }
                                         }
                                     }

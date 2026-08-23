@@ -5,6 +5,26 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.17.0] - 2026-08-22
+
+### 变更（语义注册表：L1 通用语义通道落地）
+
+- **`NodeMsg` 增加 `Custom(String)` 变体**：text 通道成为"可注册协议语义"通道——
+  基础语义 `Hello`/`Bye` 由 L2 存在层处理；L3 应用注册自定义语义标签（tag）+ handler，
+  按 tag 分发，`binary` 承载该标签的负载
+- **新增 `SignalRegistry`（L3 应用层）**：`register(tag, handler)` + `dispatch(tag, from, payload)`；
+  事件分支收到 `text=Custom(tag)` 时查表分发，handler 同步逻辑 + `ops` 队列排异步动作（同 ring buffer 解耦）
+- **chat 业务迁入注册表**：`AppPayload` 枚举拆为 5 个注册 tag + 各自负载结构——
+  `chat.text` / `chat.group_invite` / `chat.group_leave` / `chat.group_member_list` /
+  `chat.group_owner_transfer`；发送侧用 `text=Custom(tag)`，接收侧注册 handler
+- **协议版本**：`/chat/7.0.0` → `/chat/8.0.0`（NodeMsg 变体变化，同机升级）
+- 文件传输/固件升级等新应用 = 注册自己的 tag + handler，不动核心（为嵌入式固件升级打基础）
+
+### 测试
+
+- 全量 36 单测 + 12 e2e 场景全绿——chat 迁移到注册表后行为不变
+  （12 场景覆盖 5 个注册 handler：文本/邀请/退群/名单/转移）
+
 ## [0.16.0] - 2026-08-22
 
 ### 变更（1v1 信任管理 + 群主可见 + 转移自愈）

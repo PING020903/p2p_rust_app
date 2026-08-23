@@ -31,11 +31,14 @@ pub enum Control {
     Heartbeat,
 }
 
-/// text 字段：节点间短消息（**非用户内容**），可扩展自定义操作信号
+/// text 字段：节点间短消息（**非用户内容**），可扩展自定义操作信号。
+/// `Hello`/`Bye` 是基础协议语义（L2 存在层）；`Custom(tag)` 供 L3 应用
+/// 注册自定义语义值，按 tag 分发到注册的 handler（见 chat.rs SignalRegistry）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeMsg {
-    Hello(String), // 上线 + 对方名字
-    Bye,           // 下线
+    Hello(String), // 基础：上线 + 对方名字
+    Bye,           // 基础：下线
+    Custom(String), // 自定义语义标签（应用注册 tag + handler，binary 承载负载）
 }
 
 /// 1v1 通道通用帧：control（传输控制）/ text（节点信号）/ binary（用户内容）按需填充。
@@ -121,7 +124,7 @@ pub fn build_swarm(
                 gossipsub,
                 ping: ping::Behaviour::default(),
                 chat: request_response::cbor::Behaviour::new(
-                    [(StreamProtocol::new("/chat/7.0.0"), ProtocolSupport::Full)],
+                    [(StreamProtocol::new("/chat/8.0.0"), ProtocolSupport::Full)],
                     request_response::Config::default(),
                 ),
             })
