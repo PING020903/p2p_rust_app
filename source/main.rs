@@ -7,6 +7,7 @@ use color_print::{Color};
 mod calculator;
 mod chat;
 mod cmd_tree;
+mod file_transfer;
 mod p2p;
 mod student;
 

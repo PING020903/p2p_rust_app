@@ -114,7 +114,11 @@ pub fn build_swarm(
                 mdns: Toggle::from(mdns),
                 gossipsub,
                 ping: ping::Behaviour::default(),
-                chat: request_response::cbor::Behaviour::new(
+                chat: request_response::Behaviour::with_codec(
+                    request_response::cbor::codec::Codec::<ChatRequest, ChatResponse>::default()
+                        // 文件分块 1MiB + cbor 头：默认请求上限 1MiB 会拒收大块，调大
+                        .set_request_size_maximum(4 * 1024 * 1024)
+                        .set_response_size_maximum(64 * 1024),
                     [(StreamProtocol::new("/frame/1.0.0"), ProtocolSupport::Full)],
                     request_response::Config::default(),
                 ),

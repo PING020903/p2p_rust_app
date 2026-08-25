@@ -102,6 +102,7 @@ impl Node {
             .env("P2P_ID_CACHE_DIR", cache_dir)
             .env("P2P_ID_PROBE_SECS", "2")
             .env("P2P_DISCOVERY", discovery)
+            .env("P2P_DOWNLOAD_DIR", format!("{cache_dir}/downloads"))
             .spawn()
             .expect("启动节点失败");
         let (tx, rx) = mpsc::channel();
@@ -863,9 +864,73 @@ fn trust_management_and_contact_name_resolution_scenario() {
     b.kill();
 }
 
+/// 场景13：文件传输——A 发送文件给已信任联系人 B，B 落盘并校验内容一致
+fn file_transfer_scenario() {
+    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache_a = scenario_cache_dir("s13_a");
+    let cache_b = scenario_cache_dir("s13_b");
+    let (cred_a, cred_b) = load_creds();
+    let b_name = cred_b.name.clone();
+    println!("=== 场景13: 文件传输 ===");
+
+    // 生成 3MB 测试文件（伪随机字节）
+    let src_name = "s13_file.bin";
+    let src = std::env::temp_dir().join(src_name);
+    let _ = std::fs::remove_file(&src);
+    {
+        let mut data = Vec::with_capacity(3 * 1024 * 1024);
+        let mut seed: u64 = 0x1234_5678_9abc_def0;
+        for _ in 0..(3 * 1024 * 1024) {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            data.push(((seed >> 33) & 0xff) as u8);
+        }
+        std::fs::write(&src, &data).expect("写测试文件失败");
+    }
+    // 接收方 B 的下载目录由 P2P_DOWNLOAD_DIR 指到 `{cache_b}/downloads`
+    let final_path = format!("{cache_b}/downloads/{src_name}");
+    let _ = std::fs::remove_file(&final_path);
+
+    let (mut a, a_listen) = spawn_into_chat(bin, &cache_a, &cred_a, MNEMONIC_USER1);
+    let a_addr = listen_addr(&a_listen);
+    let a_id = parse_peer_id(&a_listen);
+    let (mut b, b_listen) = spawn_into_chat(bin, &cache_b, &cred_b, MNEMONIC_USER2);
+    let b_id = parse_peer_id(&b_listen);
+    b.send(&format!("/dial {a_addr}"));
+    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+    a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
+    a.wait_for(&format!("对方已上线: {b_name}"), WAIT);
+
+    println!("=== A 发送文件给 B（B 管道模式自动接受）===");
+    a.send(&format!("/send {b_name} {}", src.display()));
+    a.wait_for(&format!("开始发送 {src_name}"), WAIT);
+    b.wait_for(&format!("开始接收 {src_name}"), WAIT);
+
+    println!("=== 等传输完成，校验内容一致 ===");
+    b.wait_for("文件接收完成", WAIT);
+    a.wait_for("文件发送完成", WAIT);
+
+    let received = std::fs::read(&final_path).expect("读取接收文件失败");
+    let sent = std::fs::read(&src).expect("读取源文件失败");
+    assert_eq!(received.len(), sent.len(), "文件长度不一致");
+    assert_eq!(received, sent, "文件内容不一致");
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&final_path);
+    a.kill();
+    b.kill();
+}
+
+/// 独立文件传输测试（不加入 suite，单独运行隔离验证）
+#[test]
+fn standalone_file_transfer() {
+    file_transfer_scenario();
+}
+
 #[test]
 fn p2p_chat_e2e_suite() {
-    // 十二场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
+    // 十三场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
     basic_chat_scenario();
     chat_by_name_scenario();
     graceful_offline_online_scenario();
@@ -878,4 +943,5 @@ fn p2p_chat_e2e_suite() {
     app_blocked_heartbeat_still_alive_scenario();
     owner_offline_leave_ban_and_transfer_scenario();
     trust_management_and_contact_name_resolution_scenario();
+    file_transfer_scenario();
 }

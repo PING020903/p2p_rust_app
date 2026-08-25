@@ -11,7 +11,7 @@ use std::pin::Pin;
 use tokio::io::AsyncBufReadExt;
 
 use crate::cmd_tree::{CmdError, CmdTree, ROOT};
-use crate::p2p::{cache_dir, load_discovery_mode, save_discovery_mode, DiscoveryMode};
+use crate::p2p::{cache_dir, load_discovery_mode, save_discovery_mode, save_download_dir, DiscoveryMode};
 use crate::p2p::identity_service::{IdentityService, StdinLines};
 use crate::p2p::node::{Control, Frame, P2pCommand, P2pEvent, P2pNode, BYE_HANDSHAKE_TIMEOUT};
 
@@ -63,8 +63,8 @@ struct GroupOwnerTransferPayload {
     members: Vec<String>,
 }
 
-/// 构造一个"协议语义"帧：text=标签字符串 + binary=负载
-fn custom_frame(tag: &str, payload: Vec<u8>) -> Frame {
+/// 构造一个"协议语义"帧：text=标签字符串 + binary=负载（供本 crate 各 L3 应用复用）
+pub fn custom_frame(tag: &str, payload: Vec<u8>) -> Frame {
     Frame {
         control: None,
         text: Some(tag.to_string()),
@@ -75,7 +75,7 @@ fn custom_frame(tag: &str, payload: Vec<u8>) -> Frame {
 /// 命令 handler 产出的异步动作：同步逻辑跑在指令树 handler 里，真正需要 `.await`
 /// 的 I/O（发命令给传输任务 / 读密码）排进 `ChatCtx.ops`，由主循环统一消费。
 /// 这本质是"同步生产者 → 异步消费者"的 ring buffer 解耦。
-enum AsyncOp {
+pub(crate) enum AsyncOp {
     Cmd(P2pCommand),
     Backup,
 }
@@ -96,6 +96,7 @@ struct ChatCtx<'a> {
     /// 待消费的异步动作队列（VecDeque 即可增长的环状缓冲）
     ops: VecDeque<AsyncOp>,
     quit: bool,
+    file: &'a mut crate::file_transfer::FileTransferState,
 }
 
 impl<'a> ChatCtx<'a> {
@@ -188,14 +189,15 @@ impl SignalRegistry {
 
 /// 事件处理上下文：收到 P2pEvent::Message 时一次性构造，供语义 handler 读写。
 /// handler 是 async 的，可直接 await（TOFU 读输入 / 发命令）。
-struct AppCtx<'a> {
+pub(crate) struct AppCtx<'a> {
     identity: &'a mut IdentityService,
     conversations: &'a mut HashMap<PeerId, Conversation>,
     groups: &'a mut HashMap<String, Group>,
     focused: &'a mut Option<PeerId>,
-    stdin: &'a mut StdinLines,
-    interactive: bool,
-    cmd_tx: &'a tokio::sync::mpsc::Sender<P2pCommand>,
+    pub(crate) stdin: &'a mut StdinLines,
+    pub(crate) interactive: bool,
+    pub(crate) cmd_tx: &'a tokio::sync::mpsc::Sender<P2pCommand>,
+    pub(crate) file: &'a mut crate::file_transfer::FileTransferState,
 }
 
 // ---- chat 业务语义 handler（注册到 SignalRegistry）----
@@ -967,6 +969,43 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
         }
     });
     tree.set_help(trust, "标记/取消信任联系人（! 前缀取消）");
+    let send = tree.register(ROOT, "send", |ctx, args| {
+        if args.len() < 2 {
+            eprintln!(
+                "{}",
+                "用法: /send <角色|节点ID> <文件路径>（须为已信任联系人）".yellow()
+            );
+            return;
+        }
+        let target = args[0].to_string();
+        let path_str = args[1..].join(" ");
+        match ctx.resolve(&target) {
+            Some(peer) => {
+                if !ctx.identity.is_verified(&peer) {
+                    eprintln!(
+                        "{}",
+                        format!("{target} 尚未验证，请先 /trust {target}").yellow()
+                    );
+                    return;
+                }
+                let path = std::path::PathBuf::from(&path_str);
+                if !path.exists() {
+                    eprintln!("{}", format!("文件不存在: {path_str}").yellow());
+                    return;
+                }
+                if let Err(e) =
+                    crate::file_transfer::start_send(ctx.file, &mut ctx.ops, peer, &path)
+                {
+                    eprintln!("{}", format!("发送启动失败: {e}").yellow());
+                }
+            }
+            None => eprintln!(
+                "{}",
+                format!("未知角色: {target}（须为完整角色名或完整节点ID）").yellow()
+            ),
+        }
+    });
+    tree.set_help(send, "发送文件给已信任联系人：/send <角色|节点ID> <路径>");
     let discover = tree.register(ROOT, "discover", |ctx, args| {
         let mode = match args.first() {
             Some(m) => match DiscoveryMode::parse(m) {
@@ -999,6 +1038,28 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
         }
     });
     tree.set_help(discover, "设置 mDNS 发现模式（下次进入聊天生效）");
+    let download_dir = tree.register(ROOT, "download-dir", |ctx, args| {
+        match args.first() {
+            Some(path) => {
+                match save_download_dir(ctx.identity.my_id(), path) {
+                    Ok(()) => println!(
+                        "{}",
+                        format!("下载目录已设为 {}（下次进入聊天生效）", path).green()
+                    ),
+                    Err(e) => {
+                        eprintln!("{}", format!("保存失败: {e}").yellow())
+                    }
+                }
+            }
+            None => {
+                println!(
+                    "{}",
+                    format!("当前下载目录: {}", ctx.file.downloads_dir().display()).dimmed()
+                );
+            }
+        }
+    });
+    tree.set_help(download_dir, "设置文件下载目录（缺省为下载到用户 Downloads，/download-dir <路径> 配置）");
     // group 树：`/group <群名>` 聚焦由 group 节点处理，子命令注册为子节点（指令树最深命中）
     let group = tree.register(ROOT, "group", |ctx, args| {
         match args.first() {
@@ -1417,6 +1478,12 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
         "{}",
         format!("发现模式: {}", discovery_mode.name()).dimmed()
     );
+    // 文件传输应用状态（下载目录在构造时解析，见 FileTransferState::new）
+    let mut file_state = crate::file_transfer::FileTransferState::new(identity.my_id());
+    println!(
+        "{}",
+        format!("下载目录: {}", file_state.downloads_dir().display()).dimmed()
+    );
 
     // L3 群注册表（登录后先读本地持久化）
     let mut groups: HashMap<String, Group> = load_groups(identity.my_id());
@@ -1467,6 +1534,32 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
     registry.register(TAG_GROUP_OWNER_TRANSFER, |ctx, from, payload| {
         Box::pin(on_group_owner_transfer(ctx, from, payload))
     });
+    // 文件传输应用（L3 应用②）注册 file.* 语义
+    use crate::file_transfer as ft;
+    registry.register(ft::TAG_FILE_OFFER, |ctx, from, payload| {
+        Box::pin(ft::on_file_offer(ctx, from, payload))
+    });
+    registry.register(ft::TAG_FILE_ACCEPT, |ctx, from, payload| {
+        Box::pin(ft::on_file_accept(ctx, from, payload))
+    });
+    registry.register(ft::TAG_FILE_REJECT, |ctx, from, payload| {
+        Box::pin(ft::on_file_reject(ctx, from, payload))
+    });
+    registry.register(ft::TAG_FILE_CHUNK, |ctx, from, payload| {
+        Box::pin(ft::on_file_chunk(ctx, from, payload))
+    });
+    registry.register(ft::TAG_FILE_ACK, |ctx, from, payload| {
+        Box::pin(ft::on_file_ack(ctx, from, payload))
+    });
+    registry.register(ft::TAG_FILE_FINISH, |ctx, from, payload| {
+        Box::pin(ft::on_file_finish(ctx, from, payload))
+    });
+    registry.register(ft::TAG_FILE_COMPLETE, |ctx, from, payload| {
+        Box::pin(ft::on_file_complete(ctx, from, payload))
+    });
+    registry.register(ft::TAG_FILE_ABORT, |ctx, from, payload| {
+        Box::pin(ft::on_file_abort(ctx, from, payload))
+    });
 
     println!(
         "{}",
@@ -1505,6 +1598,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                         registered: &mut registered,
                         ops: VecDeque::new(),
                         quit: false,
+                        file: &mut file_state,
                     };
                     let mut tree = build_tree();
                     if let Err(CmdError::NotFound) = tree.parse(cmd, &mut ctx) {
@@ -1728,6 +1822,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                         stdin: &mut stdin,
                                         interactive,
                                         cmd_tx: &cmd_tx,
+                                        file: &mut file_state,
                                     };
                                     let handled = registry
                                         .dispatch(&tag, &from, frame.binary.as_deref(), &mut actx)
