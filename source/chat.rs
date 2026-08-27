@@ -13,7 +13,7 @@ use tokio::io::AsyncBufReadExt;
 use crate::cmd_tree::{CmdError, CmdTree, ROOT};
 use crate::p2p::{cache_dir, load_discovery_mode, save_discovery_mode, save_download_dir, DiscoveryMode};
 use crate::p2p::identity_service::{IdentityService, StdinLines};
-use crate::p2p::node::{global_ipv6_addr, Control, Frame, P2pCommand, P2pEvent, P2pNode, BYE_HANDSHAKE_TIMEOUT};
+use crate::p2p::node::{is_global_ipv6_listen, Control, Frame, P2pCommand, P2pEvent, P2pNode, BYE_HANDSHAKE_TIMEOUT};
 
 // ---- 语义注册表（L3 应用层）：text=Custom(tag) 承载协议语义，binary 承载负载 ----
 //
@@ -135,24 +135,40 @@ fn push_cmd(ops: &mut VecDeque<AsyncOp>, cmd: P2pCommand) {
     ops.push_back(AsyncOp::Cmd(cmd));
 }
 
-/// 打印本机可分享地址：全局 IPv6 直连地址突出显示，其余监听地址一并列出（/listen）
+/// 打印本机可分享地址：全局 IPv6 直连地址（标题一次 + 逐条列出），其余监听地址另列（/listen）
 fn print_listen_addrs(addrs: &[Multiaddr], peer_id: &PeerId) {
-    match global_ipv6_addr(addrs, peer_id) {
-        Some(v6) => {
-            println!("{}", format!("全局IPv6直连地址: {v6}").cyan());
-            println!(
-                "{}",
-                "（把此地址发给对方，对方 /dial 即直连；需路由器放行该端口）".dimmed()
-            );
-        }
-        None => println!(
+    let globals: Vec<&Multiaddr> = addrs
+        .iter()
+        .filter(|a| is_global_ipv6_listen(a))
+        .collect();
+    if globals.is_empty() {
+        println!(
             "{}",
-            "本机暂无全局 IPv6 直连地址（跨城市需中继，后续支持）".yellow()
-        ),
+            "本机暂无全局 IPv6 直连地址（跨城市需中继，后续支持；若刚启动可稍后重试 /listen）"
+                .yellow()
+        );
+    } else {
+        println!(
+            "{}",
+            "全局IPv6直连地址（任选一条分享，对方 /dial 即连；需路由器放行该端口）:".cyan()
+        );
+        for a in globals {
+            println!("{}", format!("  {a}/p2p/{peer_id}").cyan());
+        }
+        println!(
+            "{}",
+            "（若分享的地址失效，重新 /listen 获取最新）".dimmed()
+        );
     }
-    println!("{}", "其他监听地址:".dimmed());
-    for a in addrs {
-        println!("  {a} /p2p/{peer_id}");
+    let others: Vec<&Multiaddr> = addrs
+        .iter()
+        .filter(|a| !is_global_ipv6_listen(a))
+        .collect();
+    if !others.is_empty() {
+        println!("{}", "其他监听地址:".dimmed());
+        for a in others {
+            println!("  {a}/p2p/{peer_id}");
+        }
     }
 }
 

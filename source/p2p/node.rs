@@ -153,6 +153,8 @@ pub struct P2pNode {
     v6_listen_issued: bool,
     /// 本机当前监听地址（供 /listen 查询；NewListenAddr 登记、AddressExpired 移除）
     listen_addrs: Vec<Multiaddr>,
+    /// 全局 IPv6 直连地址标题是否已打印（多条地址只打一次标题）
+    v6_global_printed: bool,
 }
 
 impl P2pNode {
@@ -200,6 +202,7 @@ impl P2pNode {
             stealth_rx,
             v6_listen_issued: false,
             listen_addrs: Vec::new(),
+            v6_global_printed: false,
         })
     }
 
@@ -391,19 +394,19 @@ impl P2pNode {
                 if !self.listen_addrs.contains(&address) {
                     self.listen_addrs.push(address.clone());
                 }
-                // UX-A：全局 IPv6 直连地址（可跨城市分享，对方 /dial 即连）
+                // UX-A：全局 IPv6 直连地址（可跨城市分享，对方 /dial 即连）。多条地址只打一次标题
                 if is_global_ipv6_listen(&address) {
+                    if !self.v6_global_printed {
+                        self.v6_global_printed = true;
+                        println!(
+                            "{}",
+                            "全局IPv6直连地址（任选一条分享，对方 /dial 即连；需路由器放行该端口）:"
+                                .cyan()
+                        );
+                    }
                     println!(
                         "{}",
-                        format!(
-                            "全局IPv6直连地址: {address}/p2p/{}",
-                            self.swarm.local_peer_id()
-                        )
-                        .cyan()
-                    );
-                    println!(
-                        "{}",
-                        "（把此地址发给对方，对方 /dial 即直连；需路由器放行该端口）".dimmed()
+                        format!("  {address}/p2p/{}", self.swarm.local_peer_id()).cyan()
                     );
                 }
                 if !self.v6_listen_issued
@@ -635,19 +638,9 @@ fn dial_next_reconnect(
 
 /// multiaddr 是否为全局 IPv6 直连地址（跨城市可分享；排除回环/链路本地/ULA）
 /// 判定：首个 hextet 属于 2000::/3（全局单播），排除 fe80 链路本地、fc00 ULA、ffff 组播
-fn is_global_ipv6_listen(addr: &Multiaddr) -> bool {
+pub(crate) fn is_global_ipv6_listen(addr: &Multiaddr) -> bool {
     addr.iter().any(|p| match p {
         Protocol::Ip6(ip) => (ip.segments()[0] & 0xe000) == 0x2000,
         _ => false,
-    })
-}
-
-/// 从监听地址列表中找出全局 IPv6 直连地址，并补上 `/p2p/<peer_id>`
-/// 供对方 `/dial` 直接连接（需对方路由器放行该端口）
-pub fn global_ipv6_addr(addrs: &[Multiaddr], peer_id: &PeerId) -> Option<Multiaddr> {
-    addrs.iter().find(|a| is_global_ipv6_listen(a)).map(|a| {
-        let mut full = a.clone();
-        full.push(Protocol::P2p(*peer_id));
-        full
     })
 }
