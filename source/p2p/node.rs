@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::net::Ipv6Addr;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::discovery::DiscoveryMode;
 use super::mdns_stealth::StealthMdns;
@@ -52,7 +52,7 @@ pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const BYE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 应用任务 → 传输任务的命令（协议无关；topic 为不透明字符串，L1 不解释）
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum P2pCommand {
     Dial { addr: Multiaddr },
     /// 拨号已知地址的 peer（按 known_addrs 逐个尝试）
@@ -63,6 +63,8 @@ pub enum P2pCommand {
     Subscribe { topic: String },
     Unsubscribe { topic: String },
     Publish { topic: String, data: Vec<u8> },
+    /// 查询本机当前监听地址（oneshot 回传，供 /listen 等命令）
+    GetListenAddr(oneshot::Sender<Vec<Multiaddr>>),
     Shutdown,
 }
 
@@ -149,6 +151,8 @@ pub struct P2pNode {
     /// 隐身模式监听上报通道
     stealth_rx: Option<mpsc::Receiver<(PeerId, Multiaddr)>>,
     v6_listen_issued: bool,
+    /// 本机当前监听地址（供 /listen 查询；NewListenAddr 登记、AddressExpired 移除）
+    listen_addrs: Vec<Multiaddr>,
 }
 
 impl P2pNode {
@@ -195,6 +199,7 @@ impl P2pNode {
             heartbeat: tokio::time::interval(HEARTBEAT_INTERVAL),
             stealth_rx,
             v6_listen_issued: false,
+            listen_addrs: Vec::new(),
         })
     }
 
@@ -300,6 +305,9 @@ impl P2pNode {
                     eprintln!("{}", format!("群消息发送失败: {e}").yellow());
                 }
             }
+            P2pCommand::GetListenAddr(reply) => {
+                let _ = reply.send(self.listen_addrs.clone());
+            }
             P2pCommand::Shutdown => return true,
         }
         false
@@ -380,6 +388,24 @@ impl P2pNode {
                     "{}",
                     format!("监听地址: {address}/p2p/{}", self.swarm.local_peer_id()).green()
                 );
+                if !self.listen_addrs.contains(&address) {
+                    self.listen_addrs.push(address.clone());
+                }
+                // UX-A：全局 IPv6 直连地址（可跨城市分享，对方 /dial 即连）
+                if is_global_ipv6_listen(&address) {
+                    println!(
+                        "{}",
+                        format!(
+                            "全局IPv6直连地址: {address}/p2p/{}",
+                            self.swarm.local_peer_id()
+                        )
+                        .cyan()
+                    );
+                    println!(
+                        "{}",
+                        "（把此地址发给对方，对方 /dial 即直连；需路由器放行该端口）".dimmed()
+                    );
+                }
                 if !self.v6_listen_issued
                     && address.iter().any(|p| matches!(p, Protocol::Ip4(_)))
                 {
@@ -553,6 +579,9 @@ impl P2pNode {
                     error: format!("{error}"),
                 });
             }
+            SwarmEvent::ExpiredListenAddr { address, .. } => {
+                self.listen_addrs.retain(|x| x != &address);
+            }
             _ => {}
         }
     }
@@ -602,4 +631,23 @@ fn dial_next_reconnect(
             format!("重连失败: {target} 的已知地址均无法连接，对方可能已退出").yellow()
         );
     }
+}
+
+/// multiaddr 是否为全局 IPv6 直连地址（跨城市可分享；排除回环/链路本地/ULA）
+/// 判定：首个 hextet 属于 2000::/3（全局单播），排除 fe80 链路本地、fc00 ULA、ffff 组播
+fn is_global_ipv6_listen(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| match p {
+        Protocol::Ip6(ip) => (ip.segments()[0] & 0xe000) == 0x2000,
+        _ => false,
+    })
+}
+
+/// 从监听地址列表中找出全局 IPv6 直连地址，并补上 `/p2p/<peer_id>`
+/// 供对方 `/dial` 直接连接（需对方路由器放行该端口）
+pub fn global_ipv6_addr(addrs: &[Multiaddr], peer_id: &PeerId) -> Option<Multiaddr> {
+    addrs.iter().find(|a| is_global_ipv6_listen(a)).map(|a| {
+        let mut full = a.clone();
+        full.push(Protocol::P2p(*peer_id));
+        full
+    })
 }

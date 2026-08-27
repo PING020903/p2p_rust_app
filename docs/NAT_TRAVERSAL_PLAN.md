@@ -1,5 +1,9 @@
 # NAT 穿透（打洞）方案规划
 
+> ⚠️ **决策更新**：本文档为 NAT/打洞**原理与通用方案**参考。当前项目落地方向已定为中国境内
+> 家庭宽带现实下的"**IPv6 直连优先 + 国内可达 relay 兜底、IPv4 打洞跳过**"，
+> 实施以 `docs/CROSS_LAN_CONNECTIVITY.md` 为准，本文仅作背景阅读。
+
 > 目标：让 `p2p_rust_app` 在两个不同局域网（不同 NAT 之后）的节点之间也能建立连接，
 > 最终支持公网 P2P 通讯。本文档先讲清原理（NAT / NAT 类型 / IPv6），再给分阶段实施方案。
 >
@@ -231,5 +235,6 @@ Cargo.toml 需加 features：`relay`、`dcutr`、`upnp`、`nat`、`quic`、`iden
 
 ## 相关文档
 
-- `docs/ROADMAP.md` — 公网（M6）条目：relay 中继（circuit v2）+ dcutr UDP 打洞；发现层从 mDNS 换 relay/rendezvous
+- `docs/ROADMAP.md` — 公网（M6）条目：**双栈策略（IPv6 直连 + 国内 relay 兜底，打洞跳过）**；发现层从 mDNS 换 relay 会合/IPv6
+- `docs/CROSS_LAN_CONNECTIVITY.md` — 当前落地方案（跨局域网联通）
 - `docs/GROUP_CRDT_ROADMAP.md` — 群成员名单去中心化方向（与公网演进独立）

@@ -13,7 +13,7 @@ use tokio::io::AsyncBufReadExt;
 use crate::cmd_tree::{CmdError, CmdTree, ROOT};
 use crate::p2p::{cache_dir, load_discovery_mode, save_discovery_mode, save_download_dir, DiscoveryMode};
 use crate::p2p::identity_service::{IdentityService, StdinLines};
-use crate::p2p::node::{Control, Frame, P2pCommand, P2pEvent, P2pNode, BYE_HANDSHAKE_TIMEOUT};
+use crate::p2p::node::{global_ipv6_addr, Control, Frame, P2pCommand, P2pEvent, P2pNode, BYE_HANDSHAKE_TIMEOUT};
 
 // ---- 语义注册表（L3 应用层）：text=Custom(tag) 承载协议语义，binary 承载负载 ----
 //
@@ -78,6 +78,8 @@ pub fn custom_frame(tag: &str, payload: Vec<u8>) -> Frame {
 pub(crate) enum AsyncOp {
     Cmd(P2pCommand),
     Backup,
+    /// 查询本机监听地址并打印（/listen）
+    Listen,
 }
 
 /// 命令上下文：一次性持有全部可变状态，供指令树 handler 直接读写。
@@ -131,6 +133,27 @@ fn trust_badge(verified: bool) -> colored::ColoredString {
 /// 向命令队列排入"发命令"动作（字段级借用，可在 handler 持有其它字段借用时调用）
 fn push_cmd(ops: &mut VecDeque<AsyncOp>, cmd: P2pCommand) {
     ops.push_back(AsyncOp::Cmd(cmd));
+}
+
+/// 打印本机可分享地址：全局 IPv6 直连地址突出显示，其余监听地址一并列出（/listen）
+fn print_listen_addrs(addrs: &[Multiaddr], peer_id: &PeerId) {
+    match global_ipv6_addr(addrs, peer_id) {
+        Some(v6) => {
+            println!("{}", format!("全局IPv6直连地址: {v6}").cyan());
+            println!(
+                "{}",
+                "（把此地址发给对方，对方 /dial 即直连；需路由器放行该端口）".dimmed()
+            );
+        }
+        None => println!(
+            "{}",
+            "本机暂无全局 IPv6 直连地址（跨城市需中继，后续支持）".yellow()
+        ),
+    }
+    println!("{}", "其他监听地址:".dimmed());
+    for a in addrs {
+        println!("  {a} /p2p/{peer_id}");
+    }
 }
 
 /// 语义信号处理器（async）：处理一个协议语义（frame.text 标签）的 binary 负载。
@@ -1060,6 +1083,10 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
         }
     });
     tree.set_help(download_dir, "设置文件下载目录（缺省为下载到用户 Downloads，/download-dir <路径> 配置）");
+    let listen = tree.register(ROOT, "listen", |ctx, _| {
+        ctx.ops.push_back(AsyncOp::Listen);
+    });
+    tree.set_help(listen, "重新打印本机可分享的直连地址（IPv6 前缀变化后可重新获取）");
     // group 树：`/group <群名>` 聚焦由 group 节点处理，子命令注册为子节点（指令树最深命中）
     let group = tree.register(ROOT, "group", |ctx, args| {
         match args.first() {
@@ -1617,6 +1644,14 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     ctx.identity.backup(ctx.stdin, ctx.interactive).await
                                 {
                                     eprintln!("{}", format!("备份失败: {e}").red());
+                                }
+                            }
+                            AsyncOp::Listen => {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                if ctx.cmd_tx.send(P2pCommand::GetListenAddr(tx)).await.is_ok() {
+                                    if let Ok(addrs) = rx.await {
+                                        print_listen_addrs(&addrs, ctx.identity.my_id());
+                                    }
                                 }
                             }
                         }

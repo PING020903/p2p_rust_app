@@ -77,8 +77,11 @@ P2P 传输层产品化方向规划。以"身份验证 + 连接"为根基，聊�
   （见 `docs/GROUP_CRDT_ROADMAP.md`）一并演进
 
 ### 公网（M6）
-- relay 中继（circuit v2）+ dcutr UDP 打洞
-- 身份/TOFU/加密已就绪，可平滑上公网；发现层从 mDNS 换成 relay/rendezvous
+- **双栈策略**（国内家庭宽带现实）：IPv6 直连优先（免费、零中继）+ 国内可达 relay 兜底（可靠基线）；
+  IPv4 打洞跳过（CGNAT 下无望）；每日 PPPoE 重拨按"瞬断自愈"处理
+- relay 点终态 = 香港 VPS 自建（会合房间 + 转发），阶段 0 先手动地址互通试水
+- 身份/TOFU/加密已就绪，可平滑上公网；发现层从 mDNS 换成 relay 会合/IPv6 地址
+- 方案设计见 `docs/CROSS_LAN_CONNECTIVITY.md`（跨局域网联通：单跳中继 + 候选测速选路 + 机会式 IPv6 升级）
 
 ### 其他
 - 修复 stdin 预读冲突（主菜单 `std::io::stdin()` vs 聊天 `tokio::io::stdin()`，
