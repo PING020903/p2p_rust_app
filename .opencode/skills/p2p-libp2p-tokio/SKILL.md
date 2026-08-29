@@ -137,7 +137,8 @@ tokio::select! {
 **L2 门禁（唯一收口，chat.rs 分发入口）**：`is_l2_signal(tag)` 为真（内化信号）一律放行；
 业务信号（chat.*/file.*）须 `effective_trusted`，否则走该 tag 的**未互信钩子**
 `SignalRegistry::register_untrusted(tag, handler)`（L2 API，async，与应用 handler 同签名；
-**不注册 = 空函数 = 丢弃**——payload 无人引用，自然回收）。
+**不注册 = 空函数 = 丢弃**——payload 无人引用，自然回收）。测试专用：`P2P_E2E_UNTRUSTED_HOOK=1`
+让 chat 注册 `chat.text` 未互信显示钩子（`[未信任]` 标记），用于验证"未互信处理是每端本地策略"。
 **对称信任红线**：`effective_trusted = is_verified && their_trust`；`/trust` 发 confirm、
 `/trust !` 发 revoke 并重置会话 `send_confirmed`（对方离线静默跳过）；hello 处理后重报当前
 信任态（重连自愈）。群消息（gossipsub `P2pEvent::Gossip`）不走 frame.text 分发，不受此门禁。

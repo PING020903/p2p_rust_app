@@ -547,6 +547,65 @@ fn standalone_ipv6_connect() {
     ipv6_loopback_and_global_scenario();
 }
 
+/// 未互信钩子边界：A 注册 `chat.text` 未互信钩子（未互信也显示，带 `[未信任]` 标记），
+/// B 未注册（未互信丢弃）——验证"未互信处理是每端本地策略、线缆协议互通"（跨版本配置）。
+fn untrusted_hook_boundary_scenario() {
+    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache_a = scenario_cache_dir("uh_a");
+    let cache_b = scenario_cache_dir("uh_b");
+    let (cred_a, cred_b) = load_creds();
+    let a_name = cred_a.name.clone();
+    let b_name = cred_b.name.clone();
+    println!("=== 场景: 未互信钩子边界（A 注册显示 / B 未注册丢弃）===");
+
+    // A 带 P2P_E2E_UNTRUSTED_HOOK 启动（注册 chat.text 未互信钩子）；B 不带
+    let mut a = Node::spawn_with_env(bin, &cache_a, "advertise", &[("P2P_E2E_UNTRUSTED_HOOK", "1")]);
+    a.wait_for("=== 主菜单 ===", Duration::from_secs(10));
+    login_restore(&mut a, &cred_a, MNEMONIC_USER1);
+    let a_listen = a.wait_for("监听地址: /ip4/127.0.0.1", Duration::from_secs(20));
+    let a_addr = listen_addr(&a_listen);
+    let a_id = parse_peer_id(&a_listen);
+
+    let (mut b, b_listen) = spawn_into_chat(bin, &cache_b, &cred_b, MNEMONIC_USER2);
+    let b_id = parse_peer_id(&b_listen);
+
+    b.send(&format!("/dial {a_addr}"));
+    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+    a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
+    // 等双方 hello 上线通知（会话名就绪），否则 /trust 按名解析不到
+    b.wait_for(&format!("对方已上线: {a_name}"), WAIT);
+    a.wait_for(&format!("对方已上线: {b_name}"), WAIT);
+
+    // B 取消信任 A → revoke 传播 → 双方互信断裂（进入未互信态）
+    println!("=== B /trust !A → 双方未互信 ===");
+    b.send(&format!("/trust !{a_name}"));
+    b.wait_for(&format!("已取消信任: {a_name}"), WAIT);
+    a.wait_for(&format!("对方已取消信任: {b_name}"), WAIT);
+
+    println!("=== B→A：A 注册了钩子 → 未互信也显示 `[未信任] ...` ===");
+    b.send("untrusted msg from B");
+    a.wait_for(&format!("[未信任] {b_name}: untrusted msg from B"), WAIT);
+
+    println!("=== A→B：B 未注册钩子 → 丢弃（B 不显示）===");
+    a.send("untrusted msg from A");
+    let dropped_b = b
+        .wait_for_optional("untrusted msg from A", Duration::from_secs(5))
+        .is_none();
+    assert!(dropped_b, "B 未注册未互信钩子，应丢弃 A 的未互信消息");
+
+    println!("=== B 重新信任 A → 互信恢复，双向正常显示 ===");
+    b.send(&format!("/trust {a_name}"));
+    b.wait_for(&format!("已信任: {a_name}"), WAIT);
+    a.wait_for(&format!("对方已信任你: {b_name}"), WAIT);
+    a.send("restored after retrust");
+    b.wait_for("[对方] restored after retrust", WAIT);
+    b.send("back after retrust");
+    a.wait_for("[对方] back after retrust", WAIT);
+
+    a.kill();
+    b.kill();
+}
+
 /// 逻辑测试串行 suite：功能正确性场景。若拆成并行 #[test]，同机 mDNS 会跨测试互相发现。
 #[test]
 fn p2p_chat_logic_suite() {
@@ -557,5 +616,6 @@ fn p2p_chat_logic_suite() {
     group_chat_scenario();
     trust_management_and_contact_name_resolution_scenario();
     symmetric_trust_scenario();
+    untrusted_hook_boundary_scenario();
     file_transfer_scenario();
 }

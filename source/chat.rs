@@ -259,6 +259,29 @@ async fn on_peer_bye_signal(ctx: &mut AppCtx<'_>, from: &PeerId, _payload: Optio
     true
 }
 
+/// 展示 chat.text 消息：trusted 用 `[对方]`/`[名字]` 前缀；untrusted 带 `[未信任]` 标记
+fn show_chat_text(from: &PeerId, text: &str, conv_name: &str, focused: bool, untrusted: bool) {
+    if untrusted {
+        let who = if conv_name.is_empty() {
+            from.to_string()
+        } else {
+            conv_name.to_string()
+        };
+        println!("{}", format!("[未信任] {who}: {text}").yellow());
+        return;
+    }
+    if focused {
+        println!("{}", format!("[对方] {text}").bright_cyan());
+    } else {
+        let who = if conv_name.is_empty() {
+            from.to_string()
+        } else {
+            conv_name.to_string()
+        };
+        println!("{}", format!("[{who}] {text}").bright_cyan());
+    }
+}
+
 async fn on_chat_text(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
     let Some(bytes) = payload else {
         return false;
@@ -270,16 +293,26 @@ async fn on_chat_text(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]
         .conversations
         .entry(*from)
         .or_insert_with(Conversation::new);
-    if *ctx.focused == Some(*from) {
-        println!("{}", format!("[对方] {}", p.text).bright_cyan());
-    } else {
-        let who = if conv.name.is_empty() {
-            from.to_string()
-        } else {
-            conv.name.clone()
-        };
-        println!("{}", format!("[{who}] {}", p.text).bright_cyan());
-    }
+    let focused = *ctx.focused == Some(*from);
+    show_chat_text(from, &p.text, &conv.name, focused, false);
+    true
+}
+
+/// 未互信 `chat.text` 钩子（测试专用，经 P2P_E2E_UNTRUSTED_HOOK=1 启用）：
+/// 未互信时也显示，带 `[未信任]` 标记。用于验证"未互信处理是每端本地策略"的边界。
+async fn display_untrusted_text(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
+    let Some(bytes) = payload else {
+        return false;
+    };
+    let Ok(p) = serde_cbor::from_slice::<ChatTextPayload>(bytes) else {
+        return false;
+    };
+    let conv = ctx
+        .conversations
+        .entry(*from)
+        .or_insert_with(Conversation::new);
+    let focused = *ctx.focused == Some(*from);
+    show_chat_text(from, &p.text, &conv.name, focused, true);
     true
 }
 
@@ -1605,6 +1638,13 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
     registry.register(TAG_CHAT_TEXT, |ctx, from, payload| {
         Box::pin(on_chat_text(ctx, from, payload))
     });
+    // 测试专用：P2P_E2E_UNTRUSTED_HOOK=1 时注册未互信 chat.text 钩子（带 [未信任] 标记显示），
+    // 用于验证"未互信信号处理是每端本地策略、协议互通"的边界（A 注册显示 / B 未注册丢弃）
+    if std::env::var("P2P_E2E_UNTRUSTED_HOOK").is_ok() {
+        registry.register_untrusted(TAG_CHAT_TEXT, |ctx, from, payload| {
+            Box::pin(display_untrusted_text(ctx, from, payload))
+        });
+    }
     registry.register(TAG_GROUP_INVITE, |ctx, from, payload| {
         Box::pin(on_group_invite(ctx, from, payload))
     });

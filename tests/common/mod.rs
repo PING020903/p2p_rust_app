@@ -98,16 +98,22 @@ impl Node {
     }
 
     pub fn spawn_with(bin: &str, cache_dir: &str, discovery: &str) -> Self {
-        let mut child = Command::new(bin)
-            .stdin(Stdio::piped())
+        Self::spawn_with_env(bin, cache_dir, discovery, &[])
+    }
+
+    pub fn spawn_with_env(bin: &str, cache_dir: &str, discovery: &str, extra_env: &[(&str, &str)]) -> Self {
+        let mut cmd = Command::new(bin);
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("P2P_ID_CACHE_DIR", cache_dir)
             .env("P2P_ID_PROBE_SECS", "2")
             .env("P2P_DISCOVERY", discovery)
-            .env("P2P_DOWNLOAD_DIR", format!("{cache_dir}/downloads"))
-            .spawn()
-            .expect("启动节点失败");
+            .env("P2P_DOWNLOAD_DIR", format!("{cache_dir}/downloads"));
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("启动节点失败");
         let (tx, rx) = mpsc::channel();
         let forward = |mut stream: Box<dyn std::io::Read + Send>, tag: &'static str, tx: mpsc::Sender<String>| {
             thread::spawn(move || {
