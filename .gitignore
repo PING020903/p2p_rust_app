@@ -16,6 +16,9 @@
 !/.opencode/
 !/docs/
 !/wish/
+!/xtask/
+# xtask 构建产物不入库（保留源码）
+/xtask/target/
 
 # .opencode 下保留 skills 与 agent
 /.opencode/*

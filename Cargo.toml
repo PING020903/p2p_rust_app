@@ -7,6 +7,9 @@ edition = "2024"
 name = "p2p_rust_app"
 path = "source/main.rs"
 
+[workspace]
+exclude = ["xtask"]
+
 [dependencies]
 argon2 = "0.5"
 bip39 = { version = "2.0", features = ["rand"] }

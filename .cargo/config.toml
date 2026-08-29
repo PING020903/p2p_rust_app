@@ -22,6 +22,11 @@ linker = "gcc"
 [net]
 # 网络配置（如果需要）
 
+# xtask：构建后把可执行文件按 <os>-<arch> 复制到 target/{profile}/bin/<os>-<arch>/
+# 用法：cargo xtask build [--release] [--target <triple>]
+[alias]
+xtask = "run --manifest-path xtask/Cargo.toml --"
+
 [term]
 # 终端输出配置
 verbose = false

@@ -19,9 +19,9 @@ pub use super::node::{is_global_ipv6_listen, BYE_HANDSHAKE_TIMEOUT};
 /// 返回是否成功处理（未注册/解析失败返回 false）。
 /// 上下文经 `SignalCtx` 的 GAT 暴露带生命周期的具体类型（本项目为 `AppCtx<'a>`），
 /// 使注册表可泛化于上下文而不把其生命周期钉死在注册表类型上。
-pub type SignalHandler<C: SignalCtx> = Box<
+pub type SignalHandler<C> = Box<
     dyn for<'borrow, 'ctx> FnMut(
-            &'borrow mut C::Ctx<'ctx>,
+            &'borrow mut <C as SignalCtx>::Ctx<'ctx>,
             &'borrow PeerId,
             Option<&'borrow [u8]>,
         ) -> Pin<Box<dyn Future<Output = bool> + 'borrow>>,
