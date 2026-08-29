@@ -128,7 +128,7 @@ fn push_cmd(ops: &mut VecDeque<AsyncOp>, cmd: seam::Cmd) {
     ops.push_back(AsyncOp::Cmd(cmd));
 }
 
-/// 终端逃逸：`cmd/<命令>` 走 cmd.exe，`ps/<命令>` 走 PowerShell。
+/// 终端逃逸：`cmd/<命令>` 走 cmd.exe，`ps/<命令>` 走 PowerShell，`sh/<命令>` 走 POSIX sh。
 /// stdout/stderr 继承到真实终端（cls 可真清屏），stdin 置 null 不与应用抢输入。
 async fn run_terminal_escape(program: &str, args: &[&str], rest: &str) {
     let status = tokio::process::Command::new(program)
@@ -1007,7 +1007,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
     let help = tree.register(ROOT, "help", |_, _| {});
     tree.set_help(
         help,
-        "显示本帮助；cmd/<命令> 或 ps/<命令> 可透传给终端执行（如 cmd/cls 清屏）",
+        "显示本帮助；cmd/<命令>（cmd）、ps/<命令>（PowerShell）、sh/<命令>（POSIX sh）可透传给终端执行（如 cmd/cls 或 sh/clear 清屏）",
     );
     let backup = tree.register(ROOT, "backup", |ctx, _| {
         ctx.ops.push_back(AsyncOp::Backup);
@@ -1686,7 +1686,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
 
     println!(
         "{}",
-        "命令以 / 开头（/help 查看详情，/list 查看节点，/chat <角色> 发起聊天）；cmd/<命令> 或 ps/<命令> 可直控终端；其余输入作为消息发送给当前聊天对象".dimmed()
+        "命令以 / 开头（/help 查看详情，/list 查看节点，/chat <角色> 发起聊天）；cmd/、ps/、sh/ 可直控终端；其余输入作为消息发送给当前聊天对象".dimmed()
     );
 
     loop {
@@ -1704,13 +1704,17 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                 if line.is_empty() {
                     continue;
                 }
-                // cmd/... 与 ps/...：终端逃逸，绕过应用直控当前终端（清屏/跑命令）
+                // cmd/...、ps/...、sh/...：终端逃逸，绕过应用直控当前终端（清屏/跑命令）
                 if let Some(rest) = line.strip_prefix("cmd/") {
                     run_terminal_escape("cmd", &["/c"], rest).await;
                     continue;
                 }
                 if let Some(rest) = line.strip_prefix("ps/") {
                     run_terminal_escape("powershell", &["-Command"], rest).await;
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("sh/") {
+                    run_terminal_escape("sh", &["-c"], rest).await;
                     continue;
                 }
                 if let Some(cmd) = line.strip_prefix('/') {
