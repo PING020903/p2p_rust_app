@@ -88,9 +88,37 @@ mDNS 依赖**组播广播**，而 `/dial` 依赖**明确地址**——两者网�
 | 现象 | 可能原因 | 处置 |
 |---|---|---|
 | `/dial` 报"地址无效" | 格式/端口/节点ID 不对 | 用对方 `/listen` 的完整行，别手敲 |
-| 拨号超时/无响应 | 被拨方入站被防火墙挡；或地址是旧端口 | 被拨方放行端口；重 `/listen` 拿新地址 |
+| 拨号超时/无响应 | 被拨方入站被防火墙挡；或地址是旧端口 | 被拨方放行端口；重 `/listen` 拿新地址；对照下方错误码 |
 | mDNS 看不到对方 | WSL↔Windows / 同机多实例 / stealth·off / 跨局域网 | 用 `/dial` 直达；跨局域网见 CROSS_LAN 文档 |
 | 连上但消息发不出 | 未互信（对称信任门禁） | 双方 `/trust` 建立互信 |
+
+## 六、常见 socket 错误码（Windows / Linux）
+
+> `os error NNNNN` 的 **NNNNN 是操作系统内核（Windows Winsock / Linux errno）的错误码**，
+> libp2p 只是把它包装搬运上来（见"认清来源"）。查错按**码语义**，别记平台数字。
+
+| 含义 | Windows (Winsock) | Linux (errno) | 常见触发 |
+|---|---|---|---|
+| 连接被拒 | 10061 (WSAECONNREFUSED) | 111 (ECONNREFUSED) | 对方端口没监听 / 防火墙 RST |
+| 地址/端口占用 | 10048 (WSAEADDRINUSE) | 98 (EADDRINUSE) | 本地源端口复用冲突（同机多实例） |
+| 网络不可达 | 10051 (WSAENETUNREACH) | 101 (ENETUNREACH) | 无路由（拨 fe80 / 无全局 IPv6） |
+| 连接超时 | 10060 (WSAETIMEDOUT) | 110 (ETIMEDOUT) | 防火墙 drop SYN（无响应） |
+| 连接被重置 | 10054 (WSAECONNRESET) | 104 (ECONNRESET) | 对方崩溃 / 防火墙 RST |
+| 地址不可用 | 10049 (WSAEADDRNOTAVAIL) | 99 (EADDRNOTAVAIL) | 本地地址不存在 / 未分配 |
+| 主机不可达 | 10065 (WSAEHOSTUNREACH) | 113 (EHOSTUNREACH) | 有路由但目标主机不可达 |
+| 权限拒绝 | 10013 (WSAEACCES) | 13 (EACCES) | 绑定特权端口 / 防火墙拦截 |
+| 资源耗尽 | 10055 (WSAENOBUFS) | 105 (ENOBUFS) | 缓冲区 / 句柄耗尽 |
+
+**编码规则提示**：早期经典 errno（如 `EACCES`=13）Winsock 是 `10000+errno`（10013）；
+网络相关码**分叉**（`ECONNREFUSED`：Windows 10061 vs Linux 111），不能简单加减换算。
+
+**如何查码含义**：
+
+| 平台 | 命令 |
+|---|---|
+| Windows | `net helpmsg 10061` |
+| Linux | `errno 111` 或 `man errno`（/usr/include/errno.h） |
+| 通用 | 搜 "WSAEADDRINUSE 10048" / "errno 98 EADDRINUSE" |
 
 ## 相关
 
