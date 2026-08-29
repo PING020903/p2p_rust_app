@@ -5,6 +5,74 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- **xtask 构建工具**：`cargo xtask build [--release]` —— 构建后自动把可执行文件按 `<os>-<arch>`
+  归档到 `target/{debug|release}/bin/<os>-<arch>/`（`std::env::consts` 自动检测，Windows 为
+  `windows-x86_64`，Linux 为 `linux-x86_64`；跨平台同一套命令，见 `.cargo/config.toml` 的 alias）
+- `docs/新手测试指南.md` 增补 WSL 章节：mirrored 网络配置 + 「同机拨号地址速查表」
+  （同机 WSL↔Windows 必须用 `127.0.0.1`，局域网 IP 会被 WSL 本地接管导致 Connection refused）
+- README 全面同步至 0.21 状态
+
+### 修复
+
+- `seam.rs` `SignalHandler` 类型别名去掉 `: SignalCtx` bound，关联类型完全限定
+  （`<C as SignalCtx>::Ctx<'ctx>`）——消除 `type_alias_bounds` 告警
+
+## [0.21.0] - 2026-08-29
+
+### 变更（严格 L3→L2→L1 分层）
+
+- **新增 seam 传输适配层** `source/p2p/seam.rs`：L3 只见 `seam::Cmd`/`seam::Event`
+  （tag+payload），不接触 L1 的 `Frame`/`control`；适配任务做 Cmd→帧组装、
+  P2pEvent→Event 拆帧（滤 control 心跳）双向翻译
+- **L1 类型 `pub(crate)` 内部化**：`Frame/P2pCommand/P2pEvent/P2pNode` 编译期强制隔离，
+  L3 不可触碰
+- **hello/bye/trust 统一为 L2 内化 `TextTag`**（门禁收口）：`is_l2_signal` 白名单，
+  L3 不直接处理存在信号
+- **未互信信号钩子**：`SignalRegistry` 下沉 seam 并 GAT 泛化上下文；按 tag 注册
+  `register_untrusted`，未注册 tag 默认空函数 = 丢弃（未互信业务信号默认丢弃）
+- **终端逃逸新增 `sh/` 前缀**（`sh -c`，POSIX/Linux），`/help` 与欢迎行同步
+- 新增 `docs/PROJECT_ARCHITECTURE.md`（分层 + 数据流 + 信号分发）
+
+### 测试
+
+- 新增 e2e：未互信钩子边界（`P2P_E2E_UNTRUSTED_HOOK` 注入，A 注册显示 `[未信任]` /
+  B 未注册丢弃，互信恢复双向正常）；`spawn_with_env` 辅助
+
+## [0.20.0] - 2026-08-29
+
+### 变更
+
+- **对称信任**（L2 互信门控）：`effective_trusted = 我信任 且 对方信任`，任一方
+  `/trust !` 取消 → 整条链路不互信，业务信号经未互信钩子（默认丢弃）；
+  `/list` 信任徽标 `[互信] / [我信任/对方未确认] / [未信任]`
+- **终端逃逸**：`cmd/<命令>`（cmd）、`ps/<命令>`（PowerShell）绕过应用直控当前终端
+- **测试拆分**：逻辑测试默认运行；稳定性测试（上下线循环/kill 掉线/阻塞心跳）移至
+  `tests/p2p_chat_stability.rs` 标 `--ignored` 显式声明
+- 信号格式规范入库
+
+### 测试
+
+- 新增 e2e：对称信任（互信→单方取消双向丢弃→恢复）、`standalone_ipv6_connect`
+  （同机 IPv6 自连：::1 回环 + 全局地址双路径）
+
+## [0.19.0] - 2026-08-29
+
+### 新增
+
+- **文件传输**（`/send <角色|节点ID> <路径>`，须互信）：事件驱动分块（1 MiB）推送 +
+  逐块 CRC32 校验 + 接收方落盘校验；停等 ack 天然背压
+- **可配置下载目录**：默认用户 Downloads，`/download-dir <路径>` 修改并持久化
+  （settings 文件）；`P2P_DOWNLOAD_DIR` 环境变量优先
+- **IPv6 直连地址 UX**：启动打印 `全局IPv6直连地址`（可分享给跨城市伙伴 `/dial` 即连，
+  需路由器放行端口）；`/listen` 随时重打（oneshot 查询监听地址）；本机双全局地址合并为
+  一条标题 + 多条地址
+- `docs/CROSS_LAN_CONNECTIVITY.md`（IPv6 直连优先 + 国内可达 relay 兜底方案）、
+  `docs/新手测试指南.md`（小白联机测试手册）
+
 ## [0.18.0] - 2026-08-22
 
 ### 变更（帧分发内核化：L3 不再 match frame.text）
