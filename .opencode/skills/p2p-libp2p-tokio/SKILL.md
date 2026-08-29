@@ -10,10 +10,16 @@ description: 本项目 libp2p 0.56 / tokio 1.53 用法参考。Use when editing 
 ## 1. 模块与 `mod` 引用
 
 - `source/main.rs` 顶层一次性声明各模块：`mod chat; mod cmd_tree; mod p2p;` 等
-- `source/p2p/` 是**通用传输层**（身份/联系人/发现/隐身监听），`chat.rs` 是消费方：
-  - `p2p/mod.rs` 声明 `pub mod identity; pub mod contacts; pub mod discovery; pub mod mdns_stealth;`
-  - `chat.rs` 引用：`use crate::p2p::mdns_stealth::StealthMdns;`、
-    `use crate::p2p::{DiscoveryMode, ContactBook, load_keystores, ...};`
+- **分层（0.21 起严格 L3→L2→L1）**：
+  - L1 = `source/p2p/node.rs`：`Frame`/`Control`/`P2pCommand`/`P2pEvent`/`P2pNode` 均 **`pub(crate)` 内部化**，
+    只有 `seam.rs`（L2）能引用；线缆帧组装/拆解只在这层
+  - L2 = `source/p2p/seam.rs`（传输适配层）：对 L3 暴露 `seam::Cmd`（`Send{peer,tag,payload}` 等）与
+    `seam::Event`（`Signal{from,tag,payload}` 等），`spawn_transport()` 建节点 + 适配任务翻译两向通道
+  - **L3（chat.rs / file_transfer.rs）禁止 import `p2p::node`**：只经 `seam::Cmd`/`seam::Event` 与 L1 通信，
+    发送一律 `seam::Cmd::Send { peer, tag, payload }`（帧组装由 seam 收口）
+- `source/p2p/` 是**通用传输层**（身份/联系人/发现/隐身监听/传输适配），`chat.rs` 是消费方：
+  - `p2p/mod.rs` 声明 `pub mod identity; pub mod contacts; pub mod discovery; pub mod mdns_stealth; pub mod seam;`
+  - `chat.rs` 引用：`use crate::p2p::seam::{self, Event, ...};`（**不引 node**）
 - 通用层内跨文件引用：`super::identity::cache_dir`（如 contacts/discovery 用身份缓存目录）
 - libp2p 的类型有时需全路径：`libp2p::swarm::behaviour::toggle::Toggle`（不在 `libp2p::swarm::*` 顶层 re-export）
 
@@ -107,12 +113,16 @@ tokio::select! {
 **`Frame` 三通道**：`control`（L1 心跳等传输控制）/ `text`（协议语义**标签**）/
 `binary`（该标签的 cbor 负载）。L1 对 text/binary 内容不解释，只透传。
 
-**注册与分发**：`SignalRegistry`（chat.rs）维护 `tag → async handler` 表，收到
-`frame.text` 即查表分发（无 match）。构造负载帧用 `custom_frame(tag, cbor(payload))`。
+**注册与分发**：`SignalRegistry`（chat.rs）维护 `tag → async handler` 表（HashMap 查表，
+**无业务 match**），收到 `frame.text` 查表分发。构造负载帧用 `custom_frame(tag, cbor(payload))`。
 
-**现有标签**（新增信号请沿用"text=标签 + binary=cbor(负载)"格式并登记）：
-- L2 存在语义：`hello`（binary=cbor(名字)）、`bye`
-- L2 对称信任：`trust.confirm` / `trust.revoke`（binary=cbor(名字)；互信 = 我信他 且 他信我）
+**L2 内化信号（hello/bye/trust）**：`identity_service.rs` 的 `TextTag` 枚举
+（`Hello`/`Bye`/`TrustConfirm`/`TrustRevoke`），经 `from_str`/`as_str` 与线缆字符串互转。
+**仅 L2 认识，L3 业务不触碰**；门禁白名单 `is_l2_signal(tag)` 判内化信号。
+
+**现有标签**：
+- L2 内化（TextTag）：`hello`（binary=cbor(名字)）、`bye`、`trust.confirm`/`trust.revoke`
+  （binary=cbor(名字)；互信 = 我信他 且 他信我）
 - L3 chat 业务：`chat.text` / `chat.group_invite` / `chat.group_leave` /
   `chat.group_member_list` / `chat.group_owner_transfer`
 - L3 文件传输：`file.offer` / `file.accept` / `file.reject` / `file.chunk` / `file.ack` /
@@ -123,6 +133,8 @@ tokio::select! {
 ④ L2 语义放 `identity_service.rs`，L3 业务放各自模块（如 `file_transfer.rs`）。
 协议版本号只在改动既有标签语义时 bump。
 
-**对称信任红线**：消息收发双向门控 `effective_trusted = is_verified && their_trust`；
-未互信 incoming 直接丢弃；`/trust` 发 confirm、`/trust !` 发 revoke 并重置会话
-`send_confirmed`；hello 处理后重报当前信任态（重连自愈）。
+**L2 门禁（唯一收口，chat.rs 分发入口）**：`is_l2_signal(tag)` 为真（内化信号）一律放行；
+业务信号（chat.*/file.*）须 `effective_trusted`，否则**整帧丢弃**。
+**对称信任红线**：`effective_trusted = is_verified && their_trust`；`/trust` 发 confirm、
+`/trust !` 发 revoke 并重置会话 `send_confirmed`（对方离线静默跳过）；hello 处理后重报当前
+信任态（重连自愈）。群消息（gossipsub `P2pEvent::Gossip`）不走 frame.text 分发，不受此门禁。

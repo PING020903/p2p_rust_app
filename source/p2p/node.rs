@@ -47,8 +47,8 @@ pub struct ChatRequest(pub Frame);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatResponse(pub bool);
 
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const BYE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 应用任务 → 传输任务的命令（协议无关；topic 为不透明字符串，L1 不解释）
@@ -88,7 +88,7 @@ pub struct NodeBehaviour {
     pub chat: request_response::cbor::Behaviour<ChatRequest, ChatResponse>,
 }
 
-pub fn build_swarm(
+pub(crate) fn build_swarm(
     keypair: Keypair,
     mode: DiscoveryMode,
 ) -> Result<Swarm<NodeBehaviour>, Box<dyn Error>> {
@@ -638,7 +638,7 @@ fn dial_next_reconnect(
 
 /// multiaddr 是否为全局 IPv6 直连地址（跨城市可分享；排除回环/链路本地/ULA）
 /// 判定：首个 hextet 属于 2000::/3（全局单播），排除 fe80 链路本地、fc00 ULA、ffff 组播
-pub(crate) fn is_global_ipv6_listen(addr: &Multiaddr) -> bool {
+pub fn is_global_ipv6_listen(addr: &Multiaddr) -> bool {
     addr.iter().any(|p| match p {
         Protocol::Ip6(ip) => (ip.segments()[0] & 0xe000) == 0x2000,
         _ => false,

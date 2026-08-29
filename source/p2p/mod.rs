@@ -15,6 +15,7 @@ pub mod identity;
 pub mod identity_service;
 pub mod mdns_stealth;
 pub mod node;
+pub mod seam;
 pub mod settings;
 
 pub use discovery::*;

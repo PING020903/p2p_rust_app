@@ -12,8 +12,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
-use crate::chat::{custom_frame, AppCtx};
-use crate::p2p::node::{Frame, P2pCommand};
+use crate::chat::AppCtx;
+use crate::p2p::seam;
 use crate::p2p::settings;
 
 /// 文件分块大小（1 MiB）
@@ -404,55 +404,56 @@ async fn drive_sender(ctx: &mut AppCtx<'_>, file_id: u64) {
         return;
     };
     // 读下一块（或读完发 finish；读失败发 abort 并移除发送状态）
-    let result: Option<(Frame, Option<(u64, u64, u64)>)> = {
+    let result: Option<(String, Option<Vec<u8>>, Option<(u64, u64, u64)>)> = {
         let Some(s) = ctx.file.senders.get_mut(&file_id) else {
             return;
         };
         let mut buf = vec![0u8; CHUNK_SIZE];
         match s.file.read(&mut buf) {
             Ok(0) => Some((
-                custom_frame(
-                    TAG_FILE_FINISH,
-                    serde_cbor::to_vec(&FileFinishPayload { file_id }).unwrap_or_default(),
-                ),
+                TAG_FILE_FINISH.to_string(),
+                Some(serde_cbor::to_vec(&FileFinishPayload { file_id }).unwrap_or_default()),
                 None,
             )),
             Ok(n) => {
-                let chunk = custom_frame(
-                    TAG_FILE_CHUNK,
-                    serde_cbor::to_vec(&FileChunkPayload {
-                        file_id,
-                        seq: s.next_seq,
-                        data: buf[..n].to_vec(),
-                        crc: crc32fast::hash(&buf[..n]),
-                    })
-                    .unwrap_or_default(),
+                let chunk = (
+                    TAG_FILE_CHUNK.to_string(),
+                    Some(
+                        serde_cbor::to_vec(&FileChunkPayload {
+                            file_id,
+                            seq: s.next_seq,
+                            data: buf[..n].to_vec(),
+                            crc: crc32fast::hash(&buf[..n]),
+                        })
+                        .unwrap_or_default(),
+                    ),
                 );
                 let progress = Some((s.sent + n as u64, s.size, s.next_seq));
                 s.sent += n as u64;
                 s.next_seq += 1;
-                Some((chunk, progress))
+                Some((chunk.0, chunk.1, progress))
             }
             Err(e) => {
                 let reason = format!("读文件失败: {e}");
                 ctx.file.senders.remove(&file_id);
                 Some((
-                    custom_frame(
-                        TAG_FILE_ABORT,
-                        serde_cbor::to_vec(&FileAbortPayload { file_id, reason })
-                            .unwrap_or_default(),
-                    ),
+                    TAG_FILE_ABORT.to_string(),
+                    Some(serde_cbor::to_vec(&FileAbortPayload { file_id, reason }).unwrap_or_default()),
                     None,
                 ))
             }
         }
     };
-    let Some((frame, progress)) = result else {
+    let Some((tag, payload, progress)) = result else {
         return;
     };
     let _ = ctx
         .cmd_tx
-        .send(P2pCommand::Send { peer, frame })
+        .send(seam::Cmd::Send {
+            peer,
+            tag,
+            payload,
+        })
         .await;
     if let Some((sent, size, seq)) = progress {
         let total = if size == 0 {
@@ -480,9 +481,10 @@ async fn send_signal<T: Serialize>(
     };
     let _ = ctx
         .cmd_tx
-        .send(P2pCommand::Send {
+        .send(seam::Cmd::Send {
             peer: *peer,
-            frame: custom_frame(tag, bin),
+            tag: tag.to_string(),
+            payload: Some(bin),
         })
         .await;
     true
@@ -526,9 +528,10 @@ pub fn start_send(
         size,
     })
     .map_err(|e| format!("序列化失败: {e}"))?;
-    ops.push_back(crate::chat::AsyncOp::Cmd(P2pCommand::Send {
+    ops.push_back(crate::chat::AsyncOp::Cmd(seam::Cmd::Send {
         peer,
-        frame: custom_frame(TAG_FILE_OFFER, offer),
+        tag: TAG_FILE_OFFER.to_string(),
+        payload: Some(offer),
     }));
     println!(
         "{}",

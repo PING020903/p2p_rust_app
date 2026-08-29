@@ -1,4 +1,4 @@
-﻿use colored::Colorize;
+use colored::Colorize;
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -12,8 +12,8 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::cmd_tree::{CmdError, CmdTree, ROOT};
 use crate::p2p::{cache_dir, load_discovery_mode, save_discovery_mode, save_download_dir, DiscoveryMode};
-use crate::p2p::identity_service::{IdentityService, StdinLines};
-use crate::p2p::node::{is_global_ipv6_listen, Control, Frame, P2pCommand, P2pEvent, P2pNode, BYE_HANDSHAKE_TIMEOUT};
+use crate::p2p::identity_service::{is_l2_signal, IdentityService, StdinLines, TextTag};
+use crate::p2p::seam::{self, is_global_ipv6_listen, Event, BYE_HANDSHAKE_TIMEOUT};
 
 // ---- 语义注册表（L3 应用层）：text=Custom(tag) 承载协议语义，binary 承载负载 ----
 //
@@ -27,9 +27,6 @@ const TAG_GROUP_INVITE: &str = "chat.group_invite";
 const TAG_GROUP_LEAVE: &str = "chat.group_leave";
 const TAG_GROUP_MEMBER_LIST: &str = "chat.group_member_list";
 const TAG_GROUP_OWNER_TRANSFER: &str = "chat.group_owner_transfer";
-/// L2 信任信号（仿 hello/bye）：对端告知"我信任你/我取消信任你"，binary=cbor(名字)
-const TAG_TRUST_CONFIRM: &str = "trust.confirm";
-const TAG_TRUST_REVOKE: &str = "trust.revoke";
 
 /// chat 业务负载结构（各自 tag 的 binary 负载，cbor 序列化）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,20 +63,11 @@ struct GroupOwnerTransferPayload {
     members: Vec<String>,
 }
 
-/// 构造一个"协议语义"帧：text=标签字符串 + binary=负载（供本 crate 各 L3 应用复用）
-pub fn custom_frame(tag: &str, payload: Vec<u8>) -> Frame {
-    Frame {
-        control: None,
-        text: Some(tag.to_string()),
-        binary: Some(payload),
-    }
-}
-
 /// 命令 handler 产出的异步动作：同步逻辑跑在指令树 handler 里，真正需要 `.await`
-/// 的 I/O（发命令给传输任务 / 读密码）排进 `ChatCtx.ops`，由主循环统一消费。
+/// 的 I/O（发命令给传输适配层 / 读密码）排进 `ChatCtx.ops`，由主循环统一消费。
 /// 这本质是"同步生产者 → 异步消费者"的 ring buffer 解耦。
 pub(crate) enum AsyncOp {
-    Cmd(P2pCommand),
+    Cmd(seam::Cmd),
     Backup,
     /// 查询本机监听地址并打印（/listen）
     Listen,
@@ -89,7 +77,7 @@ pub(crate) enum AsyncOp {
 /// 每次解析一行命令前临时构造（借用随本次处理结束释放），quit 置位表示请求退出。
 struct ChatCtx<'a> {
     identity: &'a mut IdentityService,
-    cmd_tx: &'a tokio::sync::mpsc::Sender<P2pCommand>,
+    cmd_tx: &'a tokio::sync::mpsc::Sender<seam::Cmd>,
     stdin: &'a mut StdinLines,
     interactive: bool,
     conversations: &'a mut HashMap<PeerId, Conversation>,
@@ -136,7 +124,7 @@ fn trust_badge(effective: bool, my_verified: bool) -> colored::ColoredString {
 }
 
 /// 向命令队列排入"发命令"动作（字段级借用，可在 handler 持有其它字段借用时调用）
-fn push_cmd(ops: &mut VecDeque<AsyncOp>, cmd: P2pCommand) {
+fn push_cmd(ops: &mut VecDeque<AsyncOp>, cmd: seam::Cmd) {
     ops.push_back(AsyncOp::Cmd(cmd));
 }
 
@@ -195,7 +183,7 @@ fn print_listen_addrs(addrs: &[Multiaddr], peer_id: &PeerId) {
     }
 }
 
-/// 语义信号处理器（async）：处理一个协议语义（frame.text 标签）的 binary 负载。
+/// 语义信号处理器（async）：处理一个信号（seam::Event::Signal 的 tag）的 payload 负载。
 /// `'borrow` 是 handler 调用时的借用生命周期，`'ctx` 是 AppCtx 内部引用的生命周期。
 /// 返回是否成功处理（未注册/解析失败返回 false）。
 type SignalHandler = Box<
@@ -249,7 +237,7 @@ impl SignalRegistry {
     }
 }
 
-/// 事件处理上下文：收到 P2pEvent::Message 时一次性构造，供语义 handler 读写。
+/// 事件处理上下文：收到 seam::Event::Signal 时一次性构造，供语义 handler 读写。
 /// handler 是 async 的，可直接 await（TOFU 读输入 / 发命令）。
 pub(crate) struct AppCtx<'a> {
     identity: &'a mut IdentityService,
@@ -258,7 +246,7 @@ pub(crate) struct AppCtx<'a> {
     focused: &'a mut Option<PeerId>,
     pub(crate) stdin: &'a mut StdinLines,
     pub(crate) interactive: bool,
-    pub(crate) cmd_tx: &'a tokio::sync::mpsc::Sender<P2pCommand>,
+    pub(crate) cmd_tx: &'a tokio::sync::mpsc::Sender<seam::Cmd>,
     pub(crate) file: &'a mut crate::file_transfer::FileTransferState,
 }
 
@@ -291,15 +279,16 @@ async fn on_peer_hello_signal(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Opti
     let my_name = ctx.identity.my_name().to_string();
     let my_name_bin = serde_cbor::to_vec(&my_name).unwrap_or_default();
     let trust_tag = if ctx.identity.is_verified(from) {
-        TAG_TRUST_CONFIRM
+        TextTag::TrustConfirm.as_str()
     } else {
-        TAG_TRUST_REVOKE
+        TextTag::TrustRevoke.as_str()
     };
     let _ = ctx
         .cmd_tx
-        .send(P2pCommand::Send {
+        .send(seam::Cmd::Send {
             peer: *from,
-            frame: custom_frame(trust_tag, my_name_bin),
+            tag: trust_tag.to_string(),
+            payload: Some(my_name_bin),
         })
         .await;
     ok
@@ -316,7 +305,7 @@ async fn on_peer_bye_signal(ctx: &mut AppCtx<'_>, from: &PeerId, _payload: Optio
         println!("{}", "对方已正常退出".yellow());
     });
     // L1 策略：标记 bye → 不再心跳、断开后不重连
-    let _ = cmd_tx.send(P2pCommand::MarkBye(*from)).await;
+    let _ = cmd_tx.send(seam::Cmd::MarkBye(*from)).await;
     true
 }
 
@@ -327,10 +316,6 @@ async fn on_chat_text(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]
     let Ok(p) = serde_cbor::from_slice::<ChatTextPayload>(bytes) else {
         return false;
     };
-    // 对称信任：未互信（我信他 且 他信我）的来信直接丢弃
-    if !ctx.identity.effective_trusted(from) {
-        return true;
-    }
     let conv = ctx
         .conversations
         .entry(*from)
@@ -396,7 +381,7 @@ async fn on_group_invite(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[
         let _ = save_groups(ctx.identity.my_id(), &ctx.groups);
         let _ = ctx
             .cmd_tx
-            .send(P2pCommand::Subscribe {
+            .send(seam::Cmd::Subscribe {
                 topic: group_topic(&p.group_id),
             })
             .await;
@@ -636,18 +621,18 @@ fn fanout_member_list(
         members: members.to_vec(),
     })
     .unwrap_or_default();
-    let frame = custom_frame(TAG_GROUP_MEMBER_LIST, payload);
     for p in targets {
-        ops.push_back(AsyncOp::Cmd(P2pCommand::Send {
+        ops.push_back(AsyncOp::Cmd(seam::Cmd::Send {
             peer: *p,
-            frame: frame.clone(),
+            tag: TAG_GROUP_MEMBER_LIST.to_string(),
+            payload: Some(payload.clone()),
         }));
     }
 }
 
 /// 事件 handler（async）用的异步扇出：直接 await cmd_tx
 async fn fanout_member_list_async(
-    cmd_tx: &tokio::sync::mpsc::Sender<P2pCommand>,
+    cmd_tx: &tokio::sync::mpsc::Sender<seam::Cmd>,
     group_id: &str,
     version: u64,
     members: &[String],
@@ -659,12 +644,12 @@ async fn fanout_member_list_async(
         members: members.to_vec(),
     })
     .unwrap_or_default();
-    let frame = custom_frame(TAG_GROUP_MEMBER_LIST, payload);
     for p in targets {
         let _ = cmd_tx
-            .send(P2pCommand::Send {
+            .send(seam::Cmd::Send {
                 peer: *p,
-                frame: frame.clone(),
+                tag: TAG_GROUP_MEMBER_LIST.to_string(),
+                payload: Some(payload.clone()),
             })
             .await;
     }
@@ -690,7 +675,7 @@ fn dial_group_members(
             continue;
         }
         if registered.get(&pid).map(|a| !a.is_empty()).unwrap_or(false) {
-            ops.push_back(AsyncOp::Cmd(P2pCommand::DialPeer(pid)));
+            ops.push_back(AsyncOp::Cmd(seam::Cmd::DialPeer(pid)));
         }
     }
 }
@@ -854,7 +839,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                         recorded.push(ma.clone());
                     }
                 }
-                push_cmd(&mut ctx.ops, P2pCommand::Dial { addr: ma });
+                push_cmd(&mut ctx.ops, seam::Cmd::Dial { addr: ma });
             }
             Err(reason) => {
                 eprintln!("{}", format!("地址无效: {reason}").red());
@@ -908,7 +893,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                         Some(addrs) if !addrs.is_empty() => {
                             println!("{}", format!("正在连接 {target}...").cyan());
                             ctx.conversations.get_mut(&p).unwrap().pending_dial = false;
-                            push_cmd(&mut ctx.ops, P2pCommand::DialPeer(p));
+                            push_cmd(&mut ctx.ops, seam::Cmd::DialPeer(p));
                         }
                         _ => {
                             ctx.conversations.get_mut(&p).unwrap().pending_dial = true;
@@ -1004,13 +989,10 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
         for p in peers {
             push_cmd(
                 &mut ctx.ops,
-                P2pCommand::Send {
+                seam::Cmd::Send {
                     peer: p,
-                    frame: Frame {
-                        control: None,
-                        text: Some("bye".to_string()),
-                        binary: None,
-                    },
+                    tag: TextTag::Bye.as_str().to_string(),
+                    payload: None,
                 },
             );
             println!("{}", format!("正在通知对方下线: {p}...").dimmed());
@@ -1028,13 +1010,10 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
         for p in peers {
             push_cmd(
                 &mut ctx.ops,
-                P2pCommand::Send {
+                seam::Cmd::Send {
                     peer: p,
-                    frame: Frame {
-                        control: None,
-                        text: Some("bye".to_string()),
-                        binary: None,
-                    },
+                    tag: TextTag::Bye.as_str().to_string(),
+                    payload: None,
                 },
             );
             println!("{}", format!("正在通知对方下线: {p}...").dimmed());
@@ -1078,9 +1057,10 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                     if ctx.connected.contains(&p) {
                         let my_name = ctx.identity.my_name().to_string();
                         let bin = serde_cbor::to_vec(&my_name).unwrap_or_default();
-                        ctx.ops.push_back(AsyncOp::Cmd(P2pCommand::Send {
+                        ctx.ops.push_back(AsyncOp::Cmd(seam::Cmd::Send {
                             peer: p,
-                            frame: custom_frame(TAG_TRUST_REVOKE, bin),
+                            tag: TextTag::TrustRevoke.as_str().to_string(),
+                            payload: Some(bin),
                         }));
                     }
                     println!("{}", format!("已取消信任: {name}").yellow());
@@ -1094,9 +1074,10 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                     if ctx.connected.contains(&p) {
                         let my_name = ctx.identity.my_name().to_string();
                         let bin = serde_cbor::to_vec(&my_name).unwrap_or_default();
-                        ctx.ops.push_back(AsyncOp::Cmd(P2pCommand::Send {
+                        ctx.ops.push_back(AsyncOp::Cmd(seam::Cmd::Send {
                             peer: p,
-                            frame: custom_frame(TAG_TRUST_CONFIRM, bin),
+                            tag: TextTag::TrustConfirm.as_str().to_string(),
+                            payload: Some(bin),
                         }));
                     }
                     println!("{}", format!("已信任: {name}").green());
@@ -1256,7 +1237,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                     );
                     push_cmd(
                         &mut ctx.ops,
-                        P2pCommand::Subscribe {
+                        seam::Cmd::Subscribe {
                             topic: group_topic(&id),
                         },
                     );
@@ -1308,9 +1289,10 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                             .unwrap_or_default();
                             push_cmd(
                                 &mut ctx.ops,
-                                P2pCommand::Send {
+                                seam::Cmd::Send {
                                     peer: p,
-                                    frame: custom_frame(TAG_GROUP_INVITE, invite),
+                                    tag: TAG_GROUP_INVITE.to_string(),
+                                    payload: Some(invite),
                                 },
                             );
                             println!(
@@ -1333,9 +1315,10 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                             .unwrap_or_default();
                             push_cmd(
                                 &mut ctx.ops,
-                                P2pCommand::Send {
+                                seam::Cmd::Send {
                                     peer: p,
-                                    frame: custom_frame(TAG_GROUP_INVITE, invite),
+                                    tag: TAG_GROUP_INVITE.to_string(),
+                                    payload: Some(invite),
                                 },
                             );
                             // 向其余成员（不含新人、不含自己）1v1 扇出名单更新
@@ -1469,9 +1452,10 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                         for t in targets {
                             push_cmd(
                                 &mut ctx.ops,
-                                P2pCommand::Send {
+                                seam::Cmd::Send {
                                     peer: t,
-                                    frame: custom_frame(TAG_GROUP_OWNER_TRANSFER, payload.clone()),
+                                    tag: TAG_GROUP_OWNER_TRANSFER.to_string(),
+                                    payload: Some(payload.clone()),
                                 },
                             );
                         }
@@ -1492,7 +1476,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                         // 退订 + 本地删群
                         push_cmd(
                             &mut ctx.ops,
-                            P2pCommand::Unsubscribe {
+                            seam::Cmd::Unsubscribe {
                                 topic: group_topic(&gid),
                             },
                         );
@@ -1509,7 +1493,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                         // 仅自己：解散
                         push_cmd(
                             &mut ctx.ops,
-                            P2pCommand::Unsubscribe {
+                            seam::Cmd::Unsubscribe {
                                 topic: group_topic(&gid),
                             },
                         );
@@ -1537,15 +1521,16 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                     .unwrap_or_default();
                     push_cmd(
                         &mut ctx.ops,
-                        P2pCommand::Send {
+                        seam::Cmd::Send {
                             peer: creator,
-                            frame: custom_frame(TAG_GROUP_LEAVE, leave),
+                            tag: TAG_GROUP_LEAVE.to_string(),
+                            payload: Some(leave),
                         },
                     );
                     // 本地移除群记录并退订 topic
                     push_cmd(
                         &mut ctx.ops,
-                        P2pCommand::Unsubscribe {
+                        seam::Cmd::Unsubscribe {
                             topic: group_topic(&gid),
                         },
                     );
@@ -1630,17 +1615,17 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
     let mut groups: HashMap<String, Group> = load_groups(identity.my_id());
     let mut focused_group: Option<String> = None;
 
-    // L1 传输任务：命令/事件双通道。事件用无界通道——传输任务永不因应用阻塞
+    // L1 传输任务经 L2 适配层（seam）：L3 只见 Cmd/Event（tag+payload），
+    // 不接触 Frame/control。事件用无界通道——传输任务永不因应用阻塞
     // （应用卡在 TOFU/密码等交互 await 时，心跳仍由传输任务独立维持）
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(32);
-    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
-    let node = P2pNode::new(identity.keypair().clone(), discovery_mode)?;
-    tokio::spawn(node.run(cmd_rx, ev_tx));
+    let transport = seam::spawn_transport(identity.keypair().clone(), discovery_mode)?;
+    let cmd_tx = transport.cmd_tx;
+    let mut ev_rx = transport.ev_rx;
 
     // 订阅已保存群的 gossipsub topic
     for g in groups.values() {
         let _ = cmd_tx
-            .send(P2pCommand::Subscribe {
+            .send(seam::Cmd::Subscribe {
                 topic: group_topic(&g.id),
             })
             .await;
@@ -1651,20 +1636,20 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
     let mut connected: HashSet<PeerId> = HashSet::new();
     let mut registered: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
 
-    // 语义注册表：L2 存在语义（hello/bye 默认行为）+ L3 chat 业务 handler。
-    // 收到 frame.text 标签即查表分发（无 match）。
+    // 语义注册表：L2 存在语义（hello/bye/trust 内化 text）+ L3 chat 业务 handler。
+    // 收到信号 tag 即查表分发（无 match）。L2 内化信号用 TextTag 常量注册（L3 不触碰）。
     let mut registry = SignalRegistry::new();
-    registry.register("hello", |ctx, from, payload| {
+    registry.register(TextTag::Hello.as_str(), |ctx, from, payload| {
         Box::pin(on_peer_hello_signal(ctx, from, payload))
     });
-    registry.register("bye", |ctx, from, payload| {
+    registry.register(TextTag::Bye.as_str(), |ctx, from, payload| {
         Box::pin(on_peer_bye_signal(ctx, from, payload))
     });
     // L2 信任信号（对称信任：对方告知"我信任你/我取消信任你"）
-    registry.register(TAG_TRUST_CONFIRM, |ctx, from, payload| {
+    registry.register(TextTag::TrustConfirm.as_str(), |ctx, from, payload| {
         Box::pin(on_trust_signal(ctx, from, payload, true))
     });
-    registry.register(TAG_TRUST_REVOKE, |ctx, from, payload| {
+    registry.register(TextTag::TrustRevoke.as_str(), |ctx, from, payload| {
         Box::pin(on_trust_signal(ctx, from, payload, false))
     });
     registry.register(TAG_CHAT_TEXT, |ctx, from, payload| {
@@ -1778,7 +1763,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                             }
                             AsyncOp::Listen => {
                                 let (tx, rx) = tokio::sync::oneshot::channel();
-                                if ctx.cmd_tx.send(P2pCommand::GetListenAddr(tx)).await.is_ok() {
+                                if ctx.cmd_tx.send(seam::Cmd::GetListenAddr(tx)).await.is_ok() {
                                     if let Ok(addrs) = rx.await {
                                         print_listen_addrs(&addrs, ctx.identity.my_id());
                                     }
@@ -1789,7 +1774,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                     if ctx.quit {
                         // 等 Bye 帧送达（传输任务独立处理），再关闭传输任务
                         tokio::time::sleep(BYE_HANDSHAKE_TIMEOUT).await;
-                        let _ = ctx.cmd_tx.send(P2pCommand::Shutdown).await;
+                        let _ = ctx.cmd_tx.send(seam::Cmd::Shutdown).await;
                         break;
                     }
                     continue;
@@ -1811,7 +1796,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                     })
                     .unwrap_or_default();
                     let _ = cmd_tx
-                        .send(P2pCommand::Publish {
+                        .send(seam::Cmd::Publish {
                             topic: group_topic(&g.id),
                             data: payload,
                         })
@@ -1863,9 +1848,10 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                 })
                                 .unwrap_or_default();
                                 let _ = cmd_tx
-                                    .send(P2pCommand::Send {
+                                    .send(seam::Cmd::Send {
                                         peer: p,
-                                        frame: custom_frame(TAG_CHAT_TEXT, payload),
+                                        tag: TAG_CHAT_TEXT.to_string(),
+                                        payload: Some(payload),
                                     })
                                     .await;
                                 println!("{}", format!("[我 -> {who}] {line}").green());
@@ -1882,7 +1868,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                 match event {
                     Some(ev) => {
                         match ev {
-                            P2pEvent::PeerConnected(peer) => {
+                            Event::Connected(peer) => {
                                 connected.insert(peer);
                                 if let Some(conv) = conversations.get_mut(&peer) {
                                     conv.pending_dial = false;
@@ -1911,24 +1897,21 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     .entry(peer)
                                     .or_insert_with(Conversation::new);
                                 if !conv.greeted {
-                                    // hello 存在信号：text="hello" + binary=cbor(名字)
+                                    // hello 存在信号：tag="hello" + payload=cbor(名字)，帧组装由 seam 负责
                                     let my_name = identity.my_name().to_string();
                                     let name_bin =
                                         serde_cbor::to_vec(&my_name).unwrap_or_default();
                                     let _ = cmd_tx
-                                        .send(P2pCommand::Send {
+                                        .send(seam::Cmd::Send {
                                             peer,
-                                            frame: Frame {
-                                                control: None,
-                                                text: Some("hello".to_string()),
-                                                binary: Some(name_bin),
-                                            },
+                                            tag: TextTag::Hello.as_str().to_string(),
+                                            payload: Some(name_bin),
                                         })
                                         .await;
                                     conv.greeted = true;
                                 }
                             }
-                            P2pEvent::PeerDisconnected { peer, bye } => {
+                            Event::Disconnected { peer, bye } => {
                                 connected.remove(&peer);
                                 if let Some(conv) = conversations.get_mut(&peer) {
                                     conv.greeted = false;
@@ -1948,7 +1931,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     println!("{}", "对方已正常退出，不进行重连".dimmed());
                                 }
                             }
-                            P2pEvent::PeerDiscovered { peer, addr } => {
+                            Event::Discovered { peer, addr } => {
                                 let recorded = registered.entry(peer).or_default();
                                 if !recorded.contains(&addr) {
                                     recorded.push(addr.clone());
@@ -1969,41 +1952,40 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                         "{}",
                                         format!("发现可连接节点，拨号 {peer}").cyan()
                                     );
-                                    let _ = cmd_tx.send(P2pCommand::DialPeer(peer)).await;
+                                    let _ = cmd_tx.send(seam::Cmd::DialPeer(peer)).await;
                                 }
                             }
-                            P2pEvent::Message { from, frame } => {
-                                // 通道路由：control（L1 心跳，L3 无感）→ text（协议语义标签）。
-                                // 无 match：构造应用上下文，按 text 标签查 SignalRegistry 分发，
-                                // await 注册的 handler（hello/bye 由 L2 存在语义映射 + L3 钩子分析；
+                            Event::Signal { from, tag, payload } => {
+                                // 通道路由：control（L1 心跳）已被 seam 过滤，L3 只见信号帧。
+                                // 无 match：构造应用上下文，按 tag 标签查 SignalRegistry 分发，
+                                // await 注册的 handler（hello/bye/trust 由 L2 内化语义映射 + L3 钩子；
                                 // chat.* 由 chat 业务 handler 处理）。
-                                if let Some(ctrl) = frame.control {
-                                    match ctrl {
-                                        Control::Heartbeat => {}
-                                    }
-                                } else if let Some(tag) = frame.text {
-                                    let mut actx = AppCtx {
-                                        identity: &mut identity,
-                                        conversations: &mut conversations,
-                                        groups: &mut groups,
-                                        focused: &mut focused,
-                                        stdin: &mut stdin,
-                                        interactive,
-                                        cmd_tx: &cmd_tx,
-                                        file: &mut file_state,
-                                    };
-                                    let handled = registry
-                                        .dispatch(&tag, &from, frame.binary.as_deref(), &mut actx)
-                                        .await;
-                                    if !handled {
-                                        eprintln!(
-                                            "{}",
-                                            format!("未处理的自定义语义: {tag}").yellow()
-                                        );
-                                    }
+                                // L2 门禁（唯一收口）：内化信号（hello/bye/trust）一律放行；
+                                // 业务信号（chat.*/file.*）须互信，否则整帧丢弃
+                                if !is_l2_signal(&tag) && !identity.effective_trusted(&from) {
+                                    continue;
+                                }
+                                let mut actx = AppCtx {
+                                    identity: &mut identity,
+                                    conversations: &mut conversations,
+                                    groups: &mut groups,
+                                    focused: &mut focused,
+                                    stdin: &mut stdin,
+                                    interactive,
+                                    cmd_tx: &cmd_tx,
+                                    file: &mut file_state,
+                                };
+                                let handled = registry
+                                    .dispatch(&tag, &from, payload.as_deref(), &mut actx)
+                                    .await;
+                                if !handled {
+                                    eprintln!(
+                                        "{}",
+                                        format!("未处理的自定义语义: {tag}").yellow()
+                                    );
                                 }
                             }
-                            P2pEvent::Gossip { source, data } => {
+                            Event::Gossip { source, data } => {
                                 let Ok(payload) =
                                     serde_json::from_slice::<GroupPayload>(&data)
                                 else {
@@ -2044,7 +2026,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
                             }
-                            P2pEvent::SendFailure { peer, error } => {
+                            Event::SendFailure { peer, error } => {
                                 let bye = conversations
                                     .get(&peer)
                                     .map(|c| c.bye)
@@ -2169,3 +2151,4 @@ mod tests {
         assert_eq!(next_creator(&members, "Z"), None);
     }
 }
+

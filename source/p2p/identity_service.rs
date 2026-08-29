@@ -17,6 +17,45 @@ use super::identity::{
 /// 输入行迭代器（stdin 被管道接管时逐行读取）
 pub type StdinLines = tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>;
 
+/// L2 内化信号枚举：hello/bye/trust 同一组，仅 L2 认识，L3 业务不触碰。
+/// `Frame.text` 线缆仍是字符串，应用侧用 `from_str`/`as_str` 与本枚举互转，
+/// 用于门禁白名单（内化信号一律放行）与类型安全的内化信号常量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextTag {
+    Hello,
+    Bye,
+    TrustConfirm,
+    TrustRevoke,
+}
+
+impl TextTag {
+    /// 字符串 tag → 内化枚举（"hello"→Hello 等；非内化信号返回 None）
+    pub fn from_str(s: &str) -> Option<TextTag> {
+        match s {
+            "hello" => Some(TextTag::Hello),
+            "bye" => Some(TextTag::Bye),
+            "trust.confirm" => Some(TextTag::TrustConfirm),
+            "trust.revoke" => Some(TextTag::TrustRevoke),
+            _ => None,
+        }
+    }
+
+    /// 内化枚举 → 线缆字符串 tag
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TextTag::Hello => "hello",
+            TextTag::Bye => "bye",
+            TextTag::TrustConfirm => "trust.confirm",
+            TextTag::TrustRevoke => "trust.revoke",
+        }
+    }
+}
+
+/// 某 tag 是否为 L2 内化信号（门禁白名单：内化信号无论互信与否一律放行）
+pub fn is_l2_signal(tag: &str) -> bool {
+    TextTag::from_str(tag).is_some()
+}
+
 /// 新身份助记词抄写确认词数
 const MNEMONIC_CONFIRM_WORDS: usize = 3;
 
@@ -486,6 +525,25 @@ async fn login_flow(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_tag_round_trip_and_l2_signal() {
+        for (s, tag) in [
+            ("hello", TextTag::Hello),
+            ("bye", TextTag::Bye),
+            ("trust.confirm", TextTag::TrustConfirm),
+            ("trust.revoke", TextTag::TrustRevoke),
+        ] {
+            assert_eq!(TextTag::from_str(s), Some(tag));
+            assert_eq!(tag.as_str(), s);
+            assert!(is_l2_signal(s));
+        }
+        // 业务信号不是内化信号（L3 不触碰内化 text）
+        for s in ["chat.text", "file.offer", "chat.group_invite", "bogus"] {
+            assert_eq!(TextTag::from_str(s), None);
+            assert!(!is_l2_signal(s));
+        }
+    }
 
     #[test]
     fn birthday_normalization() {

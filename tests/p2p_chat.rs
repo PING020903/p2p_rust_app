@@ -405,6 +405,10 @@ fn symmetric_trust_scenario() {
         .is_none();
     assert!(dropped_a, "A 不应收到 B 未互信的消息");
 
+    println!("=== 未互信时文件传输被拒（发送侧门控）===");
+    a.send(&format!("/send {b_name} nonexistent.txt"));
+    a.wait_for("尚未互信", WAIT);
+
     println!("=== B 重新信任 A：A 收到 confirm，双向收发恢复 ===");
     b.send(&format!("/trust {a_name}"));
     b.wait_for(&format!("已信任: {a_name}"), WAIT);
