@@ -31,10 +31,15 @@ permission:
 
 ## 验证流程
 
-- 每次改动后运行：`cargo check`；有逻辑改动必跑 `cargo test`
-- `cargo test` 包含：单元测试（约 31 项）+ e2e 七场景（约 2.5 分钟，真实双节点）
+- 每次改动后运行：`cargo check`；有逻辑改动必跑测试
+- **默认只跑逻辑测试**（功能正确性）：
+  - 单测：`cargo test --bin p2p_rust_app`
+  - 逻辑 e2e（串行，含 standalone 项）：`cargo test --test p2p_chat -- --test-threads=1`
+- **稳定性测试需显式声明**（重复登录/下线、掉线重连、同 ID 冲突、应用阻塞心跳等）：
+  `cargo test --test p2p_chat_stability -- --ignored --test-threads=1`
 - e2e 串行、依赖同机 mDNS，若失败先看是断言时序抖动还是真实回归
   （用 `wait_for_optional` 的场景尤其要核对"不应出现"断言是否被别的节点干扰）
+- 涉及信任门控/对称信任的改动：确认消息场景都先 `wait_mutual_trust` 再发消息
 - 全部绿了才算完成
 
 ## 变更报告

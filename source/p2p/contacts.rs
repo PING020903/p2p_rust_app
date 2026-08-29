@@ -20,6 +20,9 @@ pub struct ContactEntry {
     pub name: String,
     pub fingerprint: String,
     pub verified: bool,
+    /// 对方是否信任我（经 L2 trust.confirm/revoke 信号学习并持久化；对称信任的一侧）
+    #[serde(default)]
+    pub their_trust: bool,
     pub first_seen: u64,
     pub last_seen: u64,
 }
@@ -85,6 +88,32 @@ impl ContactBook {
         self.entries.get(peer_id).map(|e| e.verified).unwrap_or(false)
     }
 
+    /// 对方是否信任我（经 L2 trust 信号学习）
+    pub fn their_trust(&self, peer_id: &str) -> bool {
+        self.entries.get(peer_id).map(|e| e.their_trust).unwrap_or(false)
+    }
+
+    /// 有效信任：互信才算数（我信任对方 且 对方信任我）
+    pub fn effective_trusted(&self, peer_id: &str) -> bool {
+        self.entries
+            .get(peer_id)
+            .map(|e| e.verified && e.their_trust)
+            .unwrap_or(false)
+    }
+
+    /// 记录"对方信任我"的状态（trust.confirm=true / trust.revoke=false）
+    pub fn set_their_trust(&mut self, peer: &PeerId, trusted: bool) {
+        let pid = peer.to_string();
+        if !self.entries.contains_key(&pid) {
+            self.ensure_contact(peer, "", false);
+        }
+        if let Some(e) = self.entries.get_mut(&pid) {
+            e.their_trust = trusted;
+            e.last_seen = unix_now();
+            self.save();
+        }
+    }
+
     /// 按名字精确查找联系人（返回条目；允许多个联系人同名时取第一个）
     pub fn find_by_name(&self, name: &str) -> Option<&ContactEntry> {
         self.entries.values().find(|e| e.name == name)
@@ -121,6 +150,7 @@ impl ContactBook {
                         name: name.to_string(),
                         fingerprint: fingerprint_of(peer),
                         verified,
+                        their_trust: false,
                         first_seen: now,
                         last_seen: now,
                     },
@@ -222,6 +252,44 @@ mod tests {
         // 重新信任
         book.set_verified(&b_id, true);
         assert!(book.verified(&b_id.to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("P2P_ID_CACHE_DIR");
+        }
+    }
+
+    #[test]
+    fn symmetric_trust_requires_both_sides() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("p2p_sym_trust_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("P2P_ID_CACHE_DIR", &dir);
+        }
+        let a = keypair_from_mnemonic(MNEMONIC_A).unwrap();
+        let a_id = a.public().to_peer_id();
+        let b = keypair_from_mnemonic(MNEMONIC_B).unwrap();
+        let b_id = b.public().to_peer_id();
+
+        let mut book = ContactBook::load(&a_id);
+        // 默认：未信任（默认状态），互信才有效
+        assert!(!book.effective_trusted(&b_id.to_string()));
+        // 单方信任：我信他，但他还没信我 → 仍不生效
+        book.ensure_contact(&b_id, "bob", true);
+        assert!(book.verified(&b_id.to_string()));
+        assert!(!book.effective_trusted(&b_id.to_string()));
+        // 对方确认信任我 → 互信生效
+        book.set_their_trust(&b_id, true);
+        assert!(book.their_trust(&b_id.to_string()));
+        assert!(book.effective_trusted(&b_id.to_string()));
+        // 对方取消信任 → 失效
+        book.set_their_trust(&b_id, false);
+        assert!(!book.effective_trusted(&b_id.to_string()));
+        // 我方取消信任 → 也失效
+        book.set_their_trust(&b_id, true);
+        book.set_verified(&b_id, false);
+        assert!(!book.effective_trusted(&b_id.to_string()));
 
         let _ = std::fs::remove_dir_all(&dir);
         unsafe {

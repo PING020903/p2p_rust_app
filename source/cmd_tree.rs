@@ -136,7 +136,12 @@ impl<C> CmdTree<C> {
     pub fn show_help(&self) {
         let mut entries: Vec<(String, String)> = Vec::new();
         self.collect_help(ROOT, String::new(), &mut entries);
-        entries.push(("help".to_string(), "显示本帮助".to_string()));
+        // 若显式注册了 help 节点，用其文本（可携带应用专属提示）；否则给默认说明
+        let has_help_node = self.nodes[ROOT].children.contains_key("help")
+            && self.nodes[self.nodes[ROOT].children["help"]].help.is_some();
+        if !has_help_node {
+            entries.push(("help".to_string(), "显示本帮助".to_string()));
+        }
         let width = entries.iter().map(|(path, _)| path.len()).max().unwrap_or(0);
         println!("可用命令:");
         for (path, help) in entries {

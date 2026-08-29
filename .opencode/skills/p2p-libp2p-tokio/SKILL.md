@@ -101,3 +101,28 @@ tokio::select! {
   改动 main.rs / chat.rs 输入层前先确认此行为
 - 影子探测 `probe_duplicate_id` 用一次性随机身份（libp2p-mdns 会过滤与本机身份同
   PeerId 的发现，故需借影子身份）——仅在 `AdvertiseAndDiscover` 时有效
+
+## 7. 信号格式规范（可扩展约定，新增信号照此格式）
+
+**`Frame` 三通道**：`control`（L1 心跳等传输控制）/ `text`（协议语义**标签**）/
+`binary`（该标签的 cbor 负载）。L1 对 text/binary 内容不解释，只透传。
+
+**注册与分发**：`SignalRegistry`（chat.rs）维护 `tag → async handler` 表，收到
+`frame.text` 即查表分发（无 match）。构造负载帧用 `custom_frame(tag, cbor(payload))`。
+
+**现有标签**（新增信号请沿用"text=标签 + binary=cbor(负载)"格式并登记）：
+- L2 存在语义：`hello`（binary=cbor(名字)）、`bye`
+- L2 对称信任：`trust.confirm` / `trust.revoke`（binary=cbor(名字)；互信 = 我信他 且 他信我）
+- L3 chat 业务：`chat.text` / `chat.group_invite` / `chat.group_leave` /
+  `chat.group_member_list` / `chat.group_owner_transfer`
+- L3 文件传输：`file.offer` / `file.accept` / `file.reject` / `file.chunk` / `file.ack` /
+  `file.finish` / `file.complete` / `file.abort`
+
+**新增信号的套路**：① 定义 `const TAG_X: &str` ② 定义 cbor 负载 `struct`（serde）
+③ 在 `SignalRegistry` 注册 `registry.register(TAG_X, |ctx, from, payload| Box::pin(handler))`
+④ L2 语义放 `identity_service.rs`，L3 业务放各自模块（如 `file_transfer.rs`）。
+协议版本号只在改动既有标签语义时 bump。
+
+**对称信任红线**：消息收发双向门控 `effective_trusted = is_verified && their_trust`；
+未互信 incoming 直接丢弃；`/trust` 发 confirm、`/trust !` 发 revoke 并重置会话
+`send_confirmed`；hello 处理后重报当前信任态（重连自愈）。

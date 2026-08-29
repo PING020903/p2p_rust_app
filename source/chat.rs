@@ -27,6 +27,9 @@ const TAG_GROUP_INVITE: &str = "chat.group_invite";
 const TAG_GROUP_LEAVE: &str = "chat.group_leave";
 const TAG_GROUP_MEMBER_LIST: &str = "chat.group_member_list";
 const TAG_GROUP_OWNER_TRANSFER: &str = "chat.group_owner_transfer";
+/// L2 信任信号（仿 hello/bye）：对端告知"我信任你/我取消信任你"，binary=cbor(名字)
+const TAG_TRUST_CONFIRM: &str = "trust.confirm";
+const TAG_TRUST_REVOKE: &str = "trust.revoke";
 
 /// chat 业务负载结构（各自 tag 的 binary 负载，cbor 序列化）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,10 +124,12 @@ impl<'a> ChatCtx<'a> {
     }
 }
 
-/// 信任徽标文本（与 /list 一致的 [已信任]/[未信任]）
-fn trust_badge(verified: bool) -> colored::ColoredString {
-    if verified {
-        "  [已信任]".green()
+/// 信任徽标（对称信任）：[互信] 双向信任 / [我信任] 单方已信任 / [未信任] 默认
+fn trust_badge(effective: bool, my_verified: bool) -> colored::ColoredString {
+    if effective {
+        "  [互信]".green()
+    } else if my_verified {
+        "  [我信任/对方未确认]".yellow()
     } else {
         "  [未信任]".yellow()
     }
@@ -133,6 +138,24 @@ fn trust_badge(verified: bool) -> colored::ColoredString {
 /// 向命令队列排入"发命令"动作（字段级借用，可在 handler 持有其它字段借用时调用）
 fn push_cmd(ops: &mut VecDeque<AsyncOp>, cmd: P2pCommand) {
     ops.push_back(AsyncOp::Cmd(cmd));
+}
+
+/// 终端逃逸：`cmd/<命令>` 走 cmd.exe，`ps/<命令>` 走 PowerShell。
+/// stdout/stderr 继承到真实终端（cls 可真清屏），stdin 置 null 不与应用抢输入。
+async fn run_terminal_escape(program: &str, args: &[&str], rest: &str) {
+    let status = tokio::process::Command::new(program)
+        .args(args)
+        .arg(rest)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await;
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!("{}", format!("命令退出码: {s}").yellow()),
+        Err(e) => eprintln!("{}", format!("无法执行 {program}: {e}").yellow()),
+    }
 }
 
 /// 打印本机可分享地址：全局 IPv6 直连地址（标题一次 + 逐条列出），其余监听地址另列（/listen）
@@ -255,14 +278,31 @@ async fn on_peer_hello_signal(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Opti
     };
     // 分离字段借用，让钩子闭包能访问 conversations 而不与 handle_peer_hello 冲突
     let conversations = &mut *ctx.conversations;
-    ctx.identity
+    let ok = ctx
+        .identity
         .handle_peer_hello(ctx.stdin, ctx.interactive, from, &name, |peer, name| {
             let conv = conversations.entry(*peer).or_insert_with(Conversation::new);
             conv.name = name.to_string();
             println!("{}", format!("对方已上线: {name}").green());
         })
         .await
-        .is_ok()
+        .is_ok();
+    // 对称信任自愈：hello 处理完（verified 已定型）后，向对方重报当前信任态，重连后重新同步
+    let my_name = ctx.identity.my_name().to_string();
+    let my_name_bin = serde_cbor::to_vec(&my_name).unwrap_or_default();
+    let trust_tag = if ctx.identity.is_verified(from) {
+        TAG_TRUST_CONFIRM
+    } else {
+        TAG_TRUST_REVOKE
+    };
+    let _ = ctx
+        .cmd_tx
+        .send(P2pCommand::Send {
+            peer: *from,
+            frame: custom_frame(trust_tag, my_name_bin),
+        })
+        .await;
+    ok
 }
 
 /// bye（对方下线）：L2 处理存在 + 触发 L3 钩子（标记会话 + 打印），再发 MarkBye
@@ -287,6 +327,10 @@ async fn on_chat_text(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]
     let Ok(p) = serde_cbor::from_slice::<ChatTextPayload>(bytes) else {
         return false;
     };
+    // 对称信任：未互信（我信他 且 他信我）的来信直接丢弃
+    if !ctx.identity.effective_trusted(from) {
+        return true;
+    }
     let conv = ctx
         .conversations
         .entry(*from)
@@ -300,6 +344,28 @@ async fn on_chat_text(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]
             conv.name.clone()
         };
         println!("{}", format!("[{who}] {}", p.text).bright_cyan());
+    }
+    true
+}
+
+/// L2 信任信号处理（trust.confirm=true / trust.revoke=false）：对端告知"我信任你/取消信任你"
+async fn on_trust_signal(
+    ctx: &mut AppCtx<'_>,
+    from: &PeerId,
+    payload: Option<&[u8]>,
+    trusted: bool,
+) -> bool {
+    let Some(bytes) = payload else {
+        return false;
+    };
+    let Ok(name) = serde_cbor::from_slice::<String>(bytes) else {
+        return false;
+    };
+    ctx.identity.on_peer_trust_signal(from, &name, trusted);
+    if trusted {
+        println!("{}", format!("对方已信任你: {name}").green());
+    } else {
+        println!("{}", format!("对方已取消信任: {name}").yellow());
     }
     true
 }
@@ -822,7 +888,10 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                     } else {
                         name.as_str()
                     };
-                    let badge = trust_badge(ctx.identity.is_verified(&p));
+                    let badge = trust_badge(
+                        ctx.identity.effective_trusted(&p),
+                        ctx.identity.is_verified(&p),
+                    );
                     println!(
                         "{}",
                         format!("已切换到会话: {who}（{p}）{badge}").green()
@@ -889,8 +958,10 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                 } else {
                     "离线"
                 };
-                let trust_badge = if ctx.identity.is_verified(p) {
-                    "已信任".green()
+                let trust_badge = if ctx.identity.effective_trusted(p) {
+                    "互信".green()
+                } else if ctx.identity.is_verified(p) {
+                    "我信任/对方未确认".yellow()
                 } else {
                     "未信任".yellow()
                 };
@@ -971,6 +1042,11 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
         ctx.quit = true;
     });
     tree.set_help(q, "退出聊天");
+    let help = tree.register(ROOT, "help", |_, _| {});
+    tree.set_help(
+        help,
+        "显示本帮助；cmd/<命令> 或 ps/<命令> 可透传给终端执行（如 cmd/cls 清屏）",
+    );
     let backup = tree.register(ROOT, "backup", |ctx, _| {
         ctx.ops.push_back(AsyncOp::Backup);
     });
@@ -994,6 +1070,19 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                 let name = peer_name(&p, ctx.conversations, ctx.identity);
                 if untrust {
                     ctx.identity.trust(&p, &name, false);
+                    // 对称信任：取消后 D3 需重新生效，清掉本会话的已确认标记
+                    if let Some(conv) = ctx.conversations.get_mut(&p) {
+                        conv.send_confirmed = false;
+                    }
+                    // 通知对方"我取消了对你的信任"；对方离线则静默跳过（重连时 hello 自愈补发）
+                    if ctx.connected.contains(&p) {
+                        let my_name = ctx.identity.my_name().to_string();
+                        let bin = serde_cbor::to_vec(&my_name).unwrap_or_default();
+                        ctx.ops.push_back(AsyncOp::Cmd(P2pCommand::Send {
+                            peer: p,
+                            frame: custom_frame(TAG_TRUST_REVOKE, bin),
+                        }));
+                    }
                     println!("{}", format!("已取消信任: {name}").yellow());
                 } else {
                     // D4：信任前展示节点ID + 指纹，供人工复核（允许重名时核对）
@@ -1001,13 +1090,22 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                     println!("  节点ID: {p}");
                     println!("  指纹: {}", ctx.identity.fingerprint(&p).dimmed());
                     ctx.identity.trust(&p, &name, true);
+                    // 对称信任：通知对方"我已信任你"；对方离线则静默跳过（重连时 hello 自愈补发）
+                    if ctx.connected.contains(&p) {
+                        let my_name = ctx.identity.my_name().to_string();
+                        let bin = serde_cbor::to_vec(&my_name).unwrap_or_default();
+                        ctx.ops.push_back(AsyncOp::Cmd(P2pCommand::Send {
+                            peer: p,
+                            frame: custom_frame(TAG_TRUST_CONFIRM, bin),
+                        }));
+                    }
                     println!("{}", format!("已信任: {name}").green());
                 }
             }
             None => eprintln!("{}", "未知节点，无法标记信任（用 /list 查看）".yellow()),
         }
     });
-    tree.set_help(trust, "标记/取消信任联系人（! 前缀取消）");
+    tree.set_help(trust, "标记/取消信任联系人（! 前缀取消；对称信任：双方 /trust 后才互信可收发消息）");
     let send = tree.register(ROOT, "send", |ctx, args| {
         if args.len() < 2 {
             eprintln!(
@@ -1020,10 +1118,10 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
         let path_str = args[1..].join(" ");
         match ctx.resolve(&target) {
             Some(peer) => {
-                if !ctx.identity.is_verified(&peer) {
+                if !ctx.identity.effective_trusted(&peer) {
                     eprintln!(
                         "{}",
-                        format!("{target} 尚未验证，请先 /trust {target}").yellow()
+                        format!("{target} 尚未互信（需双方 /trust），文件传输被拒绝").yellow()
                     );
                     return;
                 }
@@ -1562,6 +1660,13 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
     registry.register("bye", |ctx, from, payload| {
         Box::pin(on_peer_bye_signal(ctx, from, payload))
     });
+    // L2 信任信号（对称信任：对方告知"我信任你/我取消信任你"）
+    registry.register(TAG_TRUST_CONFIRM, |ctx, from, payload| {
+        Box::pin(on_trust_signal(ctx, from, payload, true))
+    });
+    registry.register(TAG_TRUST_REVOKE, |ctx, from, payload| {
+        Box::pin(on_trust_signal(ctx, from, payload, false))
+    });
     registry.register(TAG_CHAT_TEXT, |ctx, from, payload| {
         Box::pin(on_chat_text(ctx, from, payload))
     });
@@ -1606,7 +1711,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
 
     println!(
         "{}",
-        "命令以 / 开头（/help 查看详情，/list 查看节点，/chat <角色> 发起聊天），其余输入作为消息发送给当前聊天对象".dimmed()
+        "命令以 / 开头（/help 查看详情，/list 查看节点，/chat <角色> 发起聊天）；cmd/<命令> 或 ps/<命令> 可直控终端；其余输入作为消息发送给当前聊天对象".dimmed()
     );
 
     loop {
@@ -1622,6 +1727,15 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                 };
                 let line = line.trim();
                 if line.is_empty() {
+                    continue;
+                }
+                // cmd/... 与 ps/...：终端逃逸，绕过应用直控当前终端（清屏/跑命令）
+                if let Some(rest) = line.strip_prefix("cmd/") {
+                    run_terminal_escape("cmd", &["/c"], rest).await;
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("ps/") {
+                    run_terminal_escape("powershell", &["-Command"], rest).await;
                     continue;
                 }
                 if let Some(cmd) = line.strip_prefix('/') {
@@ -1721,12 +1835,12 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                 } else {
                                     name
                                 };
-                                // D3：未信任联系人首次发消息确认（仅交互终端；管道/e2e 自动放行）
-                                if !identity.is_verified(&p) {
+                                // D3：未互信联系人首次发消息确认（仅交互终端；管道/e2e 自动放行）
+                                if !identity.effective_trusted(&p) {
                                     if interactive && !conversations[&p].send_confirmed {
                                         println!(
                                             "{}",
-                                            format!("对方 {who} 未信任（未经验证），确认发送？(y/n)").yellow()
+                                            format!("对方 {who} 未互信（需双方 /trust），确认发送？(y/n)").yellow()
                                         );
                                         let ans = match stdin.next_line().await {
                                             Ok(Some(l)) => l.trim().to_string(),
@@ -1781,7 +1895,10 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                         .map(|c| c.name.clone())
                                         .unwrap_or_default();
                                     if !name.is_empty() {
-                                        let badge = trust_badge(identity.is_verified(&peer));
+                                        let badge = trust_badge(
+                                            identity.effective_trusted(&peer),
+                                            identity.is_verified(&peer),
+                                        );
                                         println!(
                                             "{}",
                                             format!("已切换到会话: {}（{peer}）{badge}", name)

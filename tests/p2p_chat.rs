@@ -1,264 +1,13 @@
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+//! 逻辑测试（默认运行）：功能正确性场景——基础聊天 / 按名呼叫 / 多会话 / 群聊 / 发现模式 /
+//! 信任管理 / 对称信任 / 文件传输 / IPv6 自连。稳定性场景见 `p2p_chat_stability.rs`。
+//!
+//! 运行：`cargo test --test p2p_chat -- --test-threads=1`
+//! （串行必须：同机 mDNS 会跨测试互相发现，拆并行会连错对象）
+
+mod common;
+use common::*;
 use std::thread;
-use std::time::{Duration, Instant};
-
-const CYCLES_GRACEFUL: usize = 15;
-const CYCLES_KILL: usize = 5;
-const WAIT: Duration = Duration::from_secs(20);
-
-#[derive(Clone)]
-struct Creds {
-    name: String,
-    birthday: String,
-    gender: String,
-    password: String,
-}
-
-/// 从 tests/users.txt 读取 user1/user2 的凭据。
-/// 文件格式：`userN-name / userN-age / userN-sex / userN-password` 键值行，
-/// age 值允许带 "(YYYY-MM-DD)" 格式提示，解析时剥离。
-fn load_creds() -> (Creds, Creds) {
-    let all = load_creds_n(2);
-    (all[0].clone(), all[1].clone())
-}
-
-/// user1/user2/user3（3 号用于三节点多会话/群聊场景，要求名字互不相同）
-fn load_creds3() -> (Creds, Creds, Creds) {
-    let all = load_creds_n(3);
-    (all[0].clone(), all[1].clone(), all[2].clone())
-}
-
-/// user1..user4（4 号用于四节点群主转移场景）
-fn load_creds4() -> (Creds, Creds, Creds, Creds) {
-    let all = load_creds_n(4);
-    (
-        all[0].clone(),
-        all[1].clone(),
-        all[2].clone(),
-        all[3].clone(),
-    )
-}
-
-fn load_creds_n(n: usize) -> Vec<Creds> {
-    let path = format!("{}/tests/users.txt", env!("CARGO_MANIFEST_DIR"));
-    let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!("读取 {path} 失败: {e}（请复制 tests/users.template.txt 为 tests/users.txt 并填写）")
-    });
-    let mut fields: HashMap<String, String> = HashMap::new();
-    // 防御 UTF-8 BOM（\u{feff}）：部分编辑器/写盘会带 BOM，污染首行键名
-    let content = content.trim_start_matches('\u{feff}');
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            fields.insert(k.trim().to_string(), v.trim().to_string());
-        }
-    }
-    let take = |user: &str, field: &str| -> String {
-        fields
-            .get(&format!("{user}-{field}"))
-            .unwrap_or_else(|| panic!("users.txt 缺少 {user}-{field}"))
-            .clone()
-    };
-    let strip_hint = |v: String| v.split('(').next().unwrap_or("").trim().to_string();
-    let cred = |user: &str| Creds {
-        name: take(user, "name"),
-        birthday: strip_hint(take(user, "age")),
-        gender: take(user, "sex"),
-        password: take(user, "password"),
-    };
-    (1..=n).map(|i| cred(&format!("user{i}"))).collect()
-}
-
-/// 每场景独立的身份缓存临时目录（保证登录菜单行为确定）
-fn scenario_cache_dir(scenario: &str) -> String {
-    let dir = std::env::temp_dir()
-        .join(format!("p2p_e2e_cache_{}", std::process::id()))
-        .join(scenario);
-    std::fs::create_dir_all(&dir).expect("创建测试缓存目录失败");
-    dir.to_string_lossy().into_owned()
-}
-
-struct Node {
-    child: Child,
-    lines: mpsc::Receiver<String>,
-}
-
-impl Node {
-    fn spawn(bin: &str, cache_dir: &str) -> Self {
-        Self::spawn_with(bin, cache_dir, "advertise")
-    }
-
-    fn spawn_with(bin: &str, cache_dir: &str, discovery: &str) -> Self {
-        let mut child = Command::new(bin)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("P2P_ID_CACHE_DIR", cache_dir)
-            .env("P2P_ID_PROBE_SECS", "2")
-            .env("P2P_DISCOVERY", discovery)
-            .env("P2P_DOWNLOAD_DIR", format!("{cache_dir}/downloads"))
-            .spawn()
-            .expect("启动节点失败");
-        let (tx, rx) = mpsc::channel();
-        let forward = |mut stream: Box<dyn std::io::Read + Send>, tag: &'static str, tx: mpsc::Sender<String>| {
-            thread::spawn(move || {
-                for line in BufReader::new(&mut stream).lines() {
-                    match line {
-                        Ok(l) => {
-                            if tx.send(format!("[{tag}] {l}")).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-        };
-        forward(
-            Box::new(child.stdout.take().unwrap()),
-            "out",
-            tx.clone(),
-        );
-        forward(Box::new(child.stderr.take().unwrap()), "err", tx);
-        Node { child, lines: rx }
-    }
-
-    fn send(&mut self, text: &str) {
-        let stdin = self.child.stdin.as_mut().unwrap();
-        stdin.write_all(text.as_bytes()).unwrap();
-        stdin.write_all(b"\n").unwrap();
-        stdin.flush().unwrap();
-    }
-
-    fn wait_for(&self, needle: &str, timeout: Duration) -> String {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or(Duration::ZERO);
-            match self.lines.recv_timeout(remaining) {
-                Ok(line) => {
-                    println!("  | {line}");
-                    if line.contains(needle) {
-                        return line;
-                    }
-                }
-                Err(_) => panic!("等待 '{needle}' 超时"),
-            }
-        }
-    }
-
-    /// 等待可选出现：限时内出现返回 Some，否则 None（用于断言"不应出现"）
-    fn wait_for_optional(&self, needle: &str, timeout: Duration) -> Option<String> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or(Duration::ZERO);
-            match self.lines.recv_timeout(remaining) {
-                Ok(line) => {
-                    println!("  | {line}");
-                    if line.contains(needle) {
-                        return Some(line);
-                    }
-                }
-                Err(_) => return None,
-            }
-        }
-    }
-
-    fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn listen_addr(listen_line: &str) -> String {
-    listen_line
-        .split("监听地址: ")
-        .nth(1)
-        .expect("监听地址行格式不符")
-        .trim()
-        .to_string()
-}
-
-fn parse_peer_id(listen_line: &str) -> String {
-    listen_line
-        .split("/p2p/")
-        .nth(1)
-        .expect("监听地址行缺少 /p2p/ 段")
-        .trim()
-        .to_string()
-}
-
-/// LCG 伪随机字母数字串：长度 16~64，纯 ASCII（字符数==字节数），不引 rand 依赖
-fn random_msg(seed: u64) -> String {
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut state = seed
-        .wrapping_mul(6_364_136_223_846_793_005)
-        .wrapping_add(1_442_695_040_888_963_407);
-    let len = 16 + (state % 49) as usize;
-    (0..len)
-        .map(|_| {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            CHARSET[((state >> 33) as usize) % CHARSET.len()] as char
-        })
-        .collect()
-}
-
-/// e2e 固定身份助记词（BIP39 官方测试向量，同一助记词派生同一 PeerId，
-/// 保证场景确定性；仅测试用，勿用于生产）
-const MNEMONIC_USER1: &str =
-    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-const MNEMONIC_USER2: &str =
-    "legal winner thank year wave sausage worth useful legal winner thank yellow";
-const MNEMONIC_USER3: &str =
-    "ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic";
-const MNEMONIC_USER4: &str =
-    "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
-
-/// 从助记词恢复身份登录（r 路径）：喂 r → 助记词 → 四项资料 → 密码
-fn login_restore(node: &mut Node, creds: &Creds, mnemonic: &str) {
-    node.send("4");
-    node.send("r");
-    node.send(mnemonic);
-    node.send(&creds.name);
-    node.send(&creds.birthday);
-    node.send(&creds.gender);
-    node.send(&creds.password);
-    node.wait_for("登录成功: ", Duration::from_secs(30));
-}
-
-/// 缓存身份登录：进入聊天后选第一个缓存身份（每节点独立缓存目录，保证唯一）→ 只输密码
-fn login_cached(node: &mut Node, creds: &Creds) {
-    node.send("4");
-    node.send("1");
-    node.send(&creds.password);
-    node.wait_for("登录成功: ", Duration::from_secs(30));
-}
-
-/// 启动节点并登录进入聊天，返回 127.0.0.1 监听地址行（含 /p2p/ 节点ID）
-fn spawn_into_chat(bin: &str, cache_dir: &str, creds: &Creds, mnemonic: &str) -> (Node, String) {
-    let mut node = Node::spawn(bin, cache_dir);
-    node.wait_for("=== 主菜单 ===", Duration::from_secs(10));
-    login_restore(&mut node, creds, mnemonic);
-    let listen = node.wait_for("监听地址: /ip4/127.0.0.1", Duration::from_secs(20));
-    (node, listen)
-}
-
-/// 在已有节点上重新进入聊天（缓存解锁）
-fn enter_chat(node: &mut Node, creds: &Creds) -> String {
-    login_cached(node, creds);
-    node.wait_for("监听地址: /ip4/127.0.0.1", Duration::from_secs(20))
-}
+use std::time::Duration;
 
 /// 场景1：基础聊天——登录、连接、带名字的 Hello、双向收发、12 秒静默保活、Bye 优雅退出
 fn basic_chat_scenario() {
@@ -284,6 +33,7 @@ fn basic_chat_scenario() {
     println!("=== 上线通知（Hello 携带角色名）===");
     a.wait_for(&format!("对方已上线: {}", cred_b.name), WAIT);
     b.wait_for(&format!("对方已上线: {}", cred_a.name), WAIT);
+    wait_mutual_trust(&a, &cred_a.name, &b, &cred_b.name);
 
     println!("=== B -> A 发消息 ===");
     b.send("你好，我是节点B");
@@ -335,6 +85,7 @@ fn chat_by_name_scenario() {
     a.wait_for(&format!("已连接对端: {b_id}"), Duration::from_secs(40));
     b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
     b.wait_for(&format!("对方已上线: {}", cred_a.name), WAIT);
+    wait_mutual_trust(&a, &cred_a.name, &b, &cred_b.name);
 
     a.send("按名呼叫后的消息");
     b.wait_for("[对方] 按名呼叫后的消息", WAIT);
@@ -351,141 +102,6 @@ fn chat_by_name_scenario() {
         .parse()
         .expect("地址数不是数字");
     assert!(addr_n <= 4, "地址簿膨胀: 地址数 {addr_n} > 4");
-
-    a.kill();
-    b.kill();
-}
-
-/// 场景3：B 主动下线/上线循环，每轮发送 ≤64 字节随机消息
-fn graceful_offline_online_scenario() {
-    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
-    let cache_a = scenario_cache_dir("s3_a");
-    let cache_b = scenario_cache_dir("s3_b");
-    let (cred_a, cred_b) = load_creds();
-    println!("=== 场景3: 主动上下线循环 x{CYCLES_GRACEFUL} ===");
-
-    let (mut a, a_listen) = spawn_into_chat(bin, &cache_a, &cred_a, MNEMONIC_USER1);
-    let a_addr = listen_addr(&a_listen);
-    let a_id = parse_peer_id(&a_listen);
-
-    let mut b = Node::spawn(bin, &cache_b);
-    b.wait_for("=== 主菜单 ===", Duration::from_secs(10));
-
-    for i in 0..CYCLES_GRACEFUL {
-        println!("=== 第 {} 轮: 主动上线 ===", i + 1);
-        let b_listen = if i == 0 {
-            login_restore(&mut b, &cred_b, MNEMONIC_USER2);
-            b.wait_for("监听地址: /ip4/127.0.0.1", Duration::from_secs(20))
-        } else {
-            enter_chat(&mut b, &cred_b)
-        };
-        let b_id = parse_peer_id(&b_listen);
-        b.send(&format!("/dial {a_addr}"));
-        b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
-        a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
-
-        let msg = random_msg(i as u64 + 1);
-        assert!(msg.len() <= 64, "消息长度须 ≤64 字节");
-        println!("=== 第 {} 轮: 发送 {} 字节随机消息 ===", i + 1, msg.len());
-        b.send(&msg);
-        a.wait_for(&format!("[对方] {msg}"), WAIT);
-
-        println!("=== 第 {} 轮: 主动下线（/q）===", i + 1);
-        b.send("/q");
-        a.wait_for("对方已正常退出", WAIT);
-    }
-
-    a.kill();
-    b.kill();
-}
-
-/// 场景4：kill 进程模拟掉线（无 Bye），隔一段时间后重新上线
-fn kill_offline_online_scenario() {
-    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
-    let cache_a = scenario_cache_dir("s4_a");
-    let cache_b = scenario_cache_dir("s4_b");
-    let (cred_a, cred_b) = load_creds();
-    println!("=== 场景4: kill 掉线循环 x{CYCLES_KILL} ===");
-
-    let (mut a, a_listen) = spawn_into_chat(bin, &cache_a, &cred_a, MNEMONIC_USER1);
-    let a_addr = listen_addr(&a_listen);
-    let a_id = parse_peer_id(&a_listen);
-
-    for i in 0..CYCLES_KILL {
-        println!("=== 第 {} 轮: 上线 ===", i + 1);
-        let mut b = Node::spawn(bin, &cache_b);
-        b.wait_for("=== 主菜单 ===", Duration::from_secs(10));
-        login_restore(&mut b, &cred_b, MNEMONIC_USER2);
-        let b_listen = b.wait_for("监听地址: /ip4/127.0.0.1", Duration::from_secs(20));
-        let b_id = parse_peer_id(&b_listen);
-        b.send(&format!("/dial {a_addr}"));
-        b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
-        a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
-
-        let msg = random_msg(i as u64 + 101);
-        assert!(msg.len() <= 64, "消息长度须 ≤64 字节");
-        println!("=== 第 {} 轮: 发送 {} 字节随机消息 ===", i + 1, msg.len());
-        b.send(&msg);
-        a.wait_for(&format!("[对方] {msg}"), WAIT);
-
-        println!("=== 第 {} 轮: kill 进程模拟掉线 ===", i + 1);
-        b.kill();
-        a.wait_for("连接已关闭", WAIT);
-
-        println!("=== 隔 3 秒后重新上线 ===");
-        thread::sleep(Duration::from_secs(3));
-    }
-
-    a.kill();
-}
-
-/// 场景5：身份缓存回环——助记词恢复登录（自动加密保存）→ 退出重进 → 选缓存身份 + 只输密码
-/// （先故意输错验证密码校验）
-fn cache_login_scenario() {
-    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
-    let cache = scenario_cache_dir("s5");
-    let (cred_a, _cred_b) = load_creds();
-    println!("=== 场景5: 身份缓存回环 ===");
-
-    let mut a = Node::spawn(bin, &cache);
-    a.wait_for("=== 主菜单 ===", Duration::from_secs(10));
-    login_restore(&mut a, &cred_a, MNEMONIC_USER1);
-    a.wait_for("监听地址: /ip4/127.0.0.1", WAIT);
-
-    println!("=== 退出聊天后重新进入，走缓存登录 ===");
-    a.send("/q");
-    a.wait_for("=== 主菜单 ===", WAIT);
-    a.send("4");
-    a.wait_for("缓存身份:", WAIT);
-
-    println!("=== 先输错密码，验证校验 ===");
-    a.send("1");
-    a.send("wrong-password");
-    a.wait_for("密码错误", WAIT);
-
-    println!("=== 输正确密码（免姓名/生日/性别/助记词）===");
-    a.send(&cred_a.password);
-    a.wait_for("登录成功: ", WAIT);
-    a.wait_for("监听地址: /ip4/127.0.0.1", WAIT);
-
-    a.kill();
-}
-
-/// 场景6：同 ID 冲突——两节点同一助记词，后者登录必须被拒绝
-fn duplicate_id_scenario() {
-    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
-    let cache_a = scenario_cache_dir("s6_a");
-    let cache_b = scenario_cache_dir("s6_b");
-    let (cred_a, _cred_b) = load_creds();
-    println!("=== 场景6: 同 ID 冲突拒绝 ===");
-
-    let (mut a, _a_listen) = spawn_into_chat(bin, &cache_a, &cred_a, MNEMONIC_USER1);
-
-    println!("=== B 用同一助记词登录，必须被拒绝 ===");
-    let mut b = Node::spawn(bin, &cache_b);
-    b.wait_for("=== 主菜单 ===", Duration::from_secs(10));
-    login_restore(&mut b, &cred_a, MNEMONIC_USER1);
-    b.wait_for("该角色 ID 已在线", Duration::from_secs(30));
 
     a.kill();
     b.kill();
@@ -558,11 +174,13 @@ fn multi_session_scenario() {
     a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
     b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
     b.wait_for(&format!("对方已上线: {}", cred_a.name), WAIT);
+    wait_mutual_trust(&a, &cred_a.name, &b, &cred_b.name);
 
     c.send(&format!("/dial {a_addr}"));
     a.wait_for(&format!("已连接对端: {c_id}"), WAIT);
     c.wait_for(&format!("已连接对端: {a_id}"), WAIT);
     a.wait_for(&format!("对方已上线: {c_name}"), WAIT);
+    wait_mutual_trust(&a, &cred_a.name, &c, &cred_c.name);
 
     println!("=== A 聚焦 B：发消息 B 收 `[对方]` ===");
     a.send("hello B");
@@ -684,130 +302,6 @@ fn group_chat_scenario() {
     c.kill();
 }
 
-/// 场景10：应用任务卡在交互 await（/backup 密码提示未回答），传输任务须独立维持心跳，
-/// 连接不被心跳超时断开——这是三层架构（L1 传输任务）的核心验收点。
-fn app_blocked_heartbeat_still_alive_scenario() {
-    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
-    let cache_a = scenario_cache_dir("s10_a");
-    let cache_b = scenario_cache_dir("s10_b");
-    let (cred_a, cred_b) = load_creds();
-    println!("=== 场景10: 应用卡在密码交互，传输任务心跳仍存活 ===");
-
-    let (mut a, a_listen) = spawn_into_chat(bin, &cache_a, &cred_a, MNEMONIC_USER1);
-    let a_addr = listen_addr(&a_listen);
-    let a_id = parse_peer_id(&a_listen);
-
-    let (mut b, b_listen) = spawn_into_chat(bin, &cache_b, &cred_b, MNEMONIC_USER2);
-    let b_id = parse_peer_id(&b_listen);
-    b.send(&format!("/dial {a_addr}"));
-    a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
-    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
-
-    println!("=== A 触发 /backup 并故意不输密码 → 应用任务阻塞 ===");
-    a.send("/backup");
-    a.wait_for("请输入密码以解锁本身份", WAIT);
-
-    println!("=== 阻塞 17 秒（> 心跳超时 15s）：传输任务应保持 A-B 心跳 ===");
-    let timed_out = b
-        .wait_for_optional("心跳超时", Duration::from_secs(17))
-        .is_some();
-    assert!(!timed_out, "A 的传输任务被应用阻塞连累：B 判定 A 心跳超时");
-
-    println!("=== 补输密码解锁 A 应用任务 ===");
-    a.send(&cred_a.password);
-    a.wait_for("助记词是唯一备份", WAIT);
-
-    println!("=== 连接仍存活：A 发消息 B 收到 ===");
-    a.send("alive after app block");
-    b.wait_for("[对方] alive after app block", WAIT);
-
-    a.kill();
-    b.kill();
-}
-
-/// 场景11：群主离线禁止退群（单写者一致性，防名单发散/幽灵）+ 群主退群一步顺位转移 +
-/// 新群主能加人（群不冻结）
-fn owner_offline_leave_ban_and_transfer_scenario() {
-    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
-    let cache_a = scenario_cache_dir("s11_a");
-    let cache_b = scenario_cache_dir("s11_b");
-    let cache_c = scenario_cache_dir("s11_c");
-    let cache_d = scenario_cache_dir("s11_d");
-    let (cred_a, cred_b, cred_c, cred_d) = load_creds4();
-    let b_name = cred_b.name.clone();
-    let c_name = cred_c.name.clone();
-    let d_name = cred_d.name.clone();
-    let group = "testgrp";
-    println!("=== 场景11: 群主离线退群被拒 + 顺位转移 + 新群主加人 ===");
-
-    println!("=== 启动 A/B/C，A 建群加 B、C ===");
-    let (mut a, a_listen) = spawn_into_chat(bin, &cache_a, &cred_a, MNEMONIC_USER1);
-    let a_addr = listen_addr(&a_listen);
-    let a_id = parse_peer_id(&a_listen);
-    let (mut b, b_listen) = spawn_into_chat(bin, &cache_b, &cred_b, MNEMONIC_USER2);
-    let b_addr = listen_addr(&b_listen);
-    let b_id = parse_peer_id(&b_listen);
-    let (mut c, c_listen) = spawn_into_chat(bin, &cache_c, &cred_c, MNEMONIC_USER3);
-    let c_id = parse_peer_id(&c_listen);
-
-    b.send(&format!("/dial {a_addr}"));
-    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
-    c.send(&format!("/dial {a_addr}"));
-    c.wait_for(&format!("已连接对端: {a_id}"), WAIT);
-
-    a.send(&format!("/group new {group}"));
-    a.wait_for(&format!("已创建并聚焦群聊: {group}"), WAIT);
-    a.send(&format!("/group add {group} {b_name}"));
-    a.wait_for(&format!("已将 {b_name} 加入群"), WAIT);
-    b.wait_for(&format!("被邀请加入群聊: {group}"), WAIT);
-    a.send(&format!("/group add {group} {c_name}"));
-    a.wait_for(&format!("已将 {c_name} 加入群"), WAIT);
-    c.wait_for(&format!("被邀请加入群聊: {group}"), WAIT);
-
-    println!("=== 群主 A 离线：B 退群被拒（单写者一致性，防幽灵）===");
-    a.kill();
-    b.wait_for(&format!("连接已关闭: {a_id}"), WAIT);
-    b.send(&format!("/group leave {group}"));
-    b.wait_for("群主不在线，无法退群", WAIT);
-    b.send("/group list");
-    b.wait_for(&format!("{group}（3 人，名单版本 2"), WAIT);
-
-    println!("=== A 重新登录，B/C 重连 A ===");
-    let mut a = Node::spawn(bin, &cache_a);
-    a.wait_for("=== 主菜单 ===", Duration::from_secs(10));
-    let a_listen2 = enter_chat(&mut a, &cred_a);
-    let a_addr2 = listen_addr(&a_listen2);
-    b.send(&format!("/dial {a_addr2}"));
-    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
-    c.send(&format!("/dial {a_addr2}"));
-    c.wait_for(&format!("已连接对端: {a_id}"), WAIT);
-    a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
-    a.wait_for(&format!("已连接对端: {c_id}"), WAIT);
-
-    println!("=== A 退群：一步顺位转移给名单下一位 B ===");
-    a.send(&format!("/group leave {group}"));
-    a.wait_for(&format!("群主已顺位转移给 {b_name}"), WAIT);
-    b.wait_for("群主已转移给你，你已成为群主", WAIT);
-    c.wait_for("群主已顺位转移给", WAIT);
-
-    println!("=== 新群主 B 加人 D：群不再冻结 ===");
-    let (mut d, d_listen) = spawn_into_chat(bin, &cache_d, &cred_d, MNEMONIC_USER4);
-    let d_id = parse_peer_id(&d_listen);
-    d.send(&format!("/dial {b_addr}"));
-    d.wait_for(&format!("已连接对端: {b_id}"), WAIT);
-    b.wait_for(&format!("已连接对端: {d_id}"), WAIT);
-    b.wait_for(&format!("对方已上线: {d_name}"), WAIT);
-    b.send(&format!("/group add {group} {d_name}"));
-    b.wait_for(&format!("已将 {d_name} 加入群 {group}（名单版本 4"), WAIT);
-    d.wait_for(&format!("被邀请加入群聊: {group}"), WAIT);
-    c.wait_for(&format!("成员名单已更新（版本 4"), WAIT);
-
-    a.kill();
-    b.kill();
-    c.kill();
-    d.kill();
-}
-
 /// 场景12：1v1 信任管理——取消信任真正生效（/list 徽标 + 群加人门控）、重新信任显示指纹复核（D4）、
 /// 联系人名解析（重启后无会话仍能按联系人名 /trust /chat）
 fn trust_management_and_contact_name_resolution_scenario() {
@@ -864,7 +358,65 @@ fn trust_management_and_contact_name_resolution_scenario() {
     b.kill();
 }
 
-/// 场景13：文件传输——A 发送文件给已信任联系人 B，B 落盘并校验内容一致
+/// 场景14：对称信任——互信才能收发；任一方取消信任 → 双向丢弃（对称门控）；重新信任恢复。
+/// 管道模式 hello 自动互信，故基线直接可收发。
+fn symmetric_trust_scenario() {
+    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache_a = scenario_cache_dir("st_a");
+    let cache_b = scenario_cache_dir("st_b");
+    let (cred_a, cred_b) = load_creds();
+    let a_name = cred_a.name.clone();
+    let b_name = cred_b.name.clone();
+    println!("=== 场景14: 对称信任（互信收发 / 单方取消双向断 / 恢复）===");
+
+    let (mut a, a_listen) = spawn_into_chat(bin, &cache_a, &cred_a, MNEMONIC_USER1);
+    let a_addr = listen_addr(&a_listen);
+    let a_id = parse_peer_id(&a_listen);
+    let (mut b, b_listen) = spawn_into_chat(bin, &cache_b, &cred_b, MNEMONIC_USER2);
+    let b_id = parse_peer_id(&b_listen);
+    b.send(&format!("/dial {a_addr}"));
+    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+    a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
+
+    println!("=== 基线：双方互信信号就绪后双向收发 ===");
+    a.wait_for(&format!("对方已信任你: {b_name}"), WAIT);
+    b.wait_for(&format!("对方已信任你: {a_name}"), WAIT);
+    a.send("mutual ok");
+    b.wait_for("[对方] mutual ok", WAIT);
+    b.send("mutual back");
+    a.wait_for("[对方] mutual back", WAIT);
+
+    println!("=== B 取消信任 A：A 收到 revoke，双向消息应被丢弃 ===");
+    b.send(&format!("/trust !{a_name}"));
+    b.wait_for(&format!("已取消信任: {a_name}"), WAIT);
+    a.wait_for(&format!("对方已取消信任: {b_name}"), WAIT);
+
+    println!("=== A 发消息：B 应丢弃（不显示）===");
+    a.send("should be dropped on B");
+    let dropped_b = b
+        .wait_for_optional("should be dropped on B", Duration::from_secs(5))
+        .is_none();
+    assert!(dropped_b, "B 不应收到 A 未互信的消息");
+
+    println!("=== B 发消息：A 也应丢弃（对称）===");
+    b.send("should be dropped on A");
+    let dropped_a = a
+        .wait_for_optional("should be dropped on A", Duration::from_secs(5))
+        .is_none();
+    assert!(dropped_a, "A 不应收到 B 未互信的消息");
+
+    println!("=== B 重新信任 A：A 收到 confirm，双向收发恢复 ===");
+    b.send(&format!("/trust {a_name}"));
+    b.wait_for(&format!("已信任: {a_name}"), WAIT);
+    a.wait_for(&format!("对方已信任你: {b_name}"), WAIT);
+    a.send("restored after retrust");
+    b.wait_for("[对方] restored after retrust", WAIT);
+
+    a.kill();
+    b.kill();
+}
+
+/// 场景13：文件传输——A 发送文件给已互信联系人 B，B 落盘并校验内容一致
 fn file_transfer_scenario() {
     let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
     let cache_a = scenario_cache_dir("s13_a");
@@ -901,6 +453,7 @@ fn file_transfer_scenario() {
     b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
     a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
     a.wait_for(&format!("对方已上线: {b_name}"), WAIT);
+    wait_mutual_trust(&a, &cred_a.name, &b, &cred_b.name);
 
     println!("=== A 发送文件给 B（B 管道模式自动接受）===");
     a.send(&format!("/send {b_name} {}", src.display()));
@@ -920,38 +473,6 @@ fn file_transfer_scenario() {
     let _ = std::fs::remove_file(&final_path);
     a.kill();
     b.kill();
-}
-
-/// 独立文件传输测试（不加入 suite，单独运行隔离验证）
-#[test]
-fn standalone_file_transfer() {
-    file_transfer_scenario();
-}
-
-/// 在节点输出流中等待第一条「全局 IPv6 监听地址」行（跳过 ::1 回环 / fe80 链路本地），
-/// 超时返回 None。复用 recv_timeout 循环（不 panic，供"无全局 IPv6 则跳过"判定）。
-fn wait_global_ipv6_listen(node: &Node, timeout: Duration) -> Option<String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or(Duration::ZERO);
-        match node.lines.recv_timeout(remaining) {
-            Ok(line) => {
-                println!("  | {line}");
-                let Some(addr) = line.split("监听地址: ").nth(1).map(|s| s.trim()) else {
-                    continue;
-                };
-                let is_global_v6 = addr.starts_with("/ip6/")
-                    && !addr.starts_with("/ip6/::1")
-                    && !addr.starts_with("/ip6/fe80");
-                if is_global_v6 {
-                    return Some(line);
-                }
-            }
-            Err(_) => return None,
-        }
-    }
 }
 
 /// 场景：同机跑多个实例，用 IPv6 自连不同 PeerId——
@@ -979,6 +500,7 @@ fn ipv6_loopback_and_global_scenario() {
     let b_loop = format!("/ip6/::1/tcp/{b_port}/p2p/{b_id}");
     a.send(&format!("/dial {b_loop}"));
     a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
+    wait_mutual_trust(&a, &cred_a.name, &b, &cred_b.name);
     a.send("IPv6 回环自连测试消息");
     b.wait_for("[对方] IPv6 回环自连测试消息", WAIT);
     println!("=== Part 1 通过 ===");
@@ -993,6 +515,7 @@ fn ipv6_loopback_and_global_scenario() {
         c.send(&format!("/dial {b_global}"));
         // 防火墙 drop 会让 TCP 长时间超时，等待放宽到 35s
         c.wait_for(&format!("已连接对端: {b_id}"), Duration::from_secs(35));
+        wait_mutual_trust(&c, &cred_c.name, &b, &cred_b.name);
         c.send("IPv6 全局地址自连测试消息");
         // B 焦点仍在 A（Part 1），C 的来信为非焦点格式 `[名字] 消息`，按内容匹配即可
         b.wait_for("IPv6 全局地址自连测试消息", WAIT);
@@ -1006,23 +529,10 @@ fn ipv6_loopback_and_global_scenario() {
     b.kill();
 }
 
-/// 从监听地址行提取 TCP 端口（v4/v6 监听复用同一端口）
-fn listen_port(listen_line: &str) -> String {
-    listen_line
-        .split("/tcp/")
-        .nth(1)
-        .and_then(|s| s.split('/').next())
-        .expect("监听地址行缺少端口")
-        .to_string()
-}
-
-/// 以 P2P_DISCOVERY=off 启动节点并恢复身份登录（同机多实例互测专用，防 mDNS 干扰）
-fn spawn_chat_off(bin: &str, cache_dir: &str, creds: &Creds, mnemonic: &str) -> (Node, String) {
-    let mut node = Node::spawn_with(bin, cache_dir, "off");
-    node.wait_for("=== 主菜单 ===", Duration::from_secs(10));
-    login_restore(&mut node, creds, mnemonic);
-    let listen = node.wait_for("监听地址: /ip4/127.0.0.1", Duration::from_secs(20));
-    (node, listen)
+/// 独立文件传输测试（不加入 suite，单独运行隔离验证）
+#[test]
+fn standalone_file_transfer() {
+    file_transfer_scenario();
 }
 
 /// 独立 IPv6 自连测试（不加入串行 suite，单独运行隔离验证）。
@@ -1033,20 +543,15 @@ fn standalone_ipv6_connect() {
     ipv6_loopback_and_global_scenario();
 }
 
+/// 逻辑测试串行 suite：功能正确性场景。若拆成并行 #[test]，同机 mDNS 会跨测试互相发现。
 #[test]
-fn p2p_chat_e2e_suite() {
-    // 十三场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
+fn p2p_chat_logic_suite() {
     basic_chat_scenario();
     chat_by_name_scenario();
-    graceful_offline_online_scenario();
-    kill_offline_online_scenario();
-    cache_login_scenario();
-    duplicate_id_scenario();
     discovery_mode_scenario();
     multi_session_scenario();
     group_chat_scenario();
-    app_blocked_heartbeat_still_alive_scenario();
-    owner_offline_leave_ban_and_transfer_scenario();
     trust_management_and_contact_name_resolution_scenario();
+    symmetric_trust_scenario();
     file_transfer_scenario();
 }

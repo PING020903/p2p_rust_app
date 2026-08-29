@@ -102,6 +102,23 @@ impl IdentityService {
         self.contacts.set_verified(peer, verified);
     }
 
+    /// 对方是否信任我（经 L2 trust.confirm/revoke 信号学习）
+    pub fn their_trust(&self, peer: &PeerId) -> bool {
+        self.contacts.their_trust(&peer.to_string())
+    }
+
+    /// 有效信任：互信才算数（我信任对方 且 对方信任我）——对称信任判定根 API
+    pub fn effective_trusted(&self, peer: &PeerId) -> bool {
+        self.contacts.effective_trusted(&peer.to_string())
+    }
+
+    /// L2 信任信号处理（trust.confirm=true / trust.revoke=false）：
+    /// 对端告知"我信任你/我取消信任你"，更新 their_trust 并登记联系人。
+    pub fn on_peer_trust_signal(&mut self, peer: &PeerId, name: &str, trusted: bool) {
+        self.contacts.ensure_contact(peer, name, false);
+        self.contacts.set_their_trust(peer, trusted);
+    }
+
     /// 按联系人名反查 peer（允许重名时取第一个；用于 /trust /chat 等按名解析）
     pub fn contact_by_name(&self, name: &str) -> Option<PeerId> {
         self.contacts
