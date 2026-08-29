@@ -928,6 +928,111 @@ fn standalone_file_transfer() {
     file_transfer_scenario();
 }
 
+/// 在节点输出流中等待第一条「全局 IPv6 监听地址」行（跳过 ::1 回环 / fe80 链路本地），
+/// 超时返回 None。复用 recv_timeout 循环（不 panic，供"无全局 IPv6 则跳过"判定）。
+fn wait_global_ipv6_listen(node: &Node, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO);
+        match node.lines.recv_timeout(remaining) {
+            Ok(line) => {
+                println!("  | {line}");
+                let Some(addr) = line.split("监听地址: ").nth(1).map(|s| s.trim()) else {
+                    continue;
+                };
+                let is_global_v6 = addr.starts_with("/ip6/")
+                    && !addr.starts_with("/ip6/::1")
+                    && !addr.starts_with("/ip6/fe80");
+                if is_global_v6 {
+                    return Some(line);
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// 场景：同机跑多个实例，用 IPv6 自连不同 PeerId——
+/// Part 1 走 `::1` 回环（验证 IPv6 拨号代码路径，不受防火墙影响）；
+/// Part 2 走本机全局 IPv6（验证真实网卡 + Windows 防火墙 + NDP 环回）。
+/// 不作为串行 suite 场景（suite 已较长），由 standalone_ipv6_connect 单独运行。
+fn ipv6_loopback_and_global_scenario() {
+    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache_a = scenario_cache_dir("v6_a");
+    let cache_b = scenario_cache_dir("v6_b");
+    let cache_c = scenario_cache_dir("v6_c");
+    let (cred_a, cred_b, cred_c) = load_creds3();
+    println!("=== 场景: IPv6 自连（::1 回环 + 全局地址）===");
+
+    println!("=== 启动节点 A / B（P2P_DISCOVERY=off，防同机 mDNS 自动互连）===");
+    let (mut a, _) = spawn_chat_off(bin, &cache_a, &cred_a, MNEMONIC_USER1);
+    let (mut b, b_listen) = spawn_chat_off(bin, &cache_b, &cred_b, MNEMONIC_USER2);
+    let b_id = parse_peer_id(&b_listen);
+    let b_port = listen_port(&b_listen);
+    // 先抓取全局 IPv6 监听行（ip6 全局行在 B 后续输出被消费前出现），供 Part 2 用
+    let global_line = wait_global_ipv6_listen(&b, Duration::from_secs(20));
+
+    // Part 1：A 经 ::1 拨 B（v4/v6 监听同端口，::1 地址由端口构造，无需等 ::1 输出行）
+    println!("=== Part 1: A 经 ::1 拨 B ===");
+    let b_loop = format!("/ip6/::1/tcp/{b_port}/p2p/{b_id}");
+    a.send(&format!("/dial {b_loop}"));
+    a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
+    a.send("IPv6 回环自连测试消息");
+    b.wait_for("[对方] IPv6 回环自连测试消息", WAIT);
+    println!("=== Part 1 通过 ===");
+
+    // Part 2：C 经全局 IPv6 拨 B（真实网卡 + 防火墙）
+    if std::env::var("P2P_E2E_SKIP_GLOBAL_IPV6").is_ok() {
+        println!("=== 环境变量 P2P_E2E_SKIP_GLOBAL_IPV6 已设，跳过全局 IPv6 部分 ===");
+    } else if let Some(g) = global_line {
+        let b_global = listen_addr(&g);
+        println!("=== Part 2: C 经全局 IPv6 拨 B（{b_global}）===");
+        let (mut c, _) = spawn_chat_off(bin, &cache_c, &cred_c, MNEMONIC_USER3);
+        c.send(&format!("/dial {b_global}"));
+        // 防火墙 drop 会让 TCP 长时间超时，等待放宽到 35s
+        c.wait_for(&format!("已连接对端: {b_id}"), Duration::from_secs(35));
+        c.send("IPv6 全局地址自连测试消息");
+        // B 焦点仍在 A（Part 1），C 的来信为非焦点格式 `[名字] 消息`，按内容匹配即可
+        b.wait_for("IPv6 全局地址自连测试消息", WAIT);
+        println!("=== Part 2 通过 ===");
+        c.kill();
+    } else {
+        println!("=== 本机无全局 IPv6 地址，跳过全局 IPv6 部分 ===");
+    }
+
+    a.kill();
+    b.kill();
+}
+
+/// 从监听地址行提取 TCP 端口（v4/v6 监听复用同一端口）
+fn listen_port(listen_line: &str) -> String {
+    listen_line
+        .split("/tcp/")
+        .nth(1)
+        .and_then(|s| s.split('/').next())
+        .expect("监听地址行缺少端口")
+        .to_string()
+}
+
+/// 以 P2P_DISCOVERY=off 启动节点并恢复身份登录（同机多实例互测专用，防 mDNS 干扰）
+fn spawn_chat_off(bin: &str, cache_dir: &str, creds: &Creds, mnemonic: &str) -> (Node, String) {
+    let mut node = Node::spawn_with(bin, cache_dir, "off");
+    node.wait_for("=== 主菜单 ===", Duration::from_secs(10));
+    login_restore(&mut node, creds, mnemonic);
+    let listen = node.wait_for("监听地址: /ip4/127.0.0.1", Duration::from_secs(20));
+    (node, listen)
+}
+
+/// 独立 IPv6 自连测试（不加入串行 suite，单独运行隔离验证）。
+/// 前置：Windows 防火墙需放行 p2p_rust_app 入站，否则全局 IPv6 部分会失败
+/// （`netsh advfirewall firewall add rule ...`），::1 回环部分不受防火墙影响。
+#[test]
+fn standalone_ipv6_connect() {
+    ipv6_loopback_and_global_scenario();
+}
+
 #[test]
 fn p2p_chat_e2e_suite() {
     // 十三场景串行：若拆成并行 #[test]，同机 mDNS 会跨测试互相发现导致连错对象
