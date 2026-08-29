@@ -18,7 +18,7 @@ use libp2p::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
-use std::net::Ipv6Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
@@ -618,7 +618,10 @@ fn dial_next_reconnect(
                 None => return,
             };
             *reconnect_peer = Some(p);
-            *pending = known_addrs.get(&p).cloned().unwrap_or_default();
+            // 已知地址 + 末尾追加本地回环候选（ip4/ip6 失败后兜底尝试"对方在本机但局域网入站被挡"）
+            let mut addrs = known_addrs.get(&p).cloned().unwrap_or_default();
+            addrs.extend(loopback_candidates(&addrs, &p));
+            *pending = addrs;
         }
         let target = reconnect_peer.as_ref().unwrap().clone();
         while let Some(ma) = pending.pop() {
@@ -636,6 +639,35 @@ fn dial_next_reconnect(
     }
 }
 
+/// 从已知地址派生本地回环候选（`127.0.0.1:<端口>` 与 `[::1]:<端口>`，各带 `/p2p/<peer>`），
+/// 去重；供"对方在本机但局域网 IP 入站被挡"时兜底尝试。
+/// 安全：Noise 握手校验 `/p2p/<peerid>`，即便回环端口被别的本地进程占用也不会连错人。
+fn loopback_candidates(addrs: &[Multiaddr], peer: &PeerId) -> Vec<Multiaddr> {
+    let mut out: Vec<Multiaddr> = Vec::new();
+    for a in addrs {
+        let Some(port) = a.iter().find_map(|p| match p {
+            Protocol::Tcp(pt) => Some(pt),
+            _ => None,
+        }) else {
+            continue;
+        };
+        for host in [false, true] {
+            let mut ma = Multiaddr::empty();
+            if host {
+                ma.push(Protocol::Ip6(Ipv6Addr::LOCALHOST));
+            } else {
+                ma.push(Protocol::Ip4(Ipv4Addr::LOCALHOST));
+            }
+            ma.push(Protocol::Tcp(port));
+            ma.push(Protocol::P2p(*peer));
+            if !out.contains(&ma) {
+                out.push(ma);
+            }
+        }
+    }
+    out
+}
+
 /// multiaddr 是否为全局 IPv6 直连地址（跨城市可分享；排除回环/链路本地/ULA）
 /// 判定：首个 hextet 属于 2000::/3（全局单播），排除 fe80 链路本地、fc00 ULA、ffff 组播
 pub fn is_global_ipv6_listen(addr: &Multiaddr) -> bool {
@@ -643,4 +675,52 @@ pub fn is_global_ipv6_listen(addr: &Multiaddr) -> bool {
         Protocol::Ip6(ip) => (ip.segments()[0] & 0xe000) == 0x2000,
         _ => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr_v4(port: u16, peer: &PeerId) -> Multiaddr {
+        let mut ma = Multiaddr::empty();
+        ma.push(Protocol::Ip4(Ipv4Addr::new(192, 168, 1, 46)));
+        ma.push(Protocol::Tcp(port));
+        ma.push(Protocol::P2p(*peer));
+        ma
+    }
+
+    /// 回环候选派生：同端口保留 + /p2p/<peer> + 127.0.0.1/::1 双地址 + 去重
+    #[test]
+    fn loopback_candidates_derive_v4_and_v6_with_dedup() {
+        let peer = PeerId::random();
+        let a = addr_v4(9736, &peer);
+        let mut b = Multiaddr::empty(); // 不同 IP、同端口 → 回环候选相同，应去重
+        b.push(Protocol::Ip4(Ipv4Addr::new(10, 0, 0, 1)));
+        b.push(Protocol::Tcp(9736));
+        b.push(Protocol::P2p(peer));
+        let cands = loopback_candidates(&[a, b], &peer);
+
+        let mut expect_v4 = Multiaddr::empty();
+        expect_v4.push(Protocol::Ip4(Ipv4Addr::LOCALHOST));
+        expect_v4.push(Protocol::Tcp(9736));
+        expect_v4.push(Protocol::P2p(peer));
+        let mut expect_v6 = Multiaddr::empty();
+        expect_v6.push(Protocol::Ip6(Ipv6Addr::LOCALHOST));
+        expect_v6.push(Protocol::Tcp(9736));
+        expect_v6.push(Protocol::P2p(peer));
+
+        assert!(cands.contains(&expect_v4), "应含 127.0.0.1:9736/p2p/<peer>");
+        assert!(cands.contains(&expect_v6), "应含 [::1]:9736/p2p/<peer>");
+        assert_eq!(cands.len(), 2, "两条同端口地址应去重为 2 个回环候选");
+    }
+
+    /// 无 TCP 段的地址不产生回环候选
+    #[test]
+    fn loopback_candidates_skip_addr_without_tcp() {
+        let peer = PeerId::random();
+        let mut ma = Multiaddr::empty();
+        ma.push(Protocol::Ip4(Ipv4Addr::new(192, 168, 1, 46)));
+        ma.push(Protocol::P2p(peer));
+        assert!(loopback_candidates(&[ma], &peer).is_empty());
+    }
 }
