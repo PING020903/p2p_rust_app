@@ -5,11 +5,108 @@
 //! 经一个适配任务在 L3 通道与 L1 通道之间翻译——L3 永远不碰 L1 的线缆帧。
 
 use libp2p::{identity::Keypair, Multiaddr, PeerId};
+use std::collections::HashMap;
 use std::error::Error;
+use std::future::Future;
+use std::pin::Pin;
 use tokio::sync::{mpsc, oneshot};
 
 use super::node::{Frame, P2pCommand, P2pEvent, P2pNode};
 pub use super::node::{is_global_ipv6_listen, BYE_HANDSHAKE_TIMEOUT};
+
+/// 语义信号处理器（async）：处理一个信号（`Event::Signal` 的 tag）的 payload 负载。
+/// `'borrow` 是 handler 调用时的借用生命周期，`'ctx` 是上下文（C::Ctx）内部引用的生命周期。
+/// 返回是否成功处理（未注册/解析失败返回 false）。
+/// 上下文经 `SignalCtx` 的 GAT 暴露带生命周期的具体类型（本项目为 `AppCtx<'a>`），
+/// 使注册表可泛化于上下文而不把其生命周期钉死在注册表类型上。
+pub type SignalHandler<C: SignalCtx> = Box<
+    dyn for<'borrow, 'ctx> FnMut(
+            &'borrow mut C::Ctx<'ctx>,
+            &'borrow PeerId,
+            Option<&'borrow [u8]>,
+        ) -> Pin<Box<dyn Future<Output = bool> + 'borrow>>,
+>;
+
+/// 上下文提供者：把带生命周期的上下文类型暴露为 GAT，供 handler 对任意借用/上下文生命周期泛化
+pub trait SignalCtx {
+    type Ctx<'a>;
+}
+
+/// 语义注册表：tag → async handler（查表分发，无业务 match）。
+/// 另维护**未互信钩子**表（按 tag）：业务信号来自未互信对端时，走该 tag 的钩子；
+/// 未注册钩子的 tag 默认执行空函数（丢弃——payload 无人引用，自然回收）。
+pub struct SignalRegistry<C: SignalCtx> {
+    handlers: HashMap<String, SignalHandler<C>>,
+    untrusted: HashMap<String, SignalHandler<C>>,
+}
+
+impl<C: SignalCtx> SignalRegistry<C> {
+    pub fn new() -> Self {
+        SignalRegistry {
+            handlers: HashMap::new(),
+            untrusted: HashMap::new(),
+        }
+    }
+
+    /// 注册业务信号 handler（互信 / L2 内化信号路径）
+    pub fn register<H>(&mut self, tag: &str, handler: H)
+    where
+        H: for<'borrow, 'ctx> FnMut(
+                &'borrow mut C::Ctx<'ctx>,
+                &'borrow PeerId,
+                Option<&'borrow [u8]>,
+            ) -> Pin<Box<dyn Future<Output = bool> + 'borrow>>
+            + 'static,
+    {
+        self.handlers.insert(tag.to_string(), Box::new(handler));
+    }
+
+    /// L2 提供给 L3 的 API：按 tag 注册"未互信业务信号"的兜底处理（async，与应用 handler 同签名）。
+    /// 不注册的 tag 默认空函数 = 丢弃。
+    pub fn register_untrusted<H>(&mut self, tag: &str, handler: H)
+    where
+        H: for<'borrow, 'ctx> FnMut(
+                &'borrow mut C::Ctx<'ctx>,
+                &'borrow PeerId,
+                Option<&'borrow [u8]>,
+            ) -> Pin<Box<dyn Future<Output = bool> + 'borrow>>
+            + 'static,
+    {
+        self.untrusted.insert(tag.to_string(), Box::new(handler));
+    }
+
+    /// 按标签分发并 await handler；未注册的 tag 返回 false
+    pub async fn dispatch(
+        &mut self,
+        tag: &str,
+        from: &PeerId,
+        payload: Option<&[u8]>,
+        ctx: &mut C::Ctx<'_>,
+    ) -> bool {
+        match self.handlers.get_mut(tag) {
+            Some(h) => {
+                let fut = h(ctx, from, payload);
+                fut.await
+            }
+            None => false,
+        }
+    }
+
+    /// 未互信业务信号：调该 tag 注册的未互信钩子；未注册则空操作（丢弃）
+    pub async fn handle_untrusted(
+        &mut self,
+        tag: &str,
+        from: &PeerId,
+        payload: Option<&[u8]>,
+        ctx: &mut C::Ctx<'_>,
+    ) {
+        if let Some(h) = self.untrusted.get_mut(tag) {
+            let fut = h(ctx, from, payload);
+            let _ = fut.await;
+        }
+    }
+}
+
 
 /// L3 → L1 的命令（高层语义；L1 的 Frame 由本层组装）
 #[derive(Debug)]
@@ -147,5 +244,48 @@ fn to_l2(ev: P2pEvent) -> Option<Event> {
         }
         P2pEvent::Gossip { source, data } => Some(Event::Gossip { source, data }),
         P2pEvent::SendFailure { peer, error } => Some(Event::SendFailure { peer, error }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl SignalCtx for () {
+        type Ctx<'a> = ();
+    }
+
+    /// 未互信钩子路由：注册了钩子的 tag 走钩子；未注册的 tag 默认空函数（丢弃，无副作用）
+    #[tokio::test]
+    async fn registry_routes_normal_vs_untrusted() {
+        let normal_hits = std::rc::Rc::new(std::cell::Cell::new(0));
+        let untrusted_hits = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut reg: SignalRegistry<()> = SignalRegistry::new();
+
+        let nh = normal_hits.clone();
+        reg.register("chat.text", move |_: &mut (), _: &PeerId, _: Option<&[u8]>| {
+            nh.set(nh.get() + 1);
+            Box::pin(async { true })
+        });
+        let uh = untrusted_hits.clone();
+        reg.register_untrusted("chat.text", move |_: &mut (), _: &PeerId, _: Option<&[u8]>| {
+            uh.set(uh.get() + 1);
+            Box::pin(async { true })
+        });
+
+        let pid = PeerId::random();
+        // 互信/内化路径走正常 handler
+        let handled = reg.dispatch("chat.text", &pid, None, &mut ()).await;
+        assert!(handled);
+        assert_eq!(normal_hits.get(), 1);
+        assert_eq!(untrusted_hits.get(), 0);
+        // 未互信路径走该 tag 的钩子
+        reg.handle_untrusted("chat.text", &pid, None, &mut ()).await;
+        assert_eq!(normal_hits.get(), 1);
+        assert_eq!(untrusted_hits.get(), 1);
+        // 未注册钩子的 tag：空函数 = 丢弃（无副作用）
+        reg.handle_untrusted("file.offer", &pid, None, &mut ()).await;
+        assert_eq!(untrusted_hits.get(), 1);
+        assert_eq!(normal_hits.get(), 1);
     }
 }

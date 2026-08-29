@@ -13,7 +13,7 @@ use tokio::io::AsyncBufReadExt;
 use crate::cmd_tree::{CmdError, CmdTree, ROOT};
 use crate::p2p::{cache_dir, load_discovery_mode, save_discovery_mode, save_download_dir, DiscoveryMode};
 use crate::p2p::identity_service::{is_l2_signal, IdentityService, StdinLines, TextTag};
-use crate::p2p::seam::{self, is_global_ipv6_listen, Event, BYE_HANDSHAKE_TIMEOUT};
+use crate::p2p::seam::{self, is_global_ipv6_listen, Event, SignalRegistry, BYE_HANDSHAKE_TIMEOUT};
 
 // ---- 语义注册表（L3 应用层）：text=Custom(tag) 承载协议语义，binary 承载负载 ----
 //
@@ -183,71 +183,21 @@ fn print_listen_addrs(addrs: &[Multiaddr], peer_id: &PeerId) {
     }
 }
 
-/// 语义信号处理器（async）：处理一个信号（seam::Event::Signal 的 tag）的 payload 负载。
-/// `'borrow` 是 handler 调用时的借用生命周期，`'ctx` 是 AppCtx 内部引用的生命周期。
-/// 返回是否成功处理（未注册/解析失败返回 false）。
-type SignalHandler = Box<
-    dyn for<'borrow, 'ctx> FnMut(
-            &'borrow mut AppCtx<'ctx>,
-            &'borrow PeerId,
-            Option<&'borrow [u8]>,
-        ) -> Pin<Box<dyn Future<Output = bool> + 'borrow>>,
->;
-
-/// 语义注册表：tag → async handler，按标签分发（查表，无 match）。
-/// L2 注册存在语义（hello/bye），L3 应用注册自定义语义（chat.* / file.*）。
-struct SignalRegistry {
-    handlers: HashMap<String, SignalHandler>,
-}
-
-impl SignalRegistry {
-    fn new() -> Self {
-        SignalRegistry {
-            handlers: HashMap::new(),
-        }
-    }
-
-    fn register<H>(&mut self, tag: &str, handler: H)
-    where
-        H: for<'borrow, 'ctx> FnMut(
-                &'borrow mut AppCtx<'ctx>,
-                &'borrow PeerId,
-                Option<&'borrow [u8]>,
-            ) -> Pin<Box<dyn Future<Output = bool> + 'borrow>>
-            + 'static,
-    {
-        self.handlers.insert(tag.to_string(), Box::new(handler));
-    }
-
-    /// 按标签分发并 await handler；未注册的 tag 返回 false
-    async fn dispatch(
-        &mut self,
-        tag: &str,
-        from: &PeerId,
-        payload: Option<&[u8]>,
-        ctx: &mut AppCtx<'_>,
-    ) -> bool {
-        match self.handlers.get_mut(tag) {
-            Some(h) => {
-                let fut = h(ctx, from, payload);
-                fut.await
-            }
-            None => false,
-        }
-    }
-}
-
 /// 事件处理上下文：收到 seam::Event::Signal 时一次性构造，供语义 handler 读写。
 /// handler 是 async 的，可直接 await（TOFU 读输入 / 发命令）。
 pub(crate) struct AppCtx<'a> {
     identity: &'a mut IdentityService,
     conversations: &'a mut HashMap<PeerId, Conversation>,
     groups: &'a mut HashMap<String, Group>,
-    focused: &'a mut Option<PeerId>,
-    pub(crate) stdin: &'a mut StdinLines,
+    focused: &'a mut Option<PeerId>,    pub(crate) stdin: &'a mut StdinLines,
     pub(crate) interactive: bool,
     pub(crate) cmd_tx: &'a tokio::sync::mpsc::Sender<seam::Cmd>,
     pub(crate) file: &'a mut crate::file_transfer::FileTransferState,
+}
+
+/// 让 `AppCtx<'a>` 作为 L2 `SignalRegistry` 的上下文：GAT 暴露其带生命周期的类型
+impl seam::SignalCtx for AppCtx<'_> {
+    type Ctx<'a> = AppCtx<'a>;
 }
 
 // ---- chat 业务语义 handler（注册到 SignalRegistry）----
@@ -1636,9 +1586,9 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
     let mut connected: HashSet<PeerId> = HashSet::new();
     let mut registered: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
 
-    // 语义注册表：L2 存在语义（hello/bye/trust 内化 text）+ L3 chat 业务 handler。
+    // 语义注册表（L2 seam 提供）：L2 存在语义（hello/bye/trust 内化 text）+ L3 chat 业务 handler。
     // 收到信号 tag 即查表分发（无 match）。L2 内化信号用 TextTag 常量注册（L3 不触碰）。
-    let mut registry = SignalRegistry::new();
+    let mut registry: SignalRegistry<AppCtx<'static>> = SignalRegistry::new();
     registry.register(TextTag::Hello.as_str(), |ctx, from, payload| {
         Box::pin(on_peer_hello_signal(ctx, from, payload))
     });
@@ -1961,8 +1911,22 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                 // await 注册的 handler（hello/bye/trust 由 L2 内化语义映射 + L3 钩子；
                                 // chat.* 由 chat 业务 handler 处理）。
                                 // L2 门禁（唯一收口）：内化信号（hello/bye/trust）一律放行；
-                                // 业务信号（chat.*/file.*）须互信，否则整帧丢弃
+                                // 业务信号（chat.*/file.*）须互信，否则走该 tag 的未互信钩子
+                                // （L2 API `register_untrusted`；未注册 = 空函数 = 丢弃）
                                 if !is_l2_signal(&tag) && !identity.effective_trusted(&from) {
+                                    let mut actx = AppCtx {
+                                        identity: &mut identity,
+                                        conversations: &mut conversations,
+                                        groups: &mut groups,
+                                        focused: &mut focused,
+                                        stdin: &mut stdin,
+                                        interactive,
+                                        cmd_tx: &cmd_tx,
+                                        file: &mut file_state,
+                                    };
+                                    registry
+                                        .handle_untrusted(&tag, &from, payload.as_deref(), &mut actx)
+                                        .await;
                                     continue;
                                 }
                                 let mut actx = AppCtx {

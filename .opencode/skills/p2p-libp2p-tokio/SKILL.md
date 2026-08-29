@@ -113,8 +113,9 @@ tokio::select! {
 **`Frame` 三通道**：`control`（L1 心跳等传输控制）/ `text`（协议语义**标签**）/
 `binary`（该标签的 cbor 负载）。L1 对 text/binary 内容不解释，只透传。
 
-**注册与分发**：`SignalRegistry`（chat.rs）维护 `tag → async handler` 表（HashMap 查表，
-**无业务 match**），收到 `frame.text` 查表分发。构造负载帧用 `custom_frame(tag, cbor(payload))`。
+**注册与分发**：`SignalRegistry<C>`（在 `seam.rs`，L2，经 `SignalCtx` GAT 泛化上下文，本项目 `C=AppCtx<'static>`）维护
+`tag → async handler` 表（HashMap 查表，**无业务 match**），收到 `Event::Signal` 查表分发。
+构造负载帧用 `seam::Cmd::Send { peer, tag, payload }`（帧组装由 seam 收口）。
 
 **L2 内化信号（hello/bye/trust）**：`identity_service.rs` 的 `TextTag` 枚举
 （`Hello`/`Bye`/`TrustConfirm`/`TrustRevoke`），经 `from_str`/`as_str` 与线缆字符串互转。
@@ -134,7 +135,9 @@ tokio::select! {
 协议版本号只在改动既有标签语义时 bump。
 
 **L2 门禁（唯一收口，chat.rs 分发入口）**：`is_l2_signal(tag)` 为真（内化信号）一律放行；
-业务信号（chat.*/file.*）须 `effective_trusted`，否则**整帧丢弃**。
+业务信号（chat.*/file.*）须 `effective_trusted`，否则走该 tag 的**未互信钩子**
+`SignalRegistry::register_untrusted(tag, handler)`（L2 API，async，与应用 handler 同签名；
+**不注册 = 空函数 = 丢弃**——payload 无人引用，自然回收）。
 **对称信任红线**：`effective_trusted = is_verified && their_trust`；`/trust` 发 confirm、
 `/trust !` 发 revoke 并重置会话 `send_confirmed`（对方离线静默跳过）；hello 处理后重报当前
 信任态（重连自愈）。群消息（gossipsub `P2pEvent::Gossip`）不走 frame.text 分发，不受此门禁。
