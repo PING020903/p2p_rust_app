@@ -180,6 +180,7 @@ docs/
   CROSS_LAN_CONNECTIVITY.md 跨局域网联通方案
   新手测试指南.md          小白联机测试手册
   ROADMAP.md               演进路线图
+  UI_PLAN.md               GUI 规划与待办（egui/eframe）
   GROUP_CRDT_ROADMAP.md    群成员名单去中心化方向
 xtask/
   构建/发布辅助工具（cargo xtask build）

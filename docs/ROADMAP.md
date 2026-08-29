@@ -93,6 +93,10 @@ P2P 传输层产品化方向规划。以"身份验证 + 连接"为根基，聊�
 - 方案设计见 `docs/CROSS_LAN_CONNECTIVITY.md`（跨局域网联通：单跳中继 + 候选测速选路 + 机会式 IPv6 升级）
 
 ### 其他
+- **GUI 界面（待办，未开始）**：选型 egui/eframe，新增 `p2p_rust_app_gui` bin；渐进式——
+  P0 骨架（窗口+中文字体+后台 tokio 通道）→ P1 终端式 GUI（嵌入式控制台，全功能可用）→
+  P2 原生界面（`LineReader`/`UiOut` 抽象 + 登录表单/联系人列表/会话气泡/弹窗）→ P3 打磨；
+  详见 `docs/UI_PLAN.md`
 - **群成员名单 CRDT（待办，群聊后续）**：当前仍为**群主为中心的单写者模型**（0.15.0 引入后未变）；
   去中心化演进方向（OR-Set、add-wins、退群去中心化、防幽灵）见 `docs/GROUP_CRDT_ROADMAP.md`——
   存储迁移（format=2 + 确定性 uid）、协议变体、合并器、命令接入、e2e 收敛测试，待群聊功能稳定后推进
