@@ -25,25 +25,63 @@ GUI：tokio 后台线程跑核心，UI 主线程每帧 drain 事件通道
 
 ---
 
-## P0 — 骨架（✅/⬜ 待办）
+## P0 — 骨架（✅ 已完成）
 
-- [ ] **Cargo.toml**：加 `[[bin]] p2p_rust_app_gui`（path `source/main_gui.rs`）+ `eframe`（最新稳定，实现时锁定版本）
-- [ ] **`source/main_gui.rs`**：入口 `eframe::run_native`
-- [ ] **`source/ui/mod.rs`**：`GuiApp: eframe::App`，`update()` 每帧 drain 事件通道
-- [ ] **`source/ui/fonts.rs`**：CJK 字体加载回退链（Windows `msyh.ttc`→`simhei.ttf`；Linux `Noto Sans CJK`；macOS `PingFang`），注入 `FontDefinitions` 并设为 fallback
-- [ ] **异步集成**：tokio 后台线程 + 双通道 + `egui::Context` repaint
-- [ ] 验收：能开窗口、中文渲染正常
+- [x] **Cargo.toml**：加 `[[bin]] p2p_rust_app_gui`（path `source/main_gui.rs`）+ `default-run = "p2p_rust_app"`（保住 `cargo run` 走 CLI）+ `eframe 0.36.1`（默认 wgpu 渲染器）
+- [x] **`source/main_gui.rs`**：入口 `eframe::run_native`（1200x800）
+- [x] **`source/ui/mod.rs`**：`GuiApp` 实现 eframe 0.36 新 `App` trait（`logic()` drain 通道 + `ui()` 渲染）；滚动区 + 输入框
+- [x] **`source/ui/fonts.rs`**：CJK 字体回退链（Windows `msyh.ttc`→`simhei.ttf`；Linux Noto CJK/文泉驿；macOS PingFang），`Arc<FontData>` 注入家族末尾 fallback
+- [x] **异步集成**：后台 std 线程 + `tokio::sync::mpsc::unbounded_channel`（send 同步、`try_recv` 每帧 drain）+ `ctx.request_repaint()` 演示
+- [x] 验收：`cargo build --bin p2p_rust_app_gui` 通过；启动 6 秒存活未崩溃；`cargo run` 仍 CLI
 
-## P1 — 终端式 GUI（快速全功能可用）
+> **实现要点（2026-08-30）**：
+> - eframe 0.36 `App` trait 主方法改为 `fn ui(&mut self, ui: &mut egui::Ui, frame)`（原 `update` 移除），另有可选 `logic(&mut self, ctx, frame)`（隐藏时也调用、不能画 UI）——drain 通道放 `logic`，渲染放 `ui`，`CentralPanel::show(ui, …)` 直接收 `&mut Ui`
+> - `egui` 需为**直接依赖**（eframe 不再 re-export）
+> - `std::sync::mpsc::unbounded_channel`/`UnboundedReceiver` 在 **Rust 1.97 已被移除**（`channel`/`sync_channel` 保留）——改用 tokio 的 unbounded 通道（send 为同步方法，无需运行时）
+> - `FontData::from_owned` 返回 `FontData`，插入 `font_data` map 需包 `Arc`
+
+## P1 — 终端式 GUI（✅ 已完成）
 
 > 方案：**嵌入式控制台**——复用 e2e 既有模式（tests/common/mod.rs 的 `Node::spawn` = spawn CLI + 管道驱动，已 battle-tested）。
 
-- [ ] **`source/ui/console.rs`**：spawn `p2p_rust_app.exe`（`current_exe()` 找同目录兄弟 bin），管道接 stdout/stderr → 滚动文本区，输入框 → stdin
-- [ ] **输入框**：`egui::TextEdit`；`interactive = stdin().is_terminal()` 自动 false → 管道模式，**密码不回显**（GUI 密码输入用 `TextEdit.password(true)`）
-- [ ] **滚动文本区**：最新输出自动滚底，保留历史滚动查看
-- [ ] 验收：窗口内完成「登录 → /list → /chat → 互信 → 收发消息 → /send 文件」全流程，核心零改动
+- [x] **`source/ui/console.rs`**：spawn `p2p_rust_app.exe`（`current_exe()` 同目录兄弟 bin），stdout/stderr 双线程管道 → `UiOut::Text`，子进程退出 `try_wait` 非阻塞轮询；窗口关闭 `Drop` 杀子进程
+- [x] **输入框**：`egui::TextEdit`；管道下 CLI `interactive=false` → 密码行读取**不回显**；`TextEdit.password` 留待 P2 表单
+- [x] **滚动文本区**：无换行部分输出（提示符）即时上屏；`stick_to_bottom` 自动滚底
+- [x] 验收：GUI 存活、spawn 出 CLI 子进程、关闭后子进程被回收；`cargo build` 全绿
 
-> 备选（若不用子进程）：进程内 + `LineReader` trait + 全局输出钩子——但 println 遍布 chat/identity_service/file_transfer，机械改动量大、还需剥 ANSI 色码，性价比低于子进程方案。
+> **P1 行为说明**：
+> - 用户输入**不做本地回显**（密码防泄漏；聊天发送由 CLI 自打 `[我 -> 名]` 回显）
+> - 管道模式下 CLI 的 TOFU 指纹确认 / 文件接收 / 未信任发送确认走**自动放行**语义——P2 原生弹窗再接管
+> - `colored` 在管道下自动关闭 ANSI，无需剥色码
+
+## P1.5 — 诊断组件（✅ 已完成）
+
+> 目的：量化"子进程输出 → 屏幕可见"延迟 + 自动输出日志，方便分析对比。
+
+- [x] **耗时组件 `source/ui/timing.rs`**：`Sample`（count/last/max/avg）+ 线程安全 `TimingStats` + 手动 `Timer` + 作用域 `ScopeTimer`（Drop guard）；零依赖、可复用（P2 抽 lib 后上移共享）
+- [x] **运行日志组件 `source/ui/logging.rs`**：线程安全环形缓冲 `LogStore` + 可选文件落盘；`Level` 分级；**chrono 本地时区**时间戳（目录名与行内时间戳均为真实本地时间）
+- [x] **双文件日志**：缓存根 `~/.p2p_rust_app/gui_logs/<YYYYMMDD-HHMMSS>/`（`P2P_ID_CACHE_DIR` 可覆盖根），每次运行一个时间戳文件夹：
+  - `runtime.log` 软件运行日志：启停 / 控制台成败 / 子进程退出 / 管线延迟
+  - `interact.log` 用户交互输入输出：子进程每行输出 + 用户每次输入，均带时间戳（密码阶段暂按用户要求原样记录）
+- [x] **自动打点**：console reader 每行写 `[child]` 到 interact；`send_line` 写 `[user]`；`logic()` 记录 `pipeline.drain` / `roundtrip.input->resp`；`ScopeTimer` 包 `frame.logic`/`frame.ui`
+- [x] **日志面板**：顶栏「日志」开关 → 右侧 `Panel::right`，radio 切换 运行/交互，级别过滤（ComboBox）+ 级别着色 + 跟随/暂停 + 清空
+- [x] **状态行**：`管线 drain last/max · 输入→响应 last/max · frame.ui last/max`
+- [x] 验证：`gui_logs/<ts>/` 双文件生成、内容正确；civil 单测 2 项通过
+
+## P1.6 — GUI 治理与生命周期（✅ 已完成）
+
+> 针对运行反馈的四个"功能不完整/逻辑漏洞"：
+
+- [x] **日志本地时间**：`logging.rs` 改用 `chrono`（`Local::now()` / `DateTime::from(SystemTime).with_timezone(&Local)`），目录名与行内时间戳均为真实本地时区
+- [x] **输入检查&修改层 `source/ui/input_guard.rs`**：`Rule` trait + `InputGuard` 规则链（**检查&修改接口，可扩展**，拦截返回 `(规则名, 理由)` 便于日志）：
+  - `BlockTerminalEscape`：拦截 `cmd/`、`ps/`、`sh/` —— GUI 禁止穿透操作命令行（CLI 保留）
+  - `CollapseNewlines`：多行折叠为一行（修"换行没发出去"拆行 bug）
+  - 单测 4 项（拦截/放行/改写/改写后再拦截）
+- [x] **GUI 启动器分离**：`main_gui.rs` 无 `P2P_GUI_CHILD` → `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` spawn 自己后立即退出（**原命令行释放**）；带标记才进 GUI；spawn 失败回退前台；`windows_subsystem="windows"` **无条件**（双击/启动器均无黑窗闪显）；Unix 不分离
+- [x] **CLI 子进程禁窗**：`console.rs` spawn CLI 加 `CREATE_NO_WINDOW`——分离后 GUI 无控制台，若不禁窗 Windows 会给 console 子进程新建常驻黑窗（stdio 仍管道，行为不变）
+- [x] **生命周期联动**：CLI 子进程退出（`poll_exit`）→ 记 Info(0)/Warn(非零) → `ViewportCommand::Close` 关 GUI；**空闲低频轮询**（`request_repaint_after(500ms)`）解决"子进程退出后无新输出触发重绘 → 退出检测永不执行"的漏洞；双向绑定（GUI 关→杀 CLI 已有，CLI 退→GUI 关新增）
+- [x] 验证：启动器退出+分离 GUI 存活+子 CLI 在跑+**无伴随黑窗**（窗口列表仅见 "P2P 聊天 GUI"）+杀 CLI 后 GUI 联动关闭；日志目录为本地时间；`cargo run --bin p2p_rust_app_gui` 现在**立即返回**（GUI 独立进程运行，行为已写入 README/指南）
+
 
 ## P2 — 原生界面（"微信式"）
 

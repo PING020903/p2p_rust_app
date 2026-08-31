@@ -9,6 +9,33 @@
 
 ### 新增
 
+- **GUI 骨架（P0，`p2p_rust_app_gui`）**：egui/eframe 0.36（默认 wgpu 渲染器）+ 独立 bin；
+  `App::ui/logic` 新 trait 集成后台 `tokio::sync::mpsc` 通道 + `request_repaint`；CJK 字体运行时
+  回退链（Windows msyh/simhei、Linux Noto CJK、macOS PingFang）；`default-run` 保住 `cargo run` 走 CLI；
+  滚动文本区 + 输入框占位。详见 `docs/UI_PLAN.md`
+- **GUI 终端式控制台（P1）**：`source/ui/console.rs` spawn CLI 子进程，stdout/stderr 双管道 →
+  滚动文本区（提示符即时上屏），输入框 → stdin（无本地回显，密码防泄漏）；`try_wait` 轮询退出、
+  窗口关闭 `Drop` 杀子进程；核心零改动（管道模式复用 e2e 驱动模式）
+- **GUI 诊断组件（P1.5）**：
+  - `source/ui/timing.rs` 耗时组件：`Sample`/`TimingStats`/`Timer`/`ScopeTimer`（零依赖，可复用）
+  - `source/ui/logging.rs` 运行日志组件：线程安全 `LogStore` + 文件落盘 + 零依赖 UTC 民用历时间戳
+  - **双文件日志**：`~/.p2p_rust_app/gui_logs/<YYYYMMDD-HHMMSS>/` 下 `runtime.log`（软件运行日志）+
+    `interact.log`（用户交互输入输出，带时间戳；密码暂原样记录），每次运行一个时间戳文件夹便于对比
+  - **自动打点**：`pipeline.drain` / `roundtrip.input->resp` / `frame.logic` / `frame.ui` 延迟统计；
+    GUI 日志面板（运行/交互切换 + 级别过滤着色 + 跟随/清空）+ 状态行实时延迟
+- **GUI 治理与生命周期修复**：
+  - **日志本地时间**：改用 `chrono` 取本地时区（替换零依赖 UTC 民用历），目录名与行内时间戳均为真实本地时间
+  - **输入检查&修改层** `source/ui/input_guard.rs`：`Rule` 接口 + `InputGuard` 规则链（可扩展）；
+    GUI 默认两条规则——`BlockTerminalEscape` 拦截 `cmd/`/`ps/`/`sh/` 穿透命令（CLI 保留）、
+    `CollapseNewlines` 多行折叠（修多行消息被逐行拆分的 bug）；拦截时滚动区提示 + 日志 Warn
+  - **GUI 启动器分离**：`p2p_rust_app_gui` 无 `P2P_GUI_CHILD` 时以 `DETACHED_PROCESS` 重新
+    spawn 自己后立即退出，原命令行即释放；带标记才进 GUI；spawn 失败回退前台运行；
+    `windows_subsystem="windows"` 无条件启用（诊断全走 gui_logs，双击/启动器均无黑窗）
+  - **CLI 子进程禁窗**：GUI spawn CLI 时加 `CREATE_NO_WINDOW`——分离后的 GUI 无控制台，
+    若不禁窗 Windows 会给 console 子进程新建常驻黑窗（stdio 仍为管道，行为不变）
+  - **生命周期联动**：CLI 子进程退出 → GUI 自动 `ViewportCommand::Close` 关闭（双向绑定：
+    GUI 关→杀 CLI 已有；CLI 退→GUI 关新增）；退出日志级别按 code（0=Info / 非零=Warn）；
+    **空闲低频轮询**（`request_repaint_after(500ms)`）保证子进程退出无新输出时也能被及时检测
 - **xtask 构建工具**：`cargo xtask build [--release]` —— 构建后自动把可执行文件按 `<os>-<arch>`
   归档到 `target/{debug|release}/bin/<os>-<arch>/`（`std::env::consts` 自动检测，Windows 为
   `windows-x86_64`，Linux 为 `linux-x86_64`；跨平台同一套命令，见 `.cargo/config.toml` 的 alias）
