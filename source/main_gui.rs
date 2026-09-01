@@ -6,7 +6,7 @@
 //! GUI 不挂控制台（无条件 windows_subsystem）：诊断已全部走 `gui_logs` 日志；
 //! 否则双击启动时启动器/子进程会闪黑窗。Debug 构建的 eprintln 不再可见（可接受）。
 
-#![windows_subsystem = "windows"]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod ui;
 
@@ -57,5 +57,18 @@ fn spawn_detached() -> Result<(), String> {
 
 #[cfg(not(windows))]
 fn spawn_detached() -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    // Unix：process_group(0) 脱离终端进程组（Ctrl+C 不传播），stdio 置 null 释放终端
+    let exe = std::env::current_exe().map_err(|e| format!("定位当前 exe 失败: {e}"))?;
+    std::process::Command::new(&exe)
+        .env(CHILD_ENV, "1")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn {} 失败: {e}", exe.display()))?;
     Ok(())
 }

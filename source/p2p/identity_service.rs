@@ -141,11 +141,6 @@ impl IdentityService {
         self.contacts.set_verified(peer, verified);
     }
 
-    /// 对方是否信任我（经 L2 trust.confirm/revoke 信号学习）
-    pub fn their_trust(&self, peer: &PeerId) -> bool {
-        self.contacts.their_trust(&peer.to_string())
-    }
-
     /// 有效信任：互信才算数（我信任对方 且 对方信任我）——对称信任判定根 API
     pub fn effective_trusted(&self, peer: &PeerId) -> bool {
         self.contacts.effective_trusted(&peer.to_string())

@@ -476,7 +476,7 @@ impl P2pNode {
                     let bye = self.bye_peers.contains(&peer_id);
                     if bye {
                         self.known_addrs.remove(&peer_id);
-                        println!("{}", "对方已正常退出，不进行重连".dimmed());
+                        // 下线提示由 L3 收到 Disconnected{bye} 事件时打印（L1 只发事件不说话）
                     } else if let Some(addrs) = self.known_addrs.get(&peer_id) {
                         if !addrs.is_empty() {
                             println!("{}", format!("尝试重连 {peer_id}...").cyan());

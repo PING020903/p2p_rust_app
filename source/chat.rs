@@ -4,10 +4,8 @@ use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
-use std::future::Future;
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::pin::Pin;
 use tokio::io::AsyncBufReadExt;
 
 use crate::cmd_tree::{CmdError, CmdTree, ROOT};
@@ -1007,7 +1005,7 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
     let help = tree.register(ROOT, "help", |_, _| {});
     tree.set_help(
         help,
-        "显示本帮助；cmd/<命令>（cmd）、ps/<命令>（PowerShell）、sh/<命令>（POSIX sh）可透传给终端执行（如 cmd/cls 或 sh/clear 清屏）",
+        "显示本帮助；/sendStrings <行数> 发送多行文本（随后输入恰好 N 行，内容不解析）；cmd/<命令>（cmd）、ps/<命令>（PowerShell）、sh/<命令>（POSIX sh）可透传给终端执行（如 cmd/cls 或 sh/clear 清屏）",
     );
     let backup = tree.register(ROOT, "backup", |ctx, _| {
         ctx.ops.push_back(AsyncOp::Backup);
@@ -1561,6 +1559,114 @@ fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
     tree
 }
 
+/// 解析 `/sendStrings` 后的行数参数（`/sendStrings <N>`，N = 后续内容行数）
+fn parse_line_count(rest: &str) -> Result<usize, String> {
+    let t = rest.trim();
+    if t.is_empty() {
+        return Err("缺少行数".to_string());
+    }
+    t.parse::<usize>()
+        .map_err(|_| format!("行数须为数字，当前: {t}"))
+}
+
+/// 收集一行多行内容；返回 `Some(完整文本)` 当收满最后一行（空行原样保留、内容不解析）。
+fn collect_multiline(buf: &mut String, remaining: &mut usize, line: &str) -> Option<String> {
+    if !buf.is_empty() {
+        buf.push('\n');
+    }
+    buf.push_str(line);
+    *remaining -= 1;
+    if *remaining == 0 {
+        Some(std::mem::take(buf))
+    } else {
+        None
+    }
+}
+
+/// 发送文本到当前焦点（群或 1v1）。普通消息路径与 `/sendStrings` 多行路径共用，
+/// 信任门控/回显行为与交互终端一致（管道/脚本未互信自动放行）。
+async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
+    if let Some(gid) = &ctx.focused_group {
+        let g = match ctx.groups.get(gid) {
+            Some(g) => g.clone(),
+            None => {
+                eprintln!("{}", "当前群不存在".yellow());
+                return;
+            }
+        };
+        let payload = serde_json::to_vec(&GroupPayload::Text {
+            group_id: g.id.clone(),
+            text: text.to_string(),
+            sender: ctx.identity.my_name().to_string(),
+        })
+        .unwrap_or_default();
+        let _ = ctx
+            .cmd_tx
+            .send(seam::Cmd::Publish {
+                topic: group_topic(&g.id),
+                data: payload,
+            })
+            .await;
+        println!("{}", format!("[我 -> {}] {text}", g.name).green());
+        return;
+    }
+    match *ctx.focused {
+        Some(p) => {
+            if !ctx.connected.contains(&p) {
+                eprintln!("{}", "当前会话未连接，请用 /chat 重连".yellow());
+                return;
+            }
+            let name = ctx
+                .conversations
+                .get(&p)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            let who = if name.is_empty() {
+                p.to_string()
+            } else {
+                name
+            };
+            // D3：未互信联系人首次发消息确认（仅交互终端；管道/e2e 自动放行）
+            if !ctx.identity.effective_trusted(&p) {
+                if ctx.interactive && !ctx.conversations[&p].send_confirmed {
+                    println!(
+                        "{}",
+                        format!("对方 {who} 未互信（需双方 /trust），确认发送？(y/n)").yellow()
+                    );
+                    let ans = match ctx.stdin.next_line().await {
+                        Ok(Some(l)) => l.trim().to_string(),
+                        _ => String::new(),
+                    };
+                    if !ans.eq_ignore_ascii_case("y") {
+                        println!("{}", "已取消发送".dimmed());
+                        return;
+                    }
+                    ctx.conversations.get_mut(&p).unwrap().send_confirmed = true;
+                } else if !ctx.interactive {
+                    println!("{}", format!("对方 {who} 未信任，消息仍已发送").yellow());
+                }
+            }
+            let payload = serde_cbor::to_vec(&ChatTextPayload {
+                text: text.to_string(),
+            })
+            .unwrap_or_default();
+            let _ = ctx
+                .cmd_tx
+                .send(seam::Cmd::Send {
+                    peer: p,
+                    tag: TAG_CHAT_TEXT.to_string(),
+                    payload: Some(payload),
+                })
+                .await;
+            println!("{}", format!("[我 -> {who}] {text}").green());
+        }
+        None => eprintln!(
+            "{}",
+            "尚未选择会话，无法发送（先 /chat <角色> 或 /group <群名>）".yellow()
+        ),
+    }
+}
+
 pub fn run() {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -1686,20 +1792,56 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
 
     println!(
         "{}",
-        "命令以 / 开头（/help 查看详情，/list 查看节点，/chat <角色> 发起聊天）；cmd/、ps/、sh/ 可直控终端；其余输入作为消息发送给当前聊天对象".dimmed()
+        "命令以 / 开头（/help 查看详情，/list 查看节点，/chat <角色> 发起聊天）；/sendStrings <行数> 发送多行文本；cmd/、ps/、sh/ 可直控终端；其余输入作为消息发送给当前聊天对象".dimmed()
     );
+
+    // `/sendStrings <N>` 多行收集态：缓冲内容 + 剩余行数（None = 未在收集）
+    let mut sendstrings: Option<(String, usize)> = None;
 
     loop {
         tokio::select! {
             line = stdin.next_line() => {
                 let line = match line {
                     Ok(Some(l)) => l,
-                    Ok(None) => break,
+                    Ok(None) => {
+                        // 多行收集中 EOF：未闭合，报错丢弃
+                        if let Some((_, remaining)) = &sendstrings {
+                            eprintln!(
+                                "{}",
+                                format!("多行消息未闭合（还差 {remaining} 行时输入结束），已丢弃").yellow()
+                            );
+                        }
+                        break;
+                    }
                     Err(e) => {
                         eprintln!("{}", format!("读取输入失败: {e}").red());
                         break;
                     }
                 };
+                // 多行收集态优先：不 trim、空行原样保留，正文以 / 开头也不解析为命令
+                if let Some((mut buf, mut remaining)) = sendstrings.take() {
+                    if let Some(content) = collect_multiline(&mut buf, &mut remaining, &line) {
+                        let mut ctx = ChatCtx {
+                            identity: &mut identity,
+                            cmd_tx: &cmd_tx,
+                            stdin: &mut stdin,
+                            interactive,
+                            conversations: &mut conversations,
+                            groups: &mut groups,
+                            focused: &mut focused,
+                            focused_group: &mut focused_group,
+                            connected: &connected,
+                            registered: &mut registered,
+                            ops: VecDeque::new(),
+                            quit: false,
+                            file: &mut file_state,
+                        };
+                        send_focused_text(&mut ctx, &content).await;
+                    } else {
+                        sendstrings = Some((buf, remaining));
+                    }
+                    continue;
+                }
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
@@ -1716,6 +1858,26 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                 if let Some(rest) = line.strip_prefix("sh/") {
                     run_terminal_escape("sh", &["-c"], rest).await;
                     continue;
+                }
+                // /sendStrings <N>：多行文本（行数声明；GUI 自动计数并逐行写入，内容零解析）
+                if let Some(rest) = line.strip_prefix("/sendStrings") {
+                    match parse_line_count(rest) {
+                        Ok(0) => {
+                            eprintln!("{}", "多行内容不能为空".yellow());
+                            continue;
+                        }
+                        Ok(n) => {
+                            sendstrings = Some((String::new(), n));
+                            continue;
+                        }
+                        Err(reason) => {
+                            eprintln!(
+                                "{}",
+                                format!("{reason}（用法: /sendStrings <行数>，随后输入恰好 N 行）").yellow()
+                            );
+                            continue;
+                        }
+                    }
                 }
                 if let Some(cmd) = line.strip_prefix('/') {
                     // 命令上下文：一次性借用全部状态，handler 同步改状态 + 排异步动作队列。
@@ -1773,90 +1935,23 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                     }
                     continue;
                 }
-                // 非命令：作为消息发送给当前聊天对象
-                if let Some(gid) = &focused_group {
-                    // 群消息：gossipsub 发布到群 topic
-                    let g = match groups.get(gid) {
-                        Some(g) => g.clone(),
-                        None => {
-                            eprintln!("{}", "当前群不存在".yellow());
-                            continue;
-                        }
-                    };
-                    let payload = serde_json::to_vec(&GroupPayload::Text {
-                        group_id: g.id.clone(),
-                        text: line.to_string(),
-                        sender: identity.my_name().to_string(),
-                    })
-                    .unwrap_or_default();
-                    let _ = cmd_tx
-                        .send(seam::Cmd::Publish {
-                            topic: group_topic(&g.id),
-                            data: payload,
-                        })
-                        .await;
-                    println!("{}", format!("[我 -> {}] {line}", g.name).green());
-                } else {
-                    match focused {
-                        Some(p) => {
-                            if !connected.contains(&p) {
-                                eprintln!(
-                                    "{}",
-                                    "当前会话未连接，请用 /chat 重连".yellow()
-                                );
-                            } else {
-                                let name = conversations
-                                    .get(&p)
-                                    .map(|c| c.name.clone())
-                                    .unwrap_or_default();
-                                let who = if name.is_empty() {
-                                    p.to_string()
-                                } else {
-                                    name
-                                };
-                                // D3：未互信联系人首次发消息确认（仅交互终端；管道/e2e 自动放行）
-                                if !identity.effective_trusted(&p) {
-                                    if interactive && !conversations[&p].send_confirmed {
-                                        println!(
-                                            "{}",
-                                            format!("对方 {who} 未互信（需双方 /trust），确认发送？(y/n)").yellow()
-                                        );
-                                        let ans = match stdin.next_line().await {
-                                            Ok(Some(l)) => l.trim().to_string(),
-                                            _ => String::new(),
-                                        };
-                                        if !ans.eq_ignore_ascii_case("y") {
-                                            println!("{}", "已取消发送".dimmed());
-                                            continue;
-                                        }
-                                        conversations.get_mut(&p).unwrap().send_confirmed = true;
-                                    } else if !interactive {
-                                        println!(
-                                            "{}",
-                                            format!("对方 {who} 未信任，消息仍已发送").yellow()
-                                        );
-                                    }
-                                }
-                                let payload = serde_cbor::to_vec(&ChatTextPayload {
-                                    text: line.to_string(),
-                                })
-                                .unwrap_or_default();
-                                let _ = cmd_tx
-                                    .send(seam::Cmd::Send {
-                                        peer: p,
-                                        tag: TAG_CHAT_TEXT.to_string(),
-                                        payload: Some(payload),
-                                    })
-                                    .await;
-                                println!("{}", format!("[我 -> {who}] {line}").green());
-                            }
-                        }
-                        None => eprintln!(
-                            "{}",
-                            "尚未选择会话，无法发送（先 /chat <角色> 或 /group <群名>）".yellow()
-                        ),
-                    }
-                }
+                // 非命令：作为消息发送给当前聊天对象（与 /sendStrings 共用同一发送逻辑）
+                let mut ctx = ChatCtx {
+                    identity: &mut identity,
+                    cmd_tx: &cmd_tx,
+                    stdin: &mut stdin,
+                    interactive,
+                    conversations: &mut conversations,
+                    groups: &mut groups,
+                    focused: &mut focused,
+                    focused_group: &mut focused_group,
+                    connected: &connected,
+                    registered: &mut registered,
+                    ops: VecDeque::new(),
+                    quit: false,
+                    file: &mut file_state,
+                };
+                send_focused_text(&mut ctx, line).await;
             }
             event = ev_rx.recv() => {
                 match event {
@@ -2157,6 +2252,38 @@ mod tests {
         assert_eq!(next_creator(&solo, "A"), None);
         // 群主不在名单（数据异常防御）：不猜测继任者
         assert_eq!(next_creator(&members, "Z"), None);
+    }
+
+    #[test]
+    fn sendstrings_parse_count() {
+        assert_eq!(parse_line_count(" 3"), Ok(3));
+        assert_eq!(parse_line_count("\t5"), Ok(5));
+        assert!(parse_line_count("").is_err()); // 缺少行数
+        assert!(parse_line_count("  ").is_err());
+        assert!(parse_line_count("abc").is_err()); // 非数字
+    }
+
+    #[test]
+    fn sendstrings_collect_preserves_lines_verbatim() {
+        // 收满 N 行后返回完整文本；空行/以 / 开头的内容原样保留
+        let mut buf = String::new();
+        let mut remaining = 3;
+        assert!(collect_multiline(&mut buf, &mut remaining, "/开头行").is_none());
+        assert_eq!(remaining, 2);
+        assert!(collect_multiline(&mut buf, &mut remaining, "").is_none()); // 空行保留
+        assert_eq!(remaining, 1);
+        let done = collect_multiline(&mut buf, &mut remaining, "含\"引号行\"").unwrap();
+        assert_eq!(done, "/开头行\n\n含\"引号行\"");
+        assert_eq!(remaining, 0);
+        assert!(buf.is_empty()); // std::mem::take 已清空
+    }
+
+    #[test]
+    fn sendstrings_single_line() {
+        let mut buf = String::new();
+        let mut remaining = 1;
+        let done = collect_multiline(&mut buf, &mut remaining, "仅一行").unwrap();
+        assert_eq!(done, "仅一行");
     }
 }
 

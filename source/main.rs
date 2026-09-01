@@ -34,8 +34,8 @@ fn main() {
     tree.set_help(c4, "P2P 聊天");
     let cq = tree.register(ROOT, "q", |ctx, _| ctx.quit = true);
     tree.set_help(cq, "退出");
-    let cQ = tree.register(ROOT, "Q", |ctx, _| ctx.quit = true);
-    tree.set_help(cQ, "退出");
+    let c_q_upper = tree.register(ROOT, "Q", |ctx, _| ctx.quit = true);
+    tree.set_help(c_q_upper, "退出");
 
     let mut ctx = MainCtx { quit: false };
 

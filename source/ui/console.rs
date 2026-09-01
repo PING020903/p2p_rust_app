@@ -38,6 +38,16 @@ impl Console {
         let _ = self.stdin.flush();
     }
 
+    /// 发送多行文本：`/sendStrings <N>` + N 行原文（内容零变换，换行/引号/以 `/` 开头均原样）。
+    /// N = `text.lines().count()`；CLI 侧按行数精确收集后拼接发送。
+    pub fn send_multiline(&mut self, text: &str) {
+        let n = text.lines().count();
+        let out = format!("/sendStrings {n}\n{text}\n");
+        // 防御：内容内部/尾部换行不影响行数协议（CLI 只按 N 行取，多余空行被主循环跳过）
+        let _ = self.stdin.write_all(out.as_bytes());
+        let _ = self.stdin.flush();
+    }
+
     /// 非阻塞查询子进程是否退出；返回 Some(退出码) 仅在首次检测到退出时
     pub fn poll_exit(&mut self) -> Option<Option<i32>> {
         if self.reported_exit {

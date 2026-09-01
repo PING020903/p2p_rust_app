@@ -1,11 +1,11 @@
 use colored::Colorize;
-use std::fmt;
 
 /// 彩色打印组件
 /// 提供简单易用的彩色打印功能，方便调试和检查代码运行状态
 
-/// 颜色枚举，简化颜色选择
+/// 颜色枚举，简化颜色选择（完整色板，部分变体暂未被使用）
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum Color {
     Red,
     Green,

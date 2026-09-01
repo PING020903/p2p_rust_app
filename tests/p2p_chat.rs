@@ -1,5 +1,5 @@
 //! 逻辑测试（默认运行）：功能正确性场景——基础聊天 / 按名呼叫 / 多会话 / 群聊 / 发现模式 /
-//! 信任管理 / 对称信任 / 文件传输 / IPv6 自连。稳定性场景见 `p2p_chat_stability.rs`。
+//! 信任管理 / 对称信任 / 文件传输 / 多行发送 / IPv6 自连。稳定性场景见 `p2p_chat_stability.rs`。
 //!
 //! 运行：`cargo test --test p2p_chat -- --test-threads=1`
 //! （串行必须：同机 mDNS 会跨测试互相发现，拆并行会连错对象）
@@ -606,6 +606,48 @@ fn untrusted_hook_boundary_scenario() {
     b.kill();
 }
 
+/// 多行发送：`/sendStrings <N>` + N 行原文 → 对端收到含换行的完整文本；
+/// 内容零解析（空行、以 `/` 开头的行、引号原样保留）。
+fn sendstrings_multiline_scenario() {
+    let bin = env!("CARGO_BIN_EXE_p2p_rust_app");
+    let cache_a = scenario_cache_dir("ss_a");
+    let cache_b = scenario_cache_dir("ss_b");
+    let (cred_a, cred_b) = load_creds();
+    println!("=== 场景: 多行发送 sendStrings ===");
+
+    let (mut a, a_listen) = spawn_into_chat(bin, &cache_a, &cred_a, MNEMONIC_USER1);
+    let a_addr = listen_addr(&a_listen);
+    let a_id = parse_peer_id(&a_listen);
+
+    let (mut b, b_listen) = spawn_into_chat(bin, &cache_b, &cred_b, MNEMONIC_USER2);
+    let b_id = parse_peer_id(&b_listen);
+    b.send(&format!("/dial {a_addr}"));
+    a.wait_for(&format!("已连接对端: {b_id}"), WAIT);
+    b.wait_for(&format!("已连接对端: {a_id}"), WAIT);
+    b.wait_for(&format!("对方已上线: {}", cred_a.name), WAIT);
+    wait_mutual_trust(&a, &cred_a.name, &b, &cred_b.name);
+
+    println!("=== A /sendStrings 4 发多行（空行 + 以 / 开头的行原样保留）===");
+    a.send("/sendStrings 4");
+    a.send("第一行");
+    a.send(""); // 空行保留
+    a.send("/不是命令"); // 以 / 开头也不解析为命令
+    a.send("末尾行");
+    b.wait_for("[对方] 第一行", WAIT);
+    b.wait_for("/不是命令", WAIT);
+    b.wait_for("末尾行", WAIT);
+
+    println!("=== A 发多行含引号（引号原样）===");
+    a.send("/sendStrings 2");
+    a.send("引号\"内容");
+    a.send("结束");
+    b.wait_for("引号\"内容", WAIT);
+    b.wait_for("结束", WAIT);
+
+    a.kill();
+    b.kill();
+}
+
 /// 逻辑测试串行 suite：功能正确性场景。若拆成并行 #[test]，同机 mDNS 会跨测试互相发现。
 #[test]
 fn p2p_chat_logic_suite() {
@@ -618,4 +660,5 @@ fn p2p_chat_logic_suite() {
     symmetric_trust_scenario();
     untrusted_hook_boundary_scenario();
     file_transfer_scenario();
+    sendstrings_multiline_scenario();
 }

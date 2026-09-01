@@ -36,6 +36,30 @@
   - **生命周期联动**：CLI 子进程退出 → GUI 自动 `ViewportCommand::Close` 关闭（双向绑定：
     GUI 关→杀 CLI 已有；CLI 退→GUI 关新增）；退出日志级别按 code（0=Info / 非零=Warn）；
     **空闲低频轮询**（`request_repaint_after(500ms)`）保证子进程退出无新输出时也能被及时检测
+- **多行发送（`/sendStrings <N>`，文本/命令分离）**：
+  - **协议**：`/sendStrings <N>` + 恰好 N 行原文——**内容零解析、零转义**（空行、以 `/` 开头、含引号的行原样保留）；CLI 按行数精确收集后拼接发送，未收满（EOF）报错丢弃
+  - **CLI**：`send_focused_text` 共享发送函数（群 gossipsub / 1v1 信任门控 / cbor / 回显，普通消息与多行共用）；主循环 stdin 收集态优先（不 trim、空行保留）；`/sendStrings` 用法/行数校验；帮助同步
+  - **GUI 文本框 = 纯文本语义**：内容包成 `/sendStrings <N>` 发送（`send_multiline`），`/list` 等以 `/` 开头的内容作为聊天文本发出；新增**独立命令输入行**（guard 拦 `cmd/`/`ps/`/`sh/` 穿透 + `/sendStrings` 多行入口，其余透传）
+  - `input_guard` 按输入源分派（命令框两条规则 / 文本框预留空规则链）
+  - 测试：单测 +3（行数解析/多行收集 verbatim/单行）、e2e +1 场景（空行与 `/` 开头行原样、引号原样）
+- **GUI 状态感知 + 快捷命令（P1.8）**：
+  - **子进程状态机** `ChildState{Menu,Login,Chat}`：按输出特征行精确推进（主菜单/角色登录/发现模式），
+    聊天内容带前缀不误触发；单测 +2
+  - **文本框按状态启停**：仅聊天态启用；登录/主菜单态禁用 + placeholder 提示用命令框
+    （根治登录阶段文本框协议错位误用）；首帧焦点按状态引导
+  - **命令框动态提示**（菜单选择/登录输入/命令）+ **快捷命令按钮** `/list`、`/q`（聊天态启用）
+  - **状态行**：`状态: 聊天中/登录中/主菜单` 着色显示 + 延迟统计
+- **双平台构建就绪（P1.9）**：
+  - **xtask 归档双 bin**：CLI + GUI 都进 `target/{profile}/bin/<os>-<arch>/`（Windows/WSL 各自构建，产物按系统目录汇集）
+  - **Linux 分离启动对齐**：`process_group(0)` + stdio null（Linux 下 GUI 也不占终端）；`windows_subsystem` 加 `cfg(windows)` 门控
+  - **WSLg 实测通过**：Linux 全量构建、分离启动、子进程拉起、日志落盘全部验证；运行库备注
+    （WSL 发行版 cargo 需换 rustup stable、补 `libxkbcommon-x11-0`）
+  - **CLI 告警清零**：未用导入删除、`cQ` 更名、cmd_tree C 版对齐接口显式豁免、
+    `effective_trusted` 复用 `their_trust`（消除死包装）
+- **内置 CJK 字体兜底（P1.10）**：`assets/fonts/NotoSansCJKsc-Regular.otf`（Noto Sans CJK SC，
+  OFL 授权，15.7MB，`include_bytes!` 编译进二进制）——系统候选全部落空时自动启用，
+  **任何环境开箱即显中文**（WSL 最小安装裸机实测通过）；`fonts::install` 返回加载来源写入
+  runtime.log（无头环境凭日志验证）；`P2P_FONT_FORCE_EMBEDDED=1` 强制内置测试开关；单测 +4
 - **xtask 构建工具**：`cargo xtask build [--release]` —— 构建后自动把可执行文件按 `<os>-<arch>`
   归档到 `target/{debug|release}/bin/<os>-<arch>/`（`std::env::consts` 自动检测，Windows 为
   `windows-x86_64`，Linux 为 `linux-x86_64`；跨平台同一套命令，见 `.cargo/config.toml` 的 alias）
@@ -47,6 +71,9 @@
 
 - `seam.rs` `SignalHandler` 类型别名去掉 `: SignalCtx` bound，关联类型完全限定
   （`<C as SignalCtx>::Ctx<'ctx>`）——消除 `type_alias_bounds` 告警
+- **"对方已正常退出，不进行重连"重复打印**：同一 `ConnectionClosed` 事件被 L1（node.rs）与
+  L3（chat.rs Disconnected 分支）各打印一次——删除 L1 侧打印（分层职责：L1 只发事件，
+  下线提示归 L3）；测试断言均只依赖 Bye 到达时的短版提示，不受影响
 
 ## [0.21.0] - 2026-08-29
 

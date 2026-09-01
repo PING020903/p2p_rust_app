@@ -95,10 +95,7 @@ impl ContactBook {
 
     /// 有效信任：互信才算数（我信任对方 且 对方信任我）
     pub fn effective_trusted(&self, peer_id: &str) -> bool {
-        self.entries
-            .get(peer_id)
-            .map(|e| e.verified && e.their_trust)
-            .unwrap_or(false)
+        self.verified(peer_id) && self.their_trust(peer_id)
     }
 
     /// 记录"对方信任我"的状态（trust.confirm=true / trust.revoke=false）

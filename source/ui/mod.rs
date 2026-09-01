@@ -24,11 +24,48 @@ enum LogView {
     Interact,
 }
 
+/// 子进程界面状态：由输出特征行推断（精确整行匹配——聊天内容都带
+/// `[对方] `/`[我 -> ` 前缀，正文同款文本不会误触发）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChildState {
+    /// 主菜单（含启动初始态）
+    Menu,
+    /// 登录流程（[角色登录] 之后：身份/资料/密码输入）
+    Login,
+    /// 已进入聊天循环（打印"发现模式: "之后）
+    Chat,
+}
+
+impl ChildState {
+    fn label(self) -> &'static str {
+        match self {
+            ChildState::Menu => "主菜单",
+            ChildState::Login => "登录中",
+            ChildState::Chat => "聊天中",
+        }
+    }
+}
+
+/// 按输出行推进状态机：主菜单 →（选 4）登录 →（登录成功）聊天 →（/q）回主菜单
+fn next_state(current: ChildState, line: &str) -> ChildState {
+    if line == "=== 主菜单 ===" {
+        ChildState::Menu
+    } else if line == "[角色登录]" {
+        ChildState::Login
+    } else if line.starts_with("发现模式: ") {
+        ChildState::Chat
+    } else {
+        current
+    }
+}
+
 pub struct GuiApp {
     /// 滚动区文本行（子进程输出 + 本机状态）
     lines: Vec<String>,
     /// 输入框内容
     input: String,
+    /// 命令输入框内容（/list 等；与文本框分离）
+    cmd_input: String,
     /// 子进程 → UI 事件
     rx: mpsc::UnboundedReceiver<UiOut>,
     /// 控制台句柄（None = 启动失败）
@@ -51,16 +88,23 @@ pub struct GuiApp {
     log_view: LogView,
     log_follow: bool,
     log_level: Level,
-    /// 输入检查&修改规则链
-    guard: InputGuard,
+    /// 命令输入框的检查&修改规则链（拦终端逃逸穿透 + /sendStrings）
+    cmd_guard: InputGuard,
+    /// 文本框的检查&修改规则链（当前为空，纯文本语义；接口保留供未来加长度/敏感词等检查）
+    text_guard: InputGuard,
+    /// 子进程界面状态（决定文本框启停与命令框提示）
+    child_state: ChildState,
 }
 
 impl GuiApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        fonts::install(&cc.egui_ctx);
         let runtime = Arc::new(LogStore::new(5000));
         let interact = Arc::new(LogStore::new(5000));
         let mut lines = Vec::new();
+
+        // CJK 字体：系统优先 → 内置兜底（结果写入运行日志，无头环境可凭日志验证）
+        let font = fonts::install(&cc.egui_ctx);
+        let font_note = font.source.clone();
 
         // 缓存根/gui_logs/<时间戳>/ 建目录 + 开两份日志
         let log_dir = cache_root().join("gui_logs").join(logging::now_folder_ts());
@@ -76,6 +120,7 @@ impl GuiApp {
         }
         runtime.log(Level::Info, "gui", format!("GUI 启动，日志目录: {log_note}"));
         runtime.log(Level::Info, "gui", format!("缓存根: {}", cache_root().display()));
+        runtime.log(Level::Info, "gui", format!("CJK 字体: {font_note}"));
 
         let (console, rx) = match console::spawn(cc.egui_ctx.clone(), Some(interact.clone())) {
             Ok(h) => {
@@ -94,6 +139,7 @@ impl GuiApp {
         GuiApp {
             lines,
             input: String::new(),
+            cmd_input: String::new(),
             rx,
             console,
             first_frame: true,
@@ -107,7 +153,9 @@ impl GuiApp {
             log_view: LogView::Runtime,
             log_follow: true,
             log_level: Level::Debug,
-            guard: InputGuard::new(),
+            cmd_guard: InputGuard::command_box(),
+            text_guard: InputGuard::text_box(),
+            child_state: ChildState::Menu,
         }
     }
 }
@@ -124,6 +172,7 @@ impl eframe::App for GuiApp {
                     if let Some(t0) = self.input_sent_at.take() {
                         self.stats.record("roundtrip.input->resp", t0.elapsed());
                     }
+                    self.child_state = next_state(self.child_state, &line);
                     self.lines.push(line);
                 }
             }
@@ -166,45 +215,100 @@ impl eframe::App for GuiApp {
 
         // 底部输入面板先声明 → 先占位，CentralPanel 只拿剩余高度（ScrollArea 不会挤掉输入行）
         egui::Panel::bottom("input").show(ui, |ui| {
+            let in_chat = self.child_state == ChildState::Chat;
             ui.add_space(4.0);
+
+            // 命令输入行（与文本框分离；guard 拦截穿透命令与 /sendStrings；提示随状态变化）
             ui.horizontal(|ui| {
-                let edit = egui::TextEdit::multiline(&mut self.input)
-                    .hint_text("输入命令 / 消息，回车发送；Shift+回车换行")
-                    .desired_width(ui.available_width() - 88.0)
-                    .desired_rows(3);
+                ui.label("命令");
+                let hint = match self.child_state {
+                    ChildState::Menu => "菜单选择：4 进入 P2P 聊天；q 退出",
+                    ChildState::Login => "登录输入：序号 / 资料 / 密码…",
+                    ChildState::Chat => "/list、/chat、/trust …（单行命令）",
+                };
+                let edit = egui::TextEdit::singleline(&mut self.cmd_input)
+                    .hint_text(hint)
+                    .desired_width(ui.available_width() - 260.0)
+                    .font(egui::TextStyle::Monospace);
                 let resp = ui.add(edit);
-                if self.first_frame {
+                if self.first_frame && !in_chat {
                     resp.request_focus();
                 }
-                let send = ui.button("发送");
+                let run = ui.button("执行");
+                let enter = resp.lost_focus()
+                    && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter));
+                if (run.clicked() || enter) && !self.cmd_input.trim().is_empty() {
+                    let text = self.cmd_input.trim().to_string();
+                    self.cmd_input.clear();
+                    match self.cmd_guard.process(text) {
+                        Ok(final_text) => {
+                            self.interact
+                                .log(Level::Info, "user", format!("/cmd: {final_text}"));
+                            if let Some(c) = &mut self.console {
+                                c.send_line(&final_text);
+                            } else {
+                                self.lines.push("[控制台未启动]".to_string());
+                            }
+                        }
+                        Err((rule, reason)) => {
+                            self.lines.push(format!("[已拦截] {reason}"));
+                            self.runtime
+                                .log(Level::Warn, "guard", format!("拦截命令[{rule}]: {reason}"));
+                        }
+                    }
+                }
+                // 快捷命令（固定白名单，直接透传；仅聊天态有意义——主菜单下它们不是有效选择）
+                for cmd in ["/list", "/q"] {
+                    if ui.add_enabled(in_chat, egui::Button::new(cmd)).clicked() {
+                        self.interact
+                            .log(Level::Info, "user", format!("/cmd: {cmd}"));
+                        if let Some(c) = &mut self.console {
+                            c.send_line(cmd);
+                        }
+                    }
+                }
+            });
+
+            // 文本框 = 纯文本：包成 /sendStrings <N> 协议发送（内容零变换，换行/引号/以 / 开头均原样）。
+            // 非聊天态禁用——登录/菜单阶段 CLI 在等单行响应，文本框协议行会造成读取错位。
+            ui.horizontal(|ui| {
+                let edit = egui::TextEdit::multiline(&mut self.input)
+                    .hint_text(if in_chat {
+                        "输入消息，回车发送；Shift+回车换行（可粘贴多行文章）"
+                    } else {
+                        "登录/菜单操作请用上方命令框"
+                    })
+                    .desired_width(ui.available_width() - 88.0)
+                    .desired_rows(3);
+                let resp = ui.add_enabled(in_chat, edit);
+                if self.first_frame && in_chat {
+                    resp.request_focus();
+                }
+                let send = ui.add_enabled(in_chat, egui::Button::new("发送"));
                 // 多行下回车不触发 lost_focus，直接按键判断：回车发送（Shift+回车换行）
-                let send_now = send.clicked()
-                    || ui.ctx().input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                let send_now = in_chat
+                    && (send.clicked()
+                        || ui
+                            .ctx()
+                            .input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift));
                 if send_now && !self.input.trim().is_empty() {
                     let text = self.input.trim().to_string();
                     self.input.clear();
-                    let len = text.len();
-                    // 输入检查&修改层：拦截穿透命令、折叠多行换行
-                    match self.guard.process(text) {
-                        Ok(final_text) => {
-                            // 交互日志：记录用户输入（密码阶段暂按用户要求原样记录）
+                    // 文本框检查层（当前为空规则，接口保留）；通过后包成 sendStrings 协议发送
+                    match self.text_guard.process(text) {
+                        Ok(text) => {
                             self.interact
-                                .log(Level::Info, "user", format!("> {final_text}"));
+                                .log(Level::Info, "user", format!("> {text}"));
                             self.input_sent_at = Some(Instant::now());
                             match &mut self.console {
-                                Some(c) => c.send_line(&final_text),
+                                Some(c) => c.send_multiline(&text),
                                 None => self.lines.push("[控制台未启动]".to_string()),
                             }
                         }
                         Err((rule, reason)) => {
                             self.lines.push(format!("[已拦截] {reason}"));
-                            self.runtime.log(
-                                Level::Warn,
-                                "guard",
-                                format!("拦截输入[{rule}]: {reason}（原文 {len}B）"),
-                            );
-                            self.interact
-                                .log(Level::Warn, "user", format!("[拦截] {reason}"));
+                            self.runtime
+                                .log(Level::Warn, "guard", format!("拦截文本[{rule}]: {reason}"));
                         }
                     }
                 }
@@ -216,7 +320,18 @@ impl eframe::App for GuiApp {
                 ui.heading("P2P 聊天 GUI（终端式）");
                 ui.toggle_value(&mut self.show_log, "日志");
             });
-            ui.weak(self.status_line());
+            ui.horizontal(|ui| {
+                let state_color = match self.child_state {
+                    ChildState::Chat => egui::Color32::from_rgb(120, 200, 120),
+                    _ => egui::Color32::from_rgb(230, 180, 0),
+                };
+                ui.colored_label(
+                    state_color,
+                    format!("状态: {}", self.child_state.label()),
+                );
+                ui.separator();
+                ui.weak(self.status_line());
+            });
             ui.separator();
 
             // 滚动输出区（最新自动滚底）
@@ -349,5 +464,52 @@ fn cap(v: &mut Vec<logging::Entry>, max: usize) {
     if v.len() > max {
         let over = v.len() - max;
         v.drain(0..over);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_transitions_follow_marker_lines() {
+        // 完整生命周期：主菜单 →（选 4）登录 →（登录成功）聊天 →（/q）回主菜单
+        assert_eq!(
+            next_state(ChildState::Menu, "[角色登录]"),
+            ChildState::Login
+        );
+        assert_eq!(
+            next_state(ChildState::Login, "发现模式: advertise（广播+发现）"),
+            ChildState::Chat
+        );
+        assert_eq!(
+            next_state(ChildState::Chat, "=== 主菜单 ==="),
+            ChildState::Menu
+        );
+        // 主菜单标记在主菜单态：保持
+        assert_eq!(
+            next_state(ChildState::Menu, "=== 主菜单 ==="),
+            ChildState::Menu
+        );
+    }
+
+    #[test]
+    fn state_ignores_chat_content_with_marker_text() {
+        // 聊天内容都带 [对方]/[我 -> 前缀，精确整行匹配不会误触发
+        assert_eq!(
+            next_state(ChildState::Chat, "[对方] === 主菜单 ==="),
+            ChildState::Chat
+        );
+        assert_eq!(
+            next_state(ChildState::Chat, "[我 -> WJP] [角色登录]"),
+            ChildState::Chat
+        );
+        assert_eq!(
+            next_state(ChildState::Chat, "[对方] 发现模式: xxx"),
+            ChildState::Chat
+        );
+        // 普通行保持原状态
+        assert_eq!(next_state(ChildState::Chat, "hello"), ChildState::Chat);
+        assert_eq!(next_state(ChildState::Login, "88888888"), ChildState::Login);
     }
 }

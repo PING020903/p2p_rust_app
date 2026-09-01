@@ -11,6 +11,9 @@ pub enum CmdError {
     NotFound,
 }
 
+// Node 字段 token/data_handler 与部分方法为 C 版 simpleCmd cmdTree v2.0 对齐的组件接口，
+// Rust 侧当前未全部使用（保留以维持组件完整性），显式豁免 dead_code。
+#[allow(dead_code)]
 struct Node<C> {
     token: String,
     help: Option<String>,
@@ -45,6 +48,8 @@ impl<C> CmdTree<C> {
         self.register_inner(parent, token, Some(Box::new(handler)))
     }
 
+    /// C 版对齐的组件接口（Rust 侧暂未使用，保留完整性）
+    #[allow(dead_code)]
     pub fn register_route(&mut self, parent: NodeId, token: &str) -> NodeId {
         self.register_inner(parent, token, None)
     }
@@ -79,6 +84,8 @@ impl<C> CmdTree<C> {
         self.nodes[node].help = Some(text.to_string());
     }
 
+    /// C 版对齐的组件接口（Rust 侧暂未使用，保留完整性）
+    #[allow(dead_code)]
     pub fn set_data_handler<D>(&mut self, node: NodeId, dh: D)
     where
         D: FnMut(&[u8]) -> i32 + 'static,
@@ -123,6 +130,8 @@ impl<C> CmdTree<C> {
         }
     }
 
+    /// C 版对齐的组件接口（data 通道；Rust 侧暂未使用，保留完整性）
+    #[allow(dead_code)]
     pub fn feed_data(&mut self, buf: &[u8]) -> i32 {
         match self.active_data {
             Some(node) => match self.nodes[node].data_handler.as_mut() {
@@ -170,11 +179,14 @@ impl<C> CmdTree<C> {
         }
     }
 
+    /// C 版对齐的组件接口（调试树打印；Rust 侧暂未使用，保留完整性）
+    #[allow(dead_code)]
     pub fn show(&self) {
         println!("cmdTree:");
         self.show_walk(ROOT, 0);
     }
 
+    #[allow(dead_code)]
     fn show_walk(&self, node: NodeId, depth: usize) {
         let mut children: Vec<(&String, &NodeId)> = self.nodes[node].children.iter().collect();
         children.sort_by_key(|(token, _)| (*token).clone());

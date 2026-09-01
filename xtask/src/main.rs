@@ -3,7 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const PKG_NAME: &str = "p2p_rust_app";
+/// 归档的可执行文件：CLI + GUI 双 bin（一套代码两平台产物统一收集）
+const BINS: &[&str] = &["p2p_rust_app", "p2p_rust_app_gui"];
 
 fn main() {
     if let Err(e) = run() {
@@ -72,17 +73,12 @@ fn build_and_copy(profile: &str, target: Option<&str>, extra: &[String]) -> Resu
     }
 
     let exe_suffix = env::consts::EXE_SUFFIX;
-    let bin_name = format!("{PKG_NAME}{exe_suffix}");
 
     let target_dir = target_dir(&repo);
     let src_dir = match target {
         None => target_dir.join(profile),
         Some(t) => target_dir.join(t).join(profile),
     };
-    let src = src_dir.join(&bin_name);
-    if !src.exists() {
-        return Err(format!("未找到构建产物: {}", src.display()));
-    }
 
     let os = env::consts::OS;
     let arch = env::consts::ARCH;
@@ -90,9 +86,18 @@ fn build_and_copy(profile: &str, target: Option<&str>, extra: &[String]) -> Resu
     let dest_dir = target_dir.join(profile).join("bin").join(&os_dir);
     fs::create_dir_all(&dest_dir)
         .map_err(|e| format!("创建目录 {} 失败: {e}", dest_dir.display()))?;
-    let dest = dest_dir.join(&bin_name);
 
-    fs::copy(&src, &dest).map_err(|e| format!("复制 {} -> {} 失败: {e}", src.display(), dest.display()))?;
-    println!("已输出: {}", dest.display());
+    for bin in BINS {
+        let bin_name = format!("{bin}{exe_suffix}");
+        let src = src_dir.join(&bin_name);
+        if !src.exists() {
+            return Err(format!("未找到构建产物: {}", src.display()));
+        }
+        let dest = dest_dir.join(&bin_name);
+        fs::copy(&src, &dest).map_err(|e| {
+            format!("复制 {} -> {} 失败: {e}", src.display(), dest.display())
+        })?;
+        println!("已输出: {}", dest.display());
+    }
     Ok(())
 }

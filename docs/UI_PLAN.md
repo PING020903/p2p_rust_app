@@ -83,6 +83,70 @@ GUI：tokio 后台线程跑核心，UI 主线程每帧 drain 事件通道
 - [x] 验证：启动器退出+分离 GUI 存活+子 CLI 在跑+**无伴随黑窗**（窗口列表仅见 "P2P 聊天 GUI"）+杀 CLI 后 GUI 联动关闭；日志目录为本地时间；`cargo run --bin p2p_rust_app_gui` 现在**立即返回**（GUI 独立进程运行，行为已写入 README/指南）
 
 
+## P1.7 — 多行发送 + 文本/命令分离（✅ 已完成）
+
+> 诉求：文本框粘贴多行文章（含空行/引号/以 `/` 开头）作为**一条消息**原样发送，不被拆散、不误解析。
+> 协议调研后定为**行数声明**（netstring 思路）：流式管道里"任意内容 verbatim + 引号定界"互斥（无法定位流中最后一个引号），
+> 长度前缀是业界对"任意负载"的标准解。
+
+- [x] **协议**：`/sendStrings <N>` + 恰好 N 行原文——内容**零解析、零转义**（空行、`/` 开头行、引号原样）；CLI 按行数精确收集拼接发送；EOF 未收满 → 报错丢弃；N=0/非法 → 用法提示
+- [x] **CLI**：抽 `send_focused_text` 共享发送函数（群/1v1/信任门控/回显，普通消息与多行共用，行为等价 e2e 守护）；主循环 stdin 收集态**优先于 trim/空行跳过**（空行保留、`/` 开头不解析）；`parse_line_count`/`collect_multiline` + 单测 3 项；帮助同步
+- [x] **GUI 文本框 = 纯文本**：`send_multiline` 包 `/sendStrings <N>` 发送，`/list` 等以 `/` 开头的内容作为聊天文本发出（不再触发命令）；interact 日志记原文
+- [x] **独立命令输入行**（文本框上方）：guard 拦 `cmd/`/`ps/`/`sh/` 穿透 + `/sendStrings` 多行入口，其余透传 CLI
+- [x] `input_guard` 按输入源分派（命令框两条规则 / 文本框预留空规则链）；单测更新
+- [x] **e2e +1 场景**：空行与 `/` 开头行原样、引号原样（`p2p_chat.rs` suite 注册）；逻辑 e2e 全量回归通过
+- [x] 冒烟：启动器分离/无黑窗/生命周期联动不回归
+
+> 已知边界：CLI 终端手输 `/sendStrings` 需自数行数（GUI 自动计数）；`\r\n` 经管道被行读取器剥成 `\n`（渲染无差，P2 进程内方案字节保真）。
+
+
+## P1.8 — 状态感知 + 快捷命令（✅ 已完成）
+
+> 针对双客户端实测发现的 UX 问题：文本框在登录/主菜单阶段协议错位、用户习惯在文本框输命令。
+> 纯 GUI 侧改动，零 CLI 变更；按"先逻辑后 UI"原则在逻辑批次完成后实施。
+
+- [x] **子进程状态机**：`ChildState{Menu,Login,Chat}`，`logic()` drain 输出行时按特征行推进
+  （`=== 主菜单 ===` → Menu / `[角色登录]` → Login / `发现模式: ` 前缀 → Chat）——**精确整行匹配**，
+  聊天内容带 `[对方]`/`[我 -> ` 前缀不会误触发；单测 2 项（生命周期转移矩阵 / 内容同款文本不触发）
+- [x] **文本框按状态启停**：仅 `Chat` 态启用（sendStrings 路径不变）；`Menu/Login` 态
+  `add_enabled(false)` + placeholder"登录/菜单操作请用上方命令框"——**根治登录阶段协议错位误用**；
+  发送逻辑（含回车判定）整体加 `in_chat` 守卫
+- [x] **命令框动态提示**：Menu →"菜单选择：4 进入 P2P 聊天；q 退出"/ Login →"登录输入：序号/资料/密码…"/ Chat → 命令提示
+- [x] **快捷命令按钮**：命令框旁 `/list`、`/q`（固定白名单直接透传；仅聊天态启用——主菜单下它们不是有效选择）
+- [x] **状态行**：`状态: 聊天中/登录中/主菜单`（聊天绿/其他黄）+ 延迟统计
+- [x] **首帧焦点**：聊天态聚焦文本框，否则聚焦命令框（引导先登录）
+- [x] 验证：构建全绿 + 单测 6 项 + 冒烟（启动器/无黑窗/生命周期联动不回归）
+
+## P1.9 — 双平台构建就绪（✅ 已完成）
+
+> 目标：一套代码 Windows/Linux 双平台运行与产物统一收集。
+
+- [x] **xtask 归档双 bin**：`cargo xtask build` 同时归档 `p2p_rust_app` + `p2p_rust_app_gui` 到
+  `target/{profile}/bin/<os>-<arch>/`（Windows 与 WSL/Linux 各自构建，产物按系统目录自然汇集）
+- [x] **Linux 分离启动对齐**：`cfg(unix)` 用 `process_group(0)` + stdio null 分离 spawn，
+  与 Windows 启动器体验一致（Linux 下 GUI 也不占终端）；`windows_subsystem` 属性加 `cfg(windows)` 门控
+- [x] **WSLg 实测通过**：Linux 全量构建（egui 0.36 全家 + wgpu）✓；分离启动（启动器立即退出、
+  后台 GUI 存活）✓；子进程 CLI 正常拉起（interact.log 200ms 内收到主菜单）✓；日志双文件落盘 ✓
+- [x] **WSL 环境备注**：发行版 cargo 1.93 不满足 egui 0.36 的 rustc≥1.95 要求 → 改用
+  rustup stable（1.98）；需补运行库 `libxkbcommon-x11-0`（winit X11 后端 dlopen 依赖）
+- [x] CLI 9 个历史告警清零（未用导入/`cQ` 命名；cmd_tree C 版对齐接口显式豁免；
+  `effective_trusted` 复用 `their_trust` 消除死包装）
+
+## P1.10 — 内置 CJK 字体兜底（✅ 已完成）
+
+> 问题：WSL 最小安装无任何 CJK 字库（实测仅 DejaVu/Ubuntu），egui 中文渲染为方块——
+> fonts.rs 的系统字体回退链全部落空。
+
+- [x] **内置兜底字体**：`assets/fonts/NotoSansCJKsc-Regular.otf`（Noto Sans CJK SC，OFL 授权，15.7MB，
+  `include_bytes!` 编译进二进制）——系统候选全部落空时自动启用，**任何环境开箱即显中文**
+- [x] **加载结果可观测**：`fonts::install` 返回 `LoadedFont`（来源描述），`new()` 写入 runtime.log
+  （`CJK 字体: 系统字体: …` / `CJK 字体: 内置兜底: …`）——无头环境凭日志即可验证
+- [x] **`P2P_FONT_FORCE_EMBEDDED=1`**：跳过系统探测强制内置（测试开关）
+- [x] **优先级验证（WSL 实测）**：强制内置模式 runtime.log 记录 `内置兜底: NotoSansCJKsc-Regular` ✅；
+  用户装 fonts-noto-cjk 后系统字体优先路径已先行人工验证 ✅
+- [x] 单测 +4（候选探测跳过不存在路径 / 命中存在路径 / 内置字体魔数与体积 / 空候选返回 None）
+- [x] 文档同步：README、xtask/README 的 WSL 字体要求从"必装"降级为"可选增强（内置兜底已覆盖）"
+
 ## P2 — 原生界面（"微信式"）
 
 ### 前提重构

@@ -19,6 +19,8 @@
 !/xtask/
 # xtask 构建产物不入库（保留源码）
 /xtask/target/
+!/assets/
+# assets 只入库字体资源（无需忽略子内容）
 
 # .opencode 下保留 skills 与 agent
 /.opencode/*

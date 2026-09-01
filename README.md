@@ -40,6 +40,29 @@ cargo run
 
 任何模组里输入 `help` 可查看该模组的命令列表。完整联机测试步骤见 [docs/新手测试指南.md](docs/新手测试指南.md)。
 
+### GUI 版（图形界面）
+
+```bash
+cargo run --bin p2p_rust_app_gui
+```
+
+- **启动即释放命令行**：启动器以分离进程拉起 GUI 后立即退出（原终端可继续用，无黑色控制台窗口）
+- **两个输入区**：
+  - **文本框**（下方大框）：纯文本语义——只发消息，多行粘贴原样发送（`/sendStrings` 协议自动生成）；输入 `/list` 也是聊天文本
+  - **命令框**（上方单行）：执行命令（`/list`、`/chat`、`/trust`…）；登录/主菜单阶段的选项与密码也在这里输入
+- **状态感知**：文本框仅在进入聊天后启用，登录/主菜单阶段自动禁用并提示用命令框；状态行实时显示"主菜单/登录中/聊天中"
+- **日志**：每次运行在 `~/.p2p_rust_app/gui_logs/<时间戳>/` 生成 `runtime.log`（软件运行日志）与 `interact.log`（交互输入输出），顶栏「日志」可打开侧栏实时查看
+- **中文显示自包含**：内置 CJK 字体兜底（Noto Sans CJK SC，OFL），无任何系统字库的裸 Linux/容器也能正常渲染；系统装有中文字体时优先使用
+- 生命周期与 CLI 绑定：CLI 退出 → GUI 自动关闭；关 GUI → CLI 一并退出
+
+### 构建产物归档（双平台）
+
+```bash
+cargo xtask build [--release]
+```
+
+构建后自动把 **CLI 与 GUI 两个可执行文件**归档到 `target/{debug|release}/bin/<os>-<arch>/`（`std::env::consts` 自动检测，Windows 为 `windows-x86_64`、Linux 为 `linux-x86_64`）。一套代码两平台：Windows 与 WSL/Linux 各自执行同一命令，产物按系统目录自然汇集。
+
 ### 第三步：逐个模组体验
 
 **1. 计算器** — 直接输入表达式回车即算（支持 `+ - * /`，先乘除后加减），如 `1+2*3`。输入 `q` 退出。
@@ -145,7 +168,7 @@ e2e 的登录凭据从 `tests/users.txt` 读取（首次运行前复制 `tests/u
 ### 测试现状
 
 - **单元测试 42 项**：指令树 / 拨号地址解析 / 身份与 keystore / 资料归一 / 指纹与联系人簿（含对称互信判定）/ mDNS 解析与发现模式 / seam 注册表路由（正常 vs 未互信）/ TextTag 往返 / 文件传输（sanitize + CRC32 向量）
-- **逻辑 e2e（tests/p2p_chat.rs，9 场景 + 2 standalone）**：基础聊天 / 按角色名呼叫 / 隐身发现模式 / 三节点 1v1 多会话 / 三节点群聊 / 信任管理+联系人名解析 / **对称信任**（互信→单方取消双向丢弃→恢复）/ **未互信钩子边界**（A 注册显示、B 未注册丢弃）/ 文件传输 / IPv6 自连
+- **逻辑 e2e（tests/p2p_chat.rs，10 场景 + 2 standalone）**：基础聊天 / 按角色名呼叫 / 隐身发现模式 / 三节点 1v1 多会话 / 三节点群聊 / 信任管理+联系人名解析 / **对称信任**（互信→单方取消双向丢弃→恢复）/ **未互信钩子边界**（A 注册显示、B 未注册丢弃）/ 文件传输 / **多行发送**（/sendStrings，空行与 / 开头行原样）/ IPv6 自连
 - **稳定性 e2e（tests/p2p_chat_stability.rs，6 场景，`--ignored` 显式）**：主动上下线循环 ×15 / kill 掉线循环 ×5 / 身份缓存回环（错密码校验）/ 同 ID 冲突拒绝 / 应用阻塞心跳仍存活 / 群主离线退群被拒 + 顺位转移
 - e2e 登录凭据从 `tests/users.txt` 读取（首次运行前复制 `tests/users.template.txt` 创建，该文件不入库；user1/2/3 名字互不相同）；测试身份用 BIP39 官方测试向量助记词（代码内常量，仅测试用）
 
@@ -183,7 +206,7 @@ docs/
   UI_PLAN.md               GUI 规划与待办（egui/eframe）
   GROUP_CRDT_ROADMAP.md    群成员名单去中心化方向
 xtask/
-  构建/发布辅助工具（cargo xtask build）
+  构建/发布辅助工具（cargo xtask build；用法详见 [xtask/README.md](xtask/README.md)）
 wish/             初心与愿景文档（去中心化平台蓝图）
 ```
 
