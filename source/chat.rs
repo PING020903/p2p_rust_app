@@ -10,7 +10,7 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::cmd_tree::{CmdError, CmdTree, ROOT};
 use crate::p2p::{cache_dir, load_discovery_mode, save_discovery_mode, save_download_dir, DiscoveryMode};
-use crate::p2p::identity_service::{is_l2_signal, IdentityService, StdinLines, TextTag};
+use crate::p2p::identity_service::{is_l2_signal, IdentityService, LineSource, TextTag};
 use crate::p2p::seam::{self, is_global_ipv6_listen, Event, SignalRegistry, BYE_HANDSHAKE_TIMEOUT};
 
 // ---- 语义注册表（L3 应用层）：text=Custom(tag) 承载协议语义，binary 承载负载 ----
@@ -76,7 +76,7 @@ pub(crate) enum AsyncOp {
 struct ChatCtx<'a> {
     identity: &'a mut IdentityService,
     cmd_tx: &'a tokio::sync::mpsc::Sender<seam::Cmd>,
-    stdin: &'a mut StdinLines,
+    input: &'a mut LineSource,
     interactive: bool,
     conversations: &'a mut HashMap<PeerId, Conversation>,
     groups: &'a mut HashMap<String, Group>,
@@ -127,7 +127,7 @@ fn push_cmd(ops: &mut VecDeque<AsyncOp>, cmd: seam::Cmd) {
 }
 
 /// 终端逃逸：`cmd/<命令>` 走 cmd.exe，`ps/<命令>` 走 PowerShell，`sh/<命令>` 走 POSIX sh。
-/// stdout/stderr 继承到真实终端（cls 可真清屏），stdin 置 null 不与应用抢输入。
+/// stdout/stderr 继承到真实终端（cls 可真清屏），input 置 null 不与应用抢输入。
 async fn run_terminal_escape(program: &str, args: &[&str], rest: &str) {
     let status = tokio::process::Command::new(program)
         .args(args)
@@ -187,7 +187,7 @@ pub(crate) struct AppCtx<'a> {
     identity: &'a mut IdentityService,
     conversations: &'a mut HashMap<PeerId, Conversation>,
     groups: &'a mut HashMap<String, Group>,
-    focused: &'a mut Option<PeerId>,    pub(crate) stdin: &'a mut StdinLines,
+    focused: &'a mut Option<PeerId>,    pub(crate) input: &'a mut LineSource,
     pub(crate) interactive: bool,
     pub(crate) cmd_tx: &'a tokio::sync::mpsc::Sender<seam::Cmd>,
     pub(crate) file: &'a mut crate::file_transfer::FileTransferState,
@@ -216,7 +216,7 @@ async fn on_peer_hello_signal(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Opti
     let conversations = &mut *ctx.conversations;
     let ok = ctx
         .identity
-        .handle_peer_hello(ctx.stdin, ctx.interactive, from, &name, |peer, name| {
+        .handle_peer_hello(ctx.input, ctx.interactive, from, &name, |peer, name| {
             let conv = conversations.entry(*peer).or_insert_with(Conversation::new);
             conv.name = name.to_string();
             println!("{}", format!("对方已上线: {name}").green());
@@ -1633,9 +1633,9 @@ async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
                         "{}",
                         format!("对方 {who} 未互信（需双方 /trust），确认发送？(y/n)").yellow()
                     );
-                    let ans = match ctx.stdin.next_line().await {
-                        Ok(Some(l)) => l.trim().to_string(),
-                        _ => String::new(),
+                    let ans = match ctx.input.next_line().await {
+                        Some(l) => l.trim().to_string(),
+                        None => String::new(),
                     };
                     if !ans.eq_ignore_ascii_case("y") {
                         println!("{}", "已取消发送".dimmed());
@@ -1684,10 +1684,10 @@ pub fn run() {
 
 async fn run_node() -> Result<(), Box<dyn Error>> {
     let interactive = std::io::stdin().is_terminal();
-    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut input = LineSource::Stdin(tokio::io::BufReader::new(tokio::io::stdin()).lines());
 
     // L2 身份基础：登录（含影子探测防同 ID 双在线）+ 联系人簿（TOFU）
-    let mut identity = IdentityService::login(&mut stdin, interactive).await?;
+    let mut identity = IdentityService::login(&mut input, interactive).await?;
     let discovery_mode = load_discovery_mode(identity.my_id());
     println!(
         "{}",
@@ -1800,21 +1800,17 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
 
     loop {
         tokio::select! {
-            line = stdin.next_line() => {
+            line = input.next_line() => {
+                // None = 输入结束（EOF/通道关闭）：多行收集中则报未闭合丢弃
                 let line = match line {
-                    Ok(Some(l)) => l,
-                    Ok(None) => {
-                        // 多行收集中 EOF：未闭合，报错丢弃
+                    Some(l) => l,
+                    None => {
                         if let Some((_, remaining)) = &sendstrings {
                             eprintln!(
                                 "{}",
                                 format!("多行消息未闭合（还差 {remaining} 行时输入结束），已丢弃").yellow()
                             );
                         }
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("{}", format!("读取输入失败: {e}").red());
                         break;
                     }
                 };
@@ -1824,7 +1820,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                         let mut ctx = ChatCtx {
                             identity: &mut identity,
                             cmd_tx: &cmd_tx,
-                            stdin: &mut stdin,
+                            input: &mut input,
                             interactive,
                             conversations: &mut conversations,
                             groups: &mut groups,
@@ -1886,7 +1882,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                     let mut ctx = ChatCtx {
                         identity: &mut identity,
                         cmd_tx: &cmd_tx,
-                        stdin: &mut stdin,
+                        input: &mut input,
                         interactive,
                         conversations: &mut conversations,
                         groups: &mut groups,
@@ -1912,7 +1908,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                             }
                             AsyncOp::Backup => {
                                 if let Err(e) =
-                                    ctx.identity.backup(ctx.stdin, ctx.interactive).await
+                                    ctx.identity.backup(ctx.input, ctx.interactive).await
                                 {
                                     eprintln!("{}", format!("备份失败: {e}").red());
                                 }
@@ -1939,7 +1935,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                 let mut ctx = ChatCtx {
                     identity: &mut identity,
                     cmd_tx: &cmd_tx,
-                    stdin: &mut stdin,
+                    input: &mut input,
                     interactive,
                     conversations: &mut conversations,
                     groups: &mut groups,
@@ -2058,7 +2054,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                         conversations: &mut conversations,
                                         groups: &mut groups,
                                         focused: &mut focused,
-                                        stdin: &mut stdin,
+                                        input: &mut input,
                                         interactive,
                                         cmd_tx: &cmd_tx,
                                         file: &mut file_state,
@@ -2073,7 +2069,7 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
                                     conversations: &mut conversations,
                                     groups: &mut groups,
                                     focused: &mut focused,
-                                    stdin: &mut stdin,
+                                    input: &mut input,
                                     interactive,
                                     cmd_tx: &cmd_tx,
                                     file: &mut file_state,

@@ -14,8 +14,24 @@ use super::identity::{
     probe_duplicate_id, probe_window, save_keystore, valid_password, IdentityInfo, LoginOutcome,
 };
 
-/// 输入行迭代器（stdin 被管道接管时逐行读取）
+/// 输入行迭代器（input 被管道接管时逐行读取）
 pub type StdinLines = tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>;
+
+/// 输入源抽象：CLI/e2e 读终端或管道（Stdin）；GUI 读 UI 输入通道（Channel）。
+/// 统一语义：next_line 返回 None = 输入结束（CLI 读错误视同结束，与主循环 break 行为一致）。
+pub enum LineSource {
+    Stdin(StdinLines),
+    Channel(tokio::sync::mpsc::UnboundedReceiver<String>),
+}
+
+impl LineSource {
+    pub async fn next_line(&mut self) -> Option<String> {
+        match self {
+            LineSource::Stdin(lines) => lines.next_line().await.ok().flatten(),
+            LineSource::Channel(rx) => rx.recv().await,
+        }
+    }
+}
 
 /// L2 内化信号枚举：hello/bye/trust 同一组，仅 L2 认识，L3 业务不触碰。
 /// `Frame.text` 线缆仍是字符串，应用侧用 `from_str`/`as_str` 与本枚举互转，
@@ -72,11 +88,11 @@ impl IdentityService {
     /// 登录并建立身份会话：菜单（新身份/恢复/缓存解锁）+ 影子探测防同 ID 双在线 +
     /// 加载联系人簿。ID 冲突时内部重试登录。
     pub async fn login(
-        stdin: &mut StdinLines,
+        src: &mut LineSource,
         interactive: bool,
     ) -> Result<Self, Box<dyn Error>> {
         loop {
-            let outcome = login_flow(stdin, interactive).await?;
+            let outcome = login_flow(src, interactive).await?;
             let my_id = outcome.keypair.public().to_peer_id();
             println!(
                 "{}",
@@ -172,7 +188,7 @@ impl IdentityService {
     /// 已存在联系人保持既有信任状态（OR 合并，不会降级）。
     pub async fn on_peer_hello(
         &mut self,
-        stdin: &mut StdinLines,
+        src: &mut LineSource,
         interactive: bool,
         peer: &PeerId,
         name: &str,
@@ -183,7 +199,7 @@ impl IdentityService {
                 println!("{}", "首次连接，请核对对方身份指纹:".yellow());
                 println!("  指纹: {}", fingerprint_of(peer).dimmed());
                 println!("  节点ID: {pid}");
-                let ans = read_line(stdin, "是否信任该节点（记录为联系人）? (y/n): ").await?;
+                let ans = read_line(src, "是否信任该节点（记录为联系人）? (y/n): ").await?;
                 let trusted = ans.trim().eq_ignore_ascii_case("y");
                 self.contacts.ensure_contact(peer, name, trusted);
                 if trusted {
@@ -213,7 +229,7 @@ impl IdentityService {
     /// 再触发 L3 注册的钩子（参数回调，可在运行时替换）。L3 不直接处理原始帧。
     pub async fn handle_peer_hello<H>(
         &mut self,
-        stdin: &mut StdinLines,
+        src: &mut LineSource,
         interactive: bool,
         peer: &PeerId,
         name: &str,
@@ -222,7 +238,7 @@ impl IdentityService {
     where
         H: FnMut(&PeerId, &str),
     {
-        self.on_peer_hello(stdin, interactive, peer, name).await?;
+        self.on_peer_hello(src, interactive, peer, name).await?;
         on_hello(peer, name);
         Ok(())
     }
@@ -240,7 +256,7 @@ impl IdentityService {
     /// /backup：重新查看本身份助记词（需再输密码解锁 keystore）
     pub async fn backup(
         &mut self,
-        stdin: &mut StdinLines,
+        src: &mut LineSource,
         interactive: bool,
     ) -> Result<(), Box<dyn Error>> {
         let stored = load_keystores();
@@ -249,7 +265,7 @@ impl IdentityService {
             .find(|(k, _)| k.peer_id == self.my_id.to_string())
         {
             println!("{}", "请输入密码以解锁本身份".yellow());
-            let password = read_secret(stdin, interactive, "密码: ").await?;
+            let password = read_secret(src, interactive, "密码: ").await?;
             match decrypt_mnemonic(
                 &password,
                 &ks.salt,
@@ -277,26 +293,27 @@ impl IdentityService {
 
 // ---- 登录交互（L2 身份会话建立）----
 
-async fn read_line(stdin: &mut StdinLines, prompt: &str) -> Result<String, Box<dyn Error>> {
+async fn read_line(src: &mut LineSource, prompt: &str) -> Result<String, Box<dyn Error>> {
     use std::io::Write;
     print!("{prompt}");
     std::io::stdout().flush()?;
-    match stdin.next_line().await? {
-        Some(l) => Ok(l),
-        None => Err("输入结束".into()),
-    }
+    let line = src
+        .next_line()
+        .await
+        .ok_or_else(|| -> Box<dyn Error> { "输入结束".into() })?;
+    Ok(line)
 }
 
 /// 读取密码：交互终端不回显（rpassword）；管道环境（测试/脚本）退回行读取
 async fn read_secret(
-    stdin: &mut StdinLines,
+    src: &mut LineSource,
     interactive: bool,
     prompt: &str,
 ) -> Result<String, Box<dyn Error>> {
     if interactive {
         Ok(rpassword::prompt_password(prompt)?)
     } else {
-        read_line(stdin, prompt).await
+        read_line(src, prompt).await
     }
 }
 
@@ -338,9 +355,9 @@ fn normalize_gender(raw: &str) -> Result<char, String> {
 }
 
 /// 交互收集资料信息（姓名/生日/性别）
-async fn prompt_profile(stdin: &mut StdinLines) -> Result<IdentityInfo, Box<dyn Error>> {
+async fn prompt_profile(src: &mut LineSource) -> Result<IdentityInfo, Box<dyn Error>> {
     let name = loop {
-        let raw = read_line(stdin, "姓名: ").await?;
+        let raw = read_line(src, "姓名: ").await?;
         let name = raw.trim().to_string();
         if name.is_empty() || name.len() > 64 {
             eprintln!("{}", "姓名不能为空且不超过 64 字节".yellow());
@@ -349,14 +366,14 @@ async fn prompt_profile(stdin: &mut StdinLines) -> Result<IdentityInfo, Box<dyn 
         }
     };
     let birthday = loop {
-        let raw = read_line(stdin, "生日 (YYYY-MM-DD): ").await?;
+        let raw = read_line(src, "生日 (YYYY-MM-DD): ").await?;
         match normalize_birthday(&raw) {
             Ok(b) => break b,
             Err(reason) => eprintln!("{}", reason.yellow()),
         }
     };
     let gender = loop {
-        let raw = read_line(stdin, "性别 (男/M 女/F 保密/O): ").await?;
+        let raw = read_line(src, "性别 (男/M 女/F 保密/O): ").await?;
         match normalize_gender(&raw) {
             Ok(g) => break g,
             Err(reason) => eprintln!("{}", reason.yellow()),
@@ -371,11 +388,11 @@ async fn prompt_profile(stdin: &mut StdinLines) -> Result<IdentityInfo, Box<dyn 
 
 /// 交互收集并校验密码
 async fn prompt_password(
-    stdin: &mut StdinLines,
+    src: &mut LineSource,
     interactive: bool,
 ) -> Result<String, Box<dyn Error>> {
     loop {
-        let pwd = read_secret(stdin, interactive, "密码: ").await?;
+        let pwd = read_secret(src, interactive, "密码: ").await?;
         if valid_password(&pwd) {
             return Ok(pwd);
         }
@@ -397,7 +414,7 @@ fn print_mnemonic_guide(phrase: &str) {
 /// 登录流程：新身份生成 / 助记词恢复 / 缓存 keystore 解锁。
 /// 新身份与恢复都会自动加密保存 keystore；同 ID 冲突由调用方在探测后处理。
 async fn login_flow(
-    stdin: &mut StdinLines,
+    src: &mut LineSource,
     interactive: bool,
 ) -> Result<LoginOutcome, Box<dyn Error>> {
     loop {
@@ -413,12 +430,12 @@ async fn login_flow(
         }
         println!("  0. 新身份登录");
         println!("  r. 从助记词恢复");
-        let input = read_line(stdin, "请选择: ").await?;
+        let input = read_line(src, "请选择: ").await?;
         let input = input.trim();
 
         if input == "0" {
             // 新身份：生成助记词，展示一次并要求抄写确认
-            let info = prompt_profile(stdin).await?;
+            let info = prompt_profile(src).await?;
             let phrase = loop {
                 let phrase = match generate_mnemonic() {
                     Ok(p) => p,
@@ -429,7 +446,7 @@ async fn login_flow(
                 };
                 print_mnemonic_guide(&phrase);
                 let confirm = read_line(
-                    stdin,
+                    src,
                     &format!("请抄下助记词，输入前 {MNEMONIC_CONFIRM_WORDS} 个词确认: "),
                 )
                 .await?;
@@ -445,14 +462,14 @@ async fn login_flow(
                 }
                 eprintln!("{}", "确认词不匹配，请重新抄写".yellow());
             };
-            let password = prompt_password(stdin, interactive).await?;
+            let password = prompt_password(src, interactive).await?;
             let keypair = keypair_from_mnemonic(&phrase)?;
             let peer_id = keypair.public().to_peer_id();
             save_keystore(&info, &peer_id, &phrase, &password)?;
             return Ok(LoginOutcome { keypair, info });
         } else if input == "r" {
             // 从助记词恢复身份（跨设备迁移 / 备份恢复）
-            let phrase = read_line(stdin, "助记词（12 个英文词，空格分隔）: ").await?;
+            let phrase = read_line(src, "助记词（12 个英文词，空格分隔）: ").await?;
             let keypair = match keypair_from_mnemonic(&phrase) {
                 Ok(kp) => kp,
                 Err(reason) => {
@@ -460,8 +477,8 @@ async fn login_flow(
                     continue;
                 }
             };
-            let info = prompt_profile(stdin).await?;
-            let password = prompt_password(stdin, interactive).await?;
+            let info = prompt_profile(src).await?;
+            let password = prompt_password(src, interactive).await?;
             let peer_id = keypair.public().to_peer_id();
             save_keystore(&info, &peer_id, &phrase, &password)?;
             return Ok(LoginOutcome { keypair, info });
@@ -470,7 +487,7 @@ async fn login_flow(
                 // 缓存解锁：密码错误最多重试 3 次
                 let (ks, info) = &cached[n - 1];
                 for _ in 0..3 {
-                    let password = read_secret(stdin, interactive, "密码: ").await?;
+                    let password = read_secret(src, interactive, "密码: ").await?;
                     if !valid_password(&password) {
                         eprintln!("{}", "密码须为 8~128 字节".yellow());
                         continue;
@@ -639,12 +656,13 @@ mod tests {
             },
             contacts: ContactBook::load(&my_id),
         };
-        // 管道模式（interactive=false）下 hello 不读 stdin，可直接喂未使用的 stdin
+        // 管道模式（interactive=false）下 hello 不读 input，可直接喂未使用的 input
         use tokio::io::AsyncBufReadExt;
-        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        let mut input =
+            LineSource::Stdin(tokio::io::BufReader::new(tokio::io::stdin()).lines());
         // hello 钩子触发 + 收到名字
         let mut hello_calls: Vec<(String, String)> = Vec::new();
-        svc.handle_peer_hello(&mut stdin, false, &peer, "bob", |p, n| {
+        svc.handle_peer_hello(&mut input, false, &peer, "bob", |p, n| {
             hello_calls.push((p.to_string(), n.to_string()));
         })
         .await
