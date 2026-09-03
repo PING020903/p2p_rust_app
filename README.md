@@ -21,13 +21,18 @@ rustc --version
 cargo --version
 ```
 
-### 第二步：编译与运行
+### 第二步：编译与运行（单 exe 双模式）
 
 ```bash
-cargo run
+cargo run -- --cli     # 纯 CLI 模式：终端主菜单（1-5）
+cargo run              # GUI 模式：分离进程拉起窗口，命令行立即释放
 ```
 
-首次编译需要几分钟（libp2p 依赖较多），之后秒开。启动后进入主菜单：
+- 首次编译需要几分钟（libp2p 依赖较多），之后秒开
+- **无参数启动默认 GUI**（窗口 + 引擎线程，无子进程、无黑窗）；`--cli` 参数或管道输入 → **纯 CLI 模式**
+- 双击 exe：GUI 模式（启动器控制台有 <1s 闪现，已知项）
+
+CLI 模式启动后进入主菜单：
 
 ```
 === 主菜单 ===
@@ -35,6 +40,7 @@ cargo run
   2. 学生信息管理
   3. 彩色打印演示
   4. P2P 聊天
+  5. 清除会话日志
   q. 退出
 ```
 
@@ -43,17 +49,16 @@ cargo run
 ### GUI 版（图形界面）
 
 ```bash
-cargo run --bin p2p_rust_app_gui
+cargo run              # 无参数默认即 GUI
 ```
 
-- **启动即释放命令行**：启动器以分离进程拉起 GUI 后立即退出（原终端可继续用，无黑色控制台窗口）
 - **两个输入区**：
   - **文本框**（下方大框）：纯文本语义——只发消息，多行粘贴原样发送（`/sendStrings` 协议自动生成）；输入 `/list` 也是聊天文本
   - **命令框**（上方单行）：执行命令（`/list`、`/chat`、`/trust`…）；登录/主菜单阶段的选项与密码也在这里输入
 - **状态感知**：文本框仅在进入聊天后启用，登录/主菜单阶段自动禁用并提示用命令框；状态行实时显示"主菜单/登录中/聊天中"
 - **日志**：每次运行在 `~/.p2p_rust_app/gui_logs/<时间戳>/` 生成 `runtime.log`（软件运行日志）与 `interact.log`（交互输入输出），顶栏「日志」可打开侧栏实时查看
 - **中文显示自包含**：内置 CJK 字体兜底（Noto Sans CJK SC，OFL），无任何系统字库的裸 Linux/容器也能正常渲染；系统装有中文字体时优先使用
-- 生命周期与 CLI 绑定：CLI 退出 → GUI 自动关闭；关 GUI → CLI 一并退出
+- 生命周期与引擎绑定：聊天退出（`/q`）→ GUI 自动关闭；关 GUI → 引擎一并退出
 
 ### 构建产物归档（双平台）
 
@@ -61,7 +66,7 @@ cargo run --bin p2p_rust_app_gui
 cargo xtask build [--release]
 ```
 
-构建后自动把 **CLI 与 GUI 两个可执行文件**归档到 `target/{debug|release}/bin/<os>-<arch>/`（`std::env::consts` 自动检测，Windows 为 `windows-x86_64`、Linux 为 `linux-x86_64`）。一套代码两平台：Windows 与 WSL/Linux 各自执行同一命令，产物按系统目录自然汇集。
+构建后把可执行文件归档到 `target/{debug|release}/bin/<os>-<arch>/`（`std::env::consts` 自动检测，Windows 为 `windows-x86_64`、Linux 为 `linux-x86_64`）。一套代码两平台：Windows 与 WSL/Linux 各自执行同一命令，产物按系统目录自然汇集。详见 [xtask/README.md](xtask/README.md)。
 
 ### 第三步：逐个模组体验
 

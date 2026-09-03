@@ -3,8 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// 归档的可执行文件：CLI + GUI 双 bin（一套代码两平台产物统一收集）
-const BINS: &[&str] = &["p2p_rust_app", "p2p_rust_app_gui"];
+/// 归档的可执行文件：单 exe 双模式（无参→GUI，--cli/管道→CLI）
+const BINS: &[&str] = &["p2p_rust_app"];
 
 fn main() {
     if let Err(e) = run() {

@@ -56,6 +56,10 @@
     （WSL 发行版 cargo 需换 rustup stable、补 `libxkbcommon-x11-0`）
   - **CLI 告警清零**：未用导入删除、`cQ` 更名、cmd_tree C 版对齐接口显式豁免、
     `effective_trusted` 复用 `their_trust`（消除死包装）
+- **主菜单「5. 清除会话日志」**：清理 `gui_logs/<时间戳>/` 运行日志碎片（每次 GUI 运行产生一个
+  目录）——统计目录数/体积 → `y/n` 确认 → **保留最近 1 次**删除其余（GUI 运行中触发自动豁免当前
+  会话目录，避开文件锁）；单个目录删除失败跳过不中断；只清日志，身份/联系人/群/设置一律不动；
+  核心函数按目录名字典序判新旧（不依赖 mtime）+ tempdir 单测 ×4
 - **内置 CJK 字体兜底（P1.10）**：`assets/fonts/NotoSansCJKsc-Regular.otf`（Noto Sans CJK SC，
   OFL 授权，15.7MB，`include_bytes!` 编译进二进制）——系统候选全部落空时自动启用，
   **任何环境开箱即显中文**（WSL 最小安装裸机实测通过）；`fonts::install` 返回加载来源写入

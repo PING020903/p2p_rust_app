@@ -75,11 +75,14 @@ pub struct ConsoleHandle {
     pub console: Console,
 }
 
-/// 启动 CLI 子进程（当前 exe 同目录的兄弟二进制）。
+/// 启动 CLI 子进程：spawn **自身**（单 exe 双模式，`--cli` 参数 + 管道 stdio 落 CLI 分支）。
 /// `interact`：可选交互日志存储，子进程每行输出会写入（带时间戳，供分析对比）。
 pub fn spawn(ctx: Context, interact: Option<Arc<LogStore>>) -> Result<ConsoleHandle, String> {
-    let bin = locate_cli_binary()?;
-    let mut cmd = Command::new(&bin);
+    let exe = std::env::current_exe().map_err(|e| format!("定位当前 exe 失败: {e}"))?;
+    let mut cmd = Command::new(&exe);
+    cmd.arg("--cli");
+    // 移除 GUI 子进程标记：否则（GUI 自身带标记启动时）子进程会再次进 GUI 分支无限增殖
+    cmd.env_remove(crate::CHILD_ENV);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -93,7 +96,7 @@ pub fn spawn(ctx: Context, interact: Option<Arc<LogStore>>) -> Result<ConsoleHan
     }
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("启动 {} 失败: {e}", bin.display()))?;
+        .map_err(|e| format!("启动 {} 失败: {e}", exe.display()))?;
     let stdout = child.stdout.take().ok_or("无法接管子进程 stdout")?;
     let stderr = child.stderr.take().ok_or("无法接管子进程 stderr")?;
     let stdin = child.stdin.take().ok_or("无法接管子进程 stdin")?;
@@ -110,23 +113,6 @@ pub fn spawn(ctx: Context, interact: Option<Arc<LogStore>>) -> Result<ConsoleHan
             reported_exit: false,
         },
     })
-}
-
-/// 定位 CLI 二进制：p2p_rust_app_gui.exe 的兄弟 p2p_rust_app.exe（同 target/debug 或 release 目录）
-fn locate_cli_binary() -> Result<std::path::PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("无法定位当前 exe: {e}"))?;
-    let dir = exe.parent().ok_or("无法确定 exe 所在目录")?;
-    let name = if cfg!(windows) {
-        "p2p_rust_app.exe"
-    } else {
-        "p2p_rust_app"
-    };
-    let bin = dir.join(name);
-    if bin.exists() {
-        Ok(bin)
-    } else {
-        Err(format!("未找到 CLI 二进制: {}", bin.display()))
-    }
 }
 
 /// 管道读取线程：按行拆包送 UI；无换行的部分输出（提示符）即时上屏。
