@@ -7,12 +7,26 @@
 //! GUI 模式以 `DETACHED_PROCESS` 分离 spawn 自身，窗口无黑窗伴随，
 //! 仅双击启动时启动器控制台有 <1s 闪现（已知项）。
 
+// 输出重定向宏：crate 级遮蔽 std 宏，路由到线程局部 sink（source/sink.rs）。
+// 未安装 sink 的线程（CLI 模式、主线程）回落 ::std 宏——行为与原来逐字节一致；
+// GUI 引擎线程 install 通道后输出进滚动区。必须先于 mod 声明（文本作用域）。
+macro_rules! println {
+    ($($arg:tt)*) => { $crate::sink::line(::std::format!($($arg)*)) };
+}
+macro_rules! eprintln {
+    ($($arg:tt)*) => { $crate::sink::err(::std::format!($($arg)*)) };
+}
+macro_rules! print {
+    ($($arg:tt)*) => { $crate::sink::raw(::std::format!($($arg)*)) };
+}
+
 mod calculator;
 mod chat;
 mod cmd_tree;
 mod color_print;
 mod file_transfer;
 mod p2p;
+mod sink;
 mod student;
 mod ui;
 
