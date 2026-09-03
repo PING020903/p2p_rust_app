@@ -10,8 +10,7 @@ use std::error::Error;
 
 use super::contacts::{fingerprint_of, ContactBook, ContactEntry};
 use super::identity::{
-    decrypt_mnemonic, generate_mnemonic, keypair_from_mnemonic, load_keystores,
-    probe_duplicate_id, probe_window, save_keystore, valid_password, IdentityInfo, LoginOutcome,
+    decrypt_mnemonic, load_keystores, probe_duplicate_id, probe_window, IdentityInfo, LoginOutcome,
 };
 
 /// 输入行迭代器（input 被管道接管时逐行读取）
@@ -49,6 +48,29 @@ impl LineSource {
             Some(InputMsg::Line(s)) => Some(s),
             Some(InputMsg::ChatText(t)) => Some(t),
             None => None,
+        }
+    }
+
+    /// 带提示符读取一行（登录/确认等交互场景；I/O 属输入抽象自身）
+    pub async fn prompt(&mut self, prompt: &str) -> Result<String, Box<dyn Error>> {
+        use std::io::Write;
+        print!("{prompt}");
+        std::io::stdout().flush()?;
+        self.next_raw_line()
+            .await
+            .ok_or_else(|| -> Box<dyn Error> { "输入结束".into() })
+    }
+
+    /// 带提示符读取密码：交互终端不回显（rpassword）；管道环境（测试/脚本）退回行读取
+    pub async fn prompt_secret(
+        &mut self,
+        interactive: bool,
+        prompt: &str,
+    ) -> Result<String, Box<dyn Error>> {
+        if interactive {
+            Ok(rpassword::prompt_password(prompt)?)
+        } else {
+            self.prompt(prompt).await
         }
     }
 }
@@ -92,9 +114,6 @@ pub fn is_l2_signal(tag: &str) -> bool {
     TextTag::from_str(tag).is_some()
 }
 
-/// 新身份助记词抄写确认词数
-const MNEMONIC_CONFIRM_WORDS: usize = 3;
-
 /// L2 身份服务：持有身份会话（keypair/资料/节点ID）+ 联系人簿（TOFU 信任状态）。
 /// 身份与信任是所有上层业务的根依赖——任何业务要回答"对方是谁/是否可信"都经这里。
 pub struct IdentityService {
@@ -104,41 +123,57 @@ pub struct IdentityService {
     contacts: ContactBook,
 }
 
+/// 登录会话建立错误：类型化供前端分别处置（CLI 回菜单重试 / GUI 表单内联报错）
+#[derive(Debug)]
+pub enum LoginError {
+    /// 角色 ID 已在线（同 ID 不能同时上线；addr = 影子探测发现的在线地址）
+    IdInUse(libp2p::Multiaddr),
+    /// 其他错误（IO / 加解密等，透传原错误）
+    Other(Box<dyn Error>),
+}
+
+impl std::fmt::Display for LoginError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoginError::IdInUse(addr) => write!(f, "角色 ID 已在线（发现于 {addr}）"),
+            LoginError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl Error for LoginError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            LoginError::Other(e) => Some(e.as_ref()),
+            _ => None,
+        }
+    }
+}
+
 impl IdentityService {
-    /// 登录并建立身份会话：菜单（新身份/恢复/缓存解锁）+ 影子探测防同 ID 双在线 +
-    /// 加载联系人簿。ID 冲突时内部重试登录。
-    pub async fn login(
-        src: &mut LineSource,
-        interactive: bool,
-    ) -> Result<Self, Box<dyn Error>> {
-        loop {
-            let outcome = login_flow(src, interactive).await?;
-            let my_id = outcome.keypair.public().to_peer_id();
-            println!(
-                "{}",
-                format!("登录成功: {} (节点ID {my_id})", outcome.info.name).green()
-            );
-            match probe_duplicate_id(my_id, probe_window()).await? {
-                Some(addr) => {
-                    eprintln!(
-                        "{}",
-                        format!("该角色 ID 已在线（发现于 {addr}），同一 ID 不能同时上线").red()
-                    );
-                    eprintln!(
-                        "{}",
-                        "请改用其他身份，或先关闭占用该 ID 的设备后重试".yellow()
-                    );
-                }
-                None => {
-                    let contacts = ContactBook::load(&my_id);
-                    return Ok(IdentityService {
-                        keypair: outcome.keypair,
-                        my_id,
-                        info: outcome.info,
-                        contacts,
-                    });
-                }
+    /// 以既有登录凭据建立身份会话：影子探测防同 ID 双在线 + 加载联系人簿。
+    ///
+    /// 登录凭据（keypair/资料）由前端产出——CLI 文本菜单或 GUI 表单编排（应用层），
+    /// 本方法只做会话建立，不涉及任何交互流程。
+    /// ID 冲突返回 [`LoginError::IdInUse`]，重试策略由前端决定。
+    pub async fn login_pre(outcome: LoginOutcome) -> Result<Self, LoginError> {
+        let my_id = outcome.keypair.public().to_peer_id();
+        println!(
+            "{}",
+            format!("登录成功: {} (节点ID {my_id})", outcome.info.name).green()
+        );
+        match probe_duplicate_id(my_id, probe_window()).await {
+            Ok(Some(addr)) => Err(LoginError::IdInUse(addr)),
+            Ok(None) => {
+                let contacts = ContactBook::load(&my_id);
+                Ok(IdentityService {
+                    keypair: outcome.keypair,
+                    my_id,
+                    info: outcome.info,
+                    contacts,
+                })
             }
+            Err(e) => Err(LoginError::Other(e)),
         }
     }
 
@@ -219,7 +254,7 @@ impl IdentityService {
                 println!("{}", "首次连接，请核对对方身份指纹:".yellow());
                 println!("  指纹: {}", fingerprint_of(peer).dimmed());
                 println!("  节点ID: {pid}");
-                let ans = read_line(src, "是否信任该节点（记录为联系人）? (y/n): ").await?;
+                let ans = src.prompt("是否信任该节点（记录为联系人）? (y/n): ").await?;
                 let trusted = ans.trim().eq_ignore_ascii_case("y");
                 self.contacts.ensure_contact(peer, name, trusted);
                 if trusted {
@@ -285,7 +320,7 @@ impl IdentityService {
             .find(|(k, _)| k.peer_id == self.my_id.to_string())
         {
             println!("{}", "请输入密码以解锁本身份".yellow());
-            let password = read_secret(src, interactive, "密码: ").await?;
+            let password = src.prompt_secret(interactive, "密码: ").await?;
             match decrypt_mnemonic(
                 &password,
                 &ks.salt,
@@ -311,33 +346,10 @@ impl IdentityService {
     }
 }
 
-// ---- 登录交互（L2 身份会话建立）----
+// ---- 领域校验（CLI/GUI 前端共用的 L2 规则）----
 
-async fn read_line(src: &mut LineSource, prompt: &str) -> Result<String, Box<dyn Error>> {
-    use std::io::Write;
-    print!("{prompt}");
-    std::io::stdout().flush()?;
-    let line = src
-        .next_raw_line()
-        .await
-        .ok_or_else(|| -> Box<dyn Error> { "输入结束".into() })?;
-    Ok(line)
-}
-
-/// 读取密码：交互终端不回显（rpassword）；管道环境（测试/脚本）退回行读取
-async fn read_secret(
-    src: &mut LineSource,
-    interactive: bool,
-    prompt: &str,
-) -> Result<String, Box<dyn Error>> {
-    if interactive {
-        Ok(rpassword::prompt_password(prompt)?)
-    } else {
-        read_line(src, prompt).await
-    }
-}
-
-fn normalize_birthday(raw: &str) -> Result<String, String> {
+/// 归一化生日（YYYY-MM-DD；容错单位数月/日，越界报错）
+pub fn normalize_birthday(raw: &str) -> Result<String, String> {
     let parts: Vec<&str> = raw.trim().split('-').collect();
     if parts.len() != 3 {
         return Err("生日格式应为 YYYY-MM-DD，如 1990-01-01".into());
@@ -365,7 +377,8 @@ fn normalize_birthday(raw: &str) -> Result<String, String> {
     Ok(format!("{y:04}-{m:02}-{d:02}"))
 }
 
-fn normalize_gender(raw: &str) -> Result<char, String> {
+/// 归一化性别（男/M、女/F、保密/O；前端表单与 CLI 共用的域校验）
+pub fn normalize_gender(raw: &str) -> Result<char, String> {
     match raw.trim() {
         "男" | "M" | "m" => Ok('M'),
         "女" | "F" | "f" => Ok('F'),
@@ -374,54 +387,8 @@ fn normalize_gender(raw: &str) -> Result<char, String> {
     }
 }
 
-/// 交互收集资料信息（姓名/生日/性别）
-async fn prompt_profile(src: &mut LineSource) -> Result<IdentityInfo, Box<dyn Error>> {
-    let name = loop {
-        let raw = read_line(src, "姓名: ").await?;
-        let name = raw.trim().to_string();
-        if name.is_empty() || name.len() > 64 {
-            eprintln!("{}", "姓名不能为空且不超过 64 字节".yellow());
-        } else {
-            break name;
-        }
-    };
-    let birthday = loop {
-        let raw = read_line(src, "生日 (YYYY-MM-DD): ").await?;
-        match normalize_birthday(&raw) {
-            Ok(b) => break b,
-            Err(reason) => eprintln!("{}", reason.yellow()),
-        }
-    };
-    let gender = loop {
-        let raw = read_line(src, "性别 (男/M 女/F 保密/O): ").await?;
-        match normalize_gender(&raw) {
-            Ok(g) => break g,
-            Err(reason) => eprintln!("{}", reason.yellow()),
-        }
-    };
-    Ok(IdentityInfo {
-        name,
-        birthday,
-        gender,
-    })
-}
-
-/// 交互收集并校验密码
-async fn prompt_password(
-    src: &mut LineSource,
-    interactive: bool,
-) -> Result<String, Box<dyn Error>> {
-    loop {
-        let pwd = read_secret(src, interactive, "密码: ").await?;
-        if valid_password(&pwd) {
-            return Ok(pwd);
-        }
-        eprintln!("{}", "密码须为 8~128 字节".yellow());
-    }
-}
-
-/// 展示助记词与安全提示
-fn print_mnemonic_guide(phrase: &str) {
+/// 展示助记词与安全提示（/backup 与 CLI 登录共用的显示辅助；随 /backup 迁移归属应用层）
+pub(crate) fn print_mnemonic_guide(phrase: &str) {
     println!("{}", "=".repeat(60).yellow());
     println!(
         "{}",
@@ -431,132 +398,10 @@ fn print_mnemonic_guide(phrase: &str) {
     println!("{}", "=".repeat(60).yellow());
 }
 
-/// 登录流程：新身份生成 / 助记词恢复 / 缓存 keystore 解锁。
-/// 新身份与恢复都会自动加密保存 keystore；同 ID 冲突由调用方在探测后处理。
-async fn login_flow(
-    src: &mut LineSource,
-    interactive: bool,
-) -> Result<LoginOutcome, Box<dyn Error>> {
-    loop {
-        let cached = load_keystores();
-        println!("{}", "[角色登录]".green());
-        if cached.is_empty() {
-            println!("{}", "暂无本地身份".dimmed());
-        } else {
-            println!("缓存身份:");
-            for (i, (ks, info)) in cached.iter().enumerate() {
-                println!("  {}. {}  ({})", i + 1, info.name, ks.peer_id);
-            }
-        }
-        println!("  0. 新身份登录");
-        println!("  r. 从助记词恢复");
-        let input = read_line(src, "请选择: ").await?;
-        let input = input.trim();
-
-        if input == "0" {
-            // 新身份：生成助记词，展示一次并要求抄写确认
-            let info = prompt_profile(src).await?;
-            let phrase = loop {
-                let phrase = match generate_mnemonic() {
-                    Ok(p) => p,
-                    Err(reason) => {
-                        eprintln!("{}", reason.red());
-                        continue;
-                    }
-                };
-                print_mnemonic_guide(&phrase);
-                let confirm = read_line(
-                    src,
-                    &format!("请抄下助记词，输入前 {MNEMONIC_CONFIRM_WORDS} 个词确认: "),
-                )
-                .await?;
-                let first: Vec<&str> = phrase
-                    .split_whitespace()
-                    .take(MNEMONIC_CONFIRM_WORDS)
-                    .collect();
-                let got: Vec<&str> = confirm.split_whitespace().collect();
-                if got.len() >= MNEMONIC_CONFIRM_WORDS
-                    && got[..MNEMONIC_CONFIRM_WORDS] == first[..]
-                {
-                    break phrase;
-                }
-                eprintln!("{}", "确认词不匹配，请重新抄写".yellow());
-            };
-            let password = prompt_password(src, interactive).await?;
-            let keypair = keypair_from_mnemonic(&phrase)?;
-            let peer_id = keypair.public().to_peer_id();
-            save_keystore(&info, &peer_id, &phrase, &password)?;
-            return Ok(LoginOutcome { keypair, info });
-        } else if input == "r" {
-            // 从助记词恢复身份（跨设备迁移 / 备份恢复）
-            let phrase = read_line(src, "助记词（12 个英文词，空格分隔）: ").await?;
-            let keypair = match keypair_from_mnemonic(&phrase) {
-                Ok(kp) => kp,
-                Err(reason) => {
-                    eprintln!("{}", reason.red());
-                    continue;
-                }
-            };
-            let info = prompt_profile(src).await?;
-            let password = prompt_password(src, interactive).await?;
-            let peer_id = keypair.public().to_peer_id();
-            save_keystore(&info, &peer_id, &phrase, &password)?;
-            return Ok(LoginOutcome { keypair, info });
-        } else if let Ok(n) = input.parse::<usize>() {
-            if n >= 1 && n <= cached.len() {
-                // 缓存解锁：密码错误最多重试 3 次
-                let (ks, info) = &cached[n - 1];
-                for _ in 0..3 {
-                    let password = read_secret(src, interactive, "密码: ").await?;
-                    if !valid_password(&password) {
-                        eprintln!("{}", "密码须为 8~128 字节".yellow());
-                        continue;
-                    }
-                    match decrypt_mnemonic(
-                        &password,
-                        &ks.salt,
-                        &ks.nonce,
-                        &ks.enc,
-                        ks.kdf_m,
-                        ks.kdf_t,
-                        ks.kdf_p,
-                    ) {
-                        Ok(phrase) => match keypair_from_mnemonic(&phrase) {
-                            Ok(kp) if kp.public().to_peer_id().to_string() == ks.peer_id => {
-                                return Ok(LoginOutcome {
-                                    keypair: kp,
-                                    info: IdentityInfo {
-                                        name: info.name.clone(),
-                                        birthday: info.birthday.clone(),
-                                        gender: info.gender,
-                                    },
-                                });
-                            }
-                            Ok(_) => {
-                                eprintln!("{}", "keystore 与派生身份不符，数据可能损坏".red());
-                            }
-                            Err(reason) => {
-                                eprintln!("{}", reason.red());
-                            }
-                        },
-                        Err(reason) => {
-                            eprintln!("{}", reason.red());
-                        }
-                    }
-                }
-                eprintln!("{}", "连续多次密码错误，返回选择菜单".yellow());
-            } else {
-                eprintln!("{}", "序号无效，请重新选择".yellow());
-            }
-        } else {
-            eprintln!("{}", "无效选择，请输入序号、0 或 r".yellow());
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::p2p::identity::keypair_from_mnemonic;
 
     #[test]
     fn text_tag_round_trip_and_l2_signal() {

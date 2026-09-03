@@ -164,12 +164,33 @@ GUI：tokio 后台线程跑核心，UI 主线程每帧 drain 事件通道
 - 已知边界：GUI 模式无主菜单（引擎直入登录，`/q` 退出聊天即关闭应用）；node.rs L1 传输噪声行暂不进滚动区（P2.2 收口）
 
 ### 界面
-- [ ] **登录页**：缓存身份列表 / 新身份表单（资料 + 助记词确认）/ 助记词恢复 / 密码（password 模式）——登录状态机化（CLI 文本驱动与 GUI 表单驱动共用步骤）
+- [x] **登录页**（✅ P2.1）：全窗口登录卡片（登录期引擎未启动、底部输入面板隐藏）——
+  缓存身份列表（按钮 + 节点ID 摘要）/ 缓存解锁（masked 密码框，错误内联可重试）/
+  新身份向导（资料表单 → 助记词展示可复制 → 抄写前 3 词确认 → 密码二次确认）/ 助记词恢复（12 词校验 → 资料 → 密码）；
+  登录成功后带凭据启动引擎（`run_engine(Some(outcome))`）切聊天布局
+  ——架构：视图+状态机在 `p2p_app/chat/gui/login.rs`，编排只调 p2p 领域 API；
+  密码全程只在表单内流转（masked），不进命令框、不落 interact.log（CLI 命令框明文问题随之消除）
 - [ ] **左栏**：联系人（含信任徽标 `[互信]/[我信任/对方未确认]/[未信任]`）+ 群列表 + 发现节点
 - [ ] **中区**：会话气泡（焦点/非焦点带名）、群消息（`[群名] [成员名]`）——需消息结构化（`UiEvent::ChatText{from, text, focused}`，引擎显示逻辑拆分：CLI 格式化文本 / GUI 渲染气泡）
-- [ ] **底部**：输入框 + `/` 命令快捷入口
+- [ ] **底部**：输入框 + `/` 命令快捷入口（P2.1 起登录期隐藏，仅聊天态显示）
 - [ ] **弹窗**：TOFU 指纹确认、`/backup` 助记词、未信任发送确认、文件接收、下载目录选择
 - [ ] **状态栏**：发现模式、下载目录、本机节点 ID
+
+### 应用层结构（P2.1 起生效，架构纪律）
+
+```
+source/
+├── p2p/          协议核心（L1/L2）：无渲染、无交互流程、无 GUI 形状类型
+│                 前端触碰核心只有两条合法通道——调用领域 API + LineSource/sink I/O
+├── p2p_app/      应用层（L3+）：按应用细分（chat/file_transfer），应用内分 cli/gui
+│                 └── 交互流程（登录菜单/表单、确认编排）永不进 p2p/
+├── ui/           跨应用渲染件（GuiApp 壳、fonts、日志面板）
+└── chat.rs       应用编排（主体后续专项迁入 p2p_app/chat/）
+```
+
+- P2.1 落地：CLI 文本登录流程自 identity_service.rs 迁入 `p2p_app/chat/cli/login.rs`（提示文案逐字节不变）；
+  L2 只增领域 API：`IdentityService::login_pre(LoginOutcome)`（既有凭据建会话，冲突返回 `LoginError::IdInUse`）、
+  `normalize_birthday/normalize_gender` 开放、`LineSource::prompt/prompt_secret`（带提示符读行/密码）
 
 ## P3 — 打磨
 - [ ] 命令按钮化（`/trust`、`/group`、`/send` 原生文件选择器）

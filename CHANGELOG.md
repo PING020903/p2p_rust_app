@@ -9,6 +9,19 @@
 
 ### 新增
 
+- **P2.1 GUI 登录页 + 应用层结构（p2p_app/）**：
+  - **应用层落地**：`source/p2p_app/`（按应用细分，应用内分 cli/gui）——聊天应用 `chat/{cli,gui}`、
+    文件传输占位；CLI 文本登录流程自 identity_service.rs 迁入 `chat/cli/login.rs`（文案逐字节不变）；
+    架构纪律入 UI_PLAN：p2p/ 无渲染无交互流程，交互编排永不进协议核心
+  - **登录页**（`p2p_app/chat/gui/login.rs`）：全窗口登录卡片——缓存身份列表 / masked 密码解锁
+    （错误内联重试）/ 新身份向导（资料 → 助记词复制展示 → 抄写前 3 词确认 → 密码二次确认）/
+    助记词恢复；登录期引擎未启动（无输出噪声、关窗即退），成功后带凭据启动引擎
+  - **p2p 领域 API**：`IdentityService::login_pre(LoginOutcome)`（既有凭据建会话 + 影子探测，
+    冲突类型化 `LoginError::IdInUse`）、`normalize_birthday/gender` 开放、
+    `LineSource::prompt/prompt_secret`（带提示符读行/密码，rpassword 语义保留）
+  - **安全**：GUI 密码全程只在表单内流转（masked），不进命令框、不落 interact.log；
+    engine_done 生命周期简化（登录期无引擎线程）
+  - 单测 64（+3 登录编排：资料/密码校验、抄写确认、解锁错误与成功路径）+ e2e 全量回归
 - **P2.0 前提重构完成（GUI 进程内引擎）**：
   - **单 exe 双模式分发**（M2）：无参→GUI（分离进程拉起窗口+引擎线程）、`--cli`/管道→纯 CLI
   - **LineSource 输入抽象**：`Stdin`（CLI/e2e 逐行）+ `Channel`（GUI 消息）；`InputMsg{Line, ChatText}`——

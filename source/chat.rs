@@ -10,6 +10,7 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::cmd_tree::{CmdError, CmdTree, ROOT};
 use crate::p2p::{cache_dir, load_discovery_mode, save_discovery_mode, save_download_dir, DiscoveryMode};
+use crate::p2p::identity::LoginOutcome;
 use crate::p2p::identity_service::{
     is_l2_signal, IdentityService, InputMsg, LineSource, TextTag,
 };
@@ -1669,9 +1670,13 @@ async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
     }
 }
 
-/// GUI 进程内引擎入口：input 由调用方提供（LineSource::Channel），输出走线程局部 sink
-pub async fn run_engine(input: LineSource) -> Result<(), Box<dyn Error>> {
-    run_node(input).await
+/// GUI 进程内引擎入口：input 由调用方提供（LineSource::Channel），输出走线程局部 sink。
+/// `pre` 为 GUI 登录表单产出的凭据（Some → 直建会话；None 走 CLI 文本登录，兼容保留）
+pub async fn run_engine(
+    input: LineSource,
+    pre: Option<LoginOutcome>,
+) -> Result<(), Box<dyn Error>> {
+    run_node(input, pre).await
 }
 
 pub fn run() {
@@ -1684,21 +1689,25 @@ pub fn run() {
     };
     rt.block_on(async {
         let input = LineSource::Stdin(tokio::io::BufReader::new(tokio::io::stdin()).lines());
-        if let Err(e) = run_node(input).await {
+        if let Err(e) = run_node(input, None).await {
             eprintln!("{}", format!("节点运行错误: {e}").red());
         }
     });
 }
 
-pub async fn run_node(mut input: LineSource) -> Result<(), Box<dyn Error>> {
+pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Result<(), Box<dyn Error>> {
     // 交互语义按输入源判定：Stdin 终端=交互（rpassword/y 确认）；Stdin 管道与 GUI 通道=管道语义
     let interactive = match &input {
         LineSource::Stdin(_) => std::io::stdin().is_terminal(),
         LineSource::Channel(_) => false,
     };
 
-    // L2 身份基础：登录（含影子探测防同 ID 双在线）+ 联系人簿（TOFU）
-    let mut identity = IdentityService::login(&mut input, interactive).await?;
+    // L2 身份基础：GUI 表单凭据直建会话（影子探测防同 ID 双在线），
+    // 或 CLI 文本登录菜单产出凭据 → login_pre + 联系人簿（TOFU）
+    let mut identity = match pre {
+        Some(outcome) => IdentityService::login_pre(outcome).await?,
+        None => crate::p2p_app::chat::cli::login::run(&mut input, interactive).await?,
+    };
     let discovery_mode = load_discovery_mode(identity.my_id());
     println!(
         "{}",

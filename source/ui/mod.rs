@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::chat;
+use crate::p2p::identity::LoginOutcome;
 use crate::p2p::identity_service::{InputMsg, LineSource};
+use crate::p2p_app::chat::gui::login;
 use crate::sink;
 use input_guard::InputGuard;
 use logging::{Level, LogStore};
@@ -41,7 +43,7 @@ enum ChildState {
 impl ChildState {
     fn label(self) -> &'static str {
         match self {
-            ChildState::Login => "登录中",
+            ChildState::Login => "登录",
             ChildState::Chat => "聊天中",
         }
     }
@@ -65,12 +67,14 @@ pub struct GuiApp {
     input: String,
     /// 命令输入框内容（/list 等；与文本框分离）
     cmd_input: String,
-    /// UI → 引擎输入通道（文本框 ChatText / 命令框 Line）
-    ui_tx: mpsc::UnboundedSender<InputMsg>,
-    /// 引擎 → UI 输出通道（TextSink 捕获的引擎输出）
-    out_rx: mpsc::UnboundedReceiver<String>,
+    /// UI → 引擎输入通道（引擎启动后有效；文本框 ChatText / 命令框 Line）
+    ui_tx: Option<mpsc::UnboundedSender<InputMsg>>,
+    /// 引擎 → UI 输出通道（TextSink 捕获的引擎输出；引擎启动后有效）
+    out_rx: Option<mpsc::UnboundedReceiver<String>>,
     /// 引擎任务结束标记（聊天退出 → GUI 联动关闭）
     engine_done: Arc<AtomicBool>,
+    /// 登录页状态机（引擎未启动阶段的全窗口卡片）
+    login: login::LoginState,
     /// 首帧标记：自动聚焦输入框
     first_frame: bool,
     /// 耗时统计
@@ -123,15 +127,44 @@ impl GuiApp {
         runtime.log(Level::Info, "gui", format!("缓存根: {}", cache_root().display()));
         runtime.log(Level::Info, "gui", format!("CJK 字体: {font_note}"));
 
-        // 引擎通道：UI 输入 → 引擎；引擎输出（sink 捕获）→ UI 滚动区
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
-        let (ui_tx, ui_rx) = mpsc::unbounded_channel::<InputMsg>();
+        // 引擎在登录成功后启动（GUI 登录表单产出凭据 → run_engine(Some(outcome))）
         let engine_done = Arc::new(AtomicBool::new(false));
 
-        // 引擎线程：单线程 current_thread runtime——聊天核心与本线程同步运行，
-        // 线程局部 sink 在本线程生效（全部引擎输出进滚动区/日志）
-        let done = engine_done.clone();
-        let engine_log = runtime.clone();
+        GuiApp {
+            lines,
+            input: String::new(),
+            cmd_input: String::new(),
+            ui_tx: None,
+            out_rx: None,
+            engine_done,
+            login: login::LoginState::Menu {
+                identities: login::load_cached(),
+                error: None,
+            },
+            first_frame: true,
+            stats: timing::TimingStats::default(),
+            runtime,
+            interact,
+            input_sent_at: None,
+            pending_runtime: Vec::new(),
+            pending_interact: Vec::new(),
+            show_log: true,
+            log_view: LogView::Runtime,
+            log_follow: true,
+            log_level: Level::Debug,
+            cmd_guard: InputGuard::command_box(),
+            text_guard: InputGuard::text_box(),
+            child_state: ChildState::Login,
+        }
+    }
+
+    /// 启动聊天引擎线程：GUI 登录表单凭据（Some）直建会话；
+    /// 单线程 current_thread runtime，线程局部 sink 在本线程生效。
+    fn start_engine(&mut self, pre: Option<LoginOutcome>) {
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+        let (ui_tx, ui_rx) = mpsc::unbounded_channel::<InputMsg>();
+        let done = self.engine_done.clone();
+        let engine_log = self.runtime.clone();
         let spawn_result = std::thread::Builder::new()
             .name("chat-engine".into())
             .spawn(move || {
@@ -152,41 +185,36 @@ impl GuiApp {
                 };
                 sink::install(out_tx);
                 engine_log.log(Level::Info, "engine", "引擎线程启动（进程内聊天核心）");
-                if let Err(e) = rt.block_on(chat::run_engine(LineSource::Channel(ui_rx))) {
+                if let Err(e) = rt.block_on(chat::run_engine(LineSource::Channel(ui_rx), pre)) {
                     engine_log.log(Level::Error, "engine", format!("引擎错误: {e}"));
                 }
                 engine_log.log(Level::Info, "engine", "引擎已退出");
                 sink::uninstall();
                 done.store(true, Ordering::Release);
             });
-        if let Err(e) = spawn_result {
-            runtime.log(Level::Error, "gui", format!("引擎线程启动失败: {e}"));
-            lines.push(format!("引擎线程启动失败: {e}"));
-        } else {
-            lines.push("聊天引擎已启动（进程内模式）".to_string());
+        match spawn_result {
+            Ok(_) => {
+                self.ui_tx = Some(ui_tx);
+                self.out_rx = Some(out_rx);
+                self.child_state = ChildState::Chat;
+                self.lines.push("聊天引擎已启动（进程内模式）".to_string());
+            }
+            Err(e) => {
+                self.runtime
+                    .log(Level::Error, "gui", format!("引擎线程启动失败: {e}"));
+                self.lines.push(format!("引擎线程启动失败: {e}"));
+            }
         }
-
-        GuiApp {
-            lines,
-            input: String::new(),
-            cmd_input: String::new(),
-            ui_tx,
-            out_rx,
-            engine_done,
-            first_frame: true,
-            stats: timing::TimingStats::default(),
-            runtime,
-            interact,
-            input_sent_at: None,
-            pending_runtime: Vec::new(),
-            pending_interact: Vec::new(),
-            show_log: true,
-            log_view: LogView::Runtime,
-            log_follow: true,
-            log_level: Level::Debug,
-            cmd_guard: InputGuard::command_box(),
-            text_guard: InputGuard::text_box(),
-            child_state: ChildState::Login,
+    }
+    /// 发送输入到引擎（通道未就绪时降级为滚动区提示）
+    fn send_input(&mut self, msg: InputMsg) {
+        match &self.ui_tx {
+            Some(tx) => {
+                if let Err(e) = tx.send(msg) {
+                    self.lines.push(format!("[引擎输入通道关闭: {e}]"));
+                }
+            }
+            None => self.lines.push("[引擎未运行]".to_string()),
         }
     }
 }
@@ -195,14 +223,16 @@ impl eframe::App for GuiApp {
     /// 每帧（含窗口隐藏时）的逻辑回调：drain 引擎输出 + 轮询引擎退出 + 计时（不能画 UI）。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let _t = timing::ScopeTimer::start("frame.logic", &self.stats);
-        while let Ok(line) = self.out_rx.try_recv() {
-            if let Some(t0) = self.input_sent_at.take() {
-                self.stats.record("roundtrip.input->resp", t0.elapsed());
+        if let Some(out_rx) = &mut self.out_rx {
+            while let Ok(line) = out_rx.try_recv() {
+                if let Some(t0) = self.input_sent_at.take() {
+                    self.stats.record("roundtrip.input->resp", t0.elapsed());
+                }
+                self.child_state = next_state(self.child_state, &line);
+                self.interact.log(Level::Info, "engine", &line);
+                self.lines.push(line);
+                ctx.request_repaint();
             }
-            self.child_state = next_state(self.child_state, &line);
-            self.interact.log(Level::Info, "engine", &line);
-            self.lines.push(line);
-            ctx.request_repaint();
         }
         // 生命周期联动：引擎任务结束（聊天退出）→ GUI 一并关闭
         if self.engine_done.swap(false, Ordering::AcqRel) {
@@ -231,6 +261,24 @@ impl eframe::App for GuiApp {
                 .default_size(380.0)
                 .resizable(true)
                 .show(ui, |ui| self.log_panel(ui));
+        }
+
+        // 登录页（引擎未启动）：全窗口卡片，无底部输入面板；成功后带凭据启动引擎
+        if self.child_state == ChildState::Login {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("P2P 聊天");
+                    ui.toggle_value(&mut self.show_log, "日志");
+                });
+                if let Some(outcome) = login::view(&mut self.login, ui) {
+                    self.interact.log(Level::Info, "user", "登录成功（GUI 表单）");
+                    self.runtime
+                        .log(Level::Info, "gui", "GUI 登录完成，启动聊天引擎");
+                    self.start_engine(Some(outcome));
+                }
+            });
+            self.first_frame = false;
+            return;
         }
 
         // 底部输入面板先声明 → 先占位，CentralPanel 只拿剩余高度（ScrollArea 不会挤掉输入行）
@@ -264,9 +312,7 @@ impl eframe::App for GuiApp {
                             self.interact
                                 .log(Level::Info, "user", format!("/cmd: {final_text}"));
                             self.input_sent_at = Some(Instant::now());
-                            if let Err(e) = self.ui_tx.send(InputMsg::Line(final_text)) {
-                                self.lines.push(format!("[引擎输入通道关闭: {e}]"));
-                            }
+                            self.send_input(InputMsg::Line(final_text));
                         }
                         Err((rule, reason)) => {
                             self.lines.push(format!("[已拦截] {reason}"));
@@ -281,7 +327,7 @@ impl eframe::App for GuiApp {
                         self.interact
                             .log(Level::Info, "user", format!("/cmd: {cmd}"));
                         self.input_sent_at = Some(Instant::now());
-                        let _ = self.ui_tx.send(InputMsg::Line(cmd.to_string()));
+                        self.send_input(InputMsg::Line(cmd.to_string()));
                     }
                 }
             });
@@ -316,9 +362,7 @@ impl eframe::App for GuiApp {
                             self.interact
                                 .log(Level::Info, "user", format!("> {text}"));
                             self.input_sent_at = Some(Instant::now());
-                            if let Err(e) = self.ui_tx.send(InputMsg::ChatText(text)) {
-                                self.lines.push(format!("[引擎输入通道关闭: {e}]"));
-                            }
+                            self.send_input(InputMsg::ChatText(text));
                         }
                         Err((rule, reason)) => {
                             self.lines.push(format!("[已拦截] {reason}"));
