@@ -149,17 +149,24 @@ GUI：tokio 后台线程跑核心，UI 主线程每帧 drain 事件通道
 
 ## P2 — 原生界面（"微信式"）
 
-### 前提重构
-- [ ] 抽 **`source/lib.rs`**（`pub mod chat/...`），GUI bin 依赖 lib（为进程内调用铺路）
-- [ ] 引入 **`LineReader` trait**（`async fn next_line`）：`StdinLines`（CLI/e2e 保留）+ `ChannelReader`（GUI）；签名跨 identity_service/chat/file_transfer 机械替换
-- [ ] 输出改 **`UiOut` 事件 + `TextSink`**；交互确认（登录/TOFU/backup/未信任发送/文件接收）改为「Ask → 答」通道
-- [ ] P1 子进程方案退役，同一份逻辑进进程内跑
-- [ ] e2e 全量回归（42 单测 + 9+2 e2e，走 CLI `StdinLines` 不受影响）
+### 前提重构（✅ P2.0 已完成——M2 单 exe 路线）
+
+> 设计演化：原计划"抽 lib + LineReader trait + TextSink 逐点改造"；M2 单 exe 分发确认后简化——
+> **不抽 lib**（单 crate root 天然互见，双 bin 问题消失）、输入用 **`LineSource` 枚举**（Stdin/Channel 双实现场景固定，避免 dyn trait）、
+> 输出用 **crate 级宏遮蔽 + 线程局部 sink**（166 处输出点零改造自动路由，未装 sink 线程回落 std 逐字节一致）。
+
+- [x] **单 exe 双模式分发**（M2 子步 0）：`main()` 四规则——`P2P_GUI_CHILD=1`→GUI / 管道→CLI / `--cli`→CLI / 交互无参→分离拉起 GUI 后释放终端；退役 `p2p_rust_app_gui` bin（单 crate root 后 lib 问题消失）
+- [x] **LineSource 输入抽象**（子步 1）：`LineSource{Stdin, Channel}` + `InputMsg{Line, ChatText}`——Stdin 逐行产出 Line（CLI 语义不变）；Channel 透传 GUI 消息（ChatText 绕过命令解析）；`next_raw_line` 供登录/确认交互；签名替换 identity_service 9 处 + chat.rs 字段
+- [x] **TextSink 输出事件化**（子步 2）：`source/sink.rs` 线程局部输出端 + main.rs crate 级宏遮蔽（println!/eprintln!/print! → sink::line/err/raw）——**聊天路径 166 处输出点零改造自动路由**；未装 sink 线程回落 std（CLI 逐字节一致）
+- [x] **GUI 引擎线程化**（子步 3）：`ui/mod.rs` 引擎线程（`current_thread` runtime + `sink::install` + `run_engine(LineSource::Channel)`）——**退役 console.rs 子进程桥与 /sendStrings GUI 路径**（文本 ChatText 直进引擎，多行原样）；生命周期：引擎任务结束（/q）→ GUI 联动关闭；GUI 关 → 进程退出引擎随之结束
+- [x] 交互语义按输入源判定：Stdin 终端=交互（rpassword/y 确认）；Stdin 管道与 GUI 通道=管道语义（自动放行，提示走滚动区）
+- [x] e2e 全量回归（CLI 路径行为不变——管道路径零改动）+ 单测 61 + GUI 冒烟（单进程无子进程、引擎日志、登录流直出）
+- 已知边界：GUI 模式无主菜单（引擎直入登录，`/q` 退出聊天即关闭应用）；node.rs L1 传输噪声行暂不进滚动区（P2.2 收口）
 
 ### 界面
-- [ ] **登录页**：缓存身份列表 / 新身份表单（资料 + 助记词确认）/ 助记词恢复 / 密码（password 模式）
+- [ ] **登录页**：缓存身份列表 / 新身份表单（资料 + 助记词确认）/ 助记词恢复 / 密码（password 模式）——登录状态机化（CLI 文本驱动与 GUI 表单驱动共用步骤）
 - [ ] **左栏**：联系人（含信任徽标 `[互信]/[我信任/对方未确认]/[未信任]`）+ 群列表 + 发现节点
-- [ ] **中区**：会话气泡（焦点/非焦点带名）、群消息（`[群名] [成员名]`）
+- [ ] **中区**：会话气泡（焦点/非焦点带名）、群消息（`[群名] [成员名]`）——需消息结构化（`UiEvent::ChatText{from, text, focused}`，引擎显示逻辑拆分：CLI 格式化文本 / GUI 渲染气泡）
 - [ ] **底部**：输入框 + `/` 命令快捷入口
 - [ ] **弹窗**：TOFU 指纹确认、`/backup` 助记词、未信任发送确认、文件接收、下载目录选择
 - [ ] **状态栏**：发现模式、下载目录、本机节点 ID

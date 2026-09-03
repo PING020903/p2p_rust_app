@@ -36,7 +36,7 @@ pub fn line(s: impl Display) {
     });
 }
 
-/// 错误行输出（等价 eprintln! 语义：带换行，写 stderr）
+/// 错误行输出（等价 eprintln! 语义：带换行，写 stderr；通道模式加 ⚠ 标记）
 pub fn err(s: impl Display) {
     let s = s.to_string();
     SINK.with(|slot| match &*slot.borrow() {

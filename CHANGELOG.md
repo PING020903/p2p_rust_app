@@ -9,6 +9,15 @@
 
 ### 新增
 
+- **P2.0 前提重构完成（GUI 进程内引擎）**：
+  - **单 exe 双模式分发**（M2）：无参→GUI（分离进程拉起窗口+引擎线程）、`--cli`/管道→纯 CLI
+  - **LineSource 输入抽象**：`Stdin`（CLI/e2e 逐行）+ `Channel`（GUI 消息）；`InputMsg{Line, ChatText}`——
+    GUI 文本框纯聊天文本绕过命令解析直发焦点（多行原样，/sendStrings 协议 GUI 路径退役）
+  - **TextSink 输出事件化**：crate 级宏遮蔽（println!/eprintln!/print! → 线程局部 sink）——
+    聊天路径 166 处输出点零改造自动路由；未装 sink 线程回落 std（CLI 逐字节不变）
+  - **引擎线程化**：GUI 内 `current_thread` runtime 跑 run_node（进程内聊天核心），
+    退役 console.rs 子进程桥与 /sendStrings GUI 路径；生命周期：引擎任务结束→GUI 联动关闭
+  - 交互语义按输入源判定（Stdin 终端=交互 / 管道与 GUI 通道=管道语义）；登录状态机化列入 P2.1
 - **GUI 骨架（P0，`p2p_rust_app_gui`）**：egui/eframe 0.36（默认 wgpu 渲染器）+ 独立 bin；
   `App::ui/logic` 新 trait 集成后台 `tokio::sync::mpsc` 通道 + `request_repaint`；CJK 字体运行时
   回退链（Windows msyh/simhei、Linux Noto CJK、macOS PingFang）；`default-run` 保住 `cargo run` 走 CLI；
