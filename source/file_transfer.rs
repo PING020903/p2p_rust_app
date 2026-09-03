@@ -174,7 +174,7 @@ pub async fn on_file_offer(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<
             format!("收到文件: {name}（{} 字节，来自 {from}），保存到 downloads/ ？(y/n)", p.size)
                 .yellow()
         );
-        let ans = match ctx.input.next_line().await {
+        let ans = match ctx.input.next_raw_line().await {
             Some(l) => l,
             None => String::new(),
         };

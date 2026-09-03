@@ -10,7 +10,9 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::cmd_tree::{CmdError, CmdTree, ROOT};
 use crate::p2p::{cache_dir, load_discovery_mode, save_discovery_mode, save_download_dir, DiscoveryMode};
-use crate::p2p::identity_service::{is_l2_signal, IdentityService, LineSource, TextTag};
+use crate::p2p::identity_service::{
+    is_l2_signal, IdentityService, InputMsg, LineSource, TextTag,
+};
 use crate::p2p::seam::{self, is_global_ipv6_listen, Event, SignalRegistry, BYE_HANDSHAKE_TIMEOUT};
 
 // ---- 语义注册表（L3 应用层）：text=Custom(tag) 承载协议语义，binary 承载负载 ----
@@ -1633,7 +1635,7 @@ async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
                         "{}",
                         format!("对方 {who} 未互信（需双方 /trust），确认发送？(y/n)").yellow()
                     );
-                    let ans = match ctx.input.next_line().await {
+                    let ans = match ctx.input.next_raw_line().await {
                         Some(l) => l.trim().to_string(),
                         None => String::new(),
                     };
@@ -1667,6 +1669,11 @@ async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
     }
 }
 
+/// GUI 进程内引擎入口：input 由调用方提供（LineSource::Channel），输出走线程局部 sink
+pub async fn run_engine(input: LineSource) -> Result<(), Box<dyn Error>> {
+    run_node(input).await
+}
+
 pub fn run() {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -1676,15 +1683,19 @@ pub fn run() {
         }
     };
     rt.block_on(async {
-        if let Err(e) = run_node().await {
+        let input = LineSource::Stdin(tokio::io::BufReader::new(tokio::io::stdin()).lines());
+        if let Err(e) = run_node(input).await {
             eprintln!("{}", format!("节点运行错误: {e}").red());
         }
     });
 }
 
-async fn run_node() -> Result<(), Box<dyn Error>> {
-    let interactive = std::io::stdin().is_terminal();
-    let mut input = LineSource::Stdin(tokio::io::BufReader::new(tokio::io::stdin()).lines());
+pub async fn run_node(mut input: LineSource) -> Result<(), Box<dyn Error>> {
+    // 交互语义按输入源判定：Stdin 终端=交互（rpassword/y 确认）；Stdin 管道与 GUI 通道=管道语义
+    let interactive = match &input {
+        LineSource::Stdin(_) => std::io::stdin().is_terminal(),
+        LineSource::Channel(_) => false,
+    };
 
     // L2 身份基础：登录（含影子探测防同 ID 双在线）+ 联系人簿（TOFU）
     let mut identity = IdentityService::login(&mut input, interactive).await?;
@@ -1800,10 +1811,33 @@ async fn run_node() -> Result<(), Box<dyn Error>> {
 
     loop {
         tokio::select! {
-            line = input.next_line() => {
+            msg = input.next_input() => {
                 // None = 输入结束（EOF/通道关闭）：多行收集中则报未闭合丢弃
-                let line = match line {
-                    Some(l) => l,
+                let line = match msg {
+                    Some(InputMsg::ChatText(text)) => {
+                        // GUI 文本框：纯聊天文本直发当前焦点（多行原样；以 / 开头也不解析为命令）
+                        let text = text.trim();
+                        if !text.is_empty() {
+                            let mut ctx = ChatCtx {
+                                identity: &mut identity,
+                                cmd_tx: &cmd_tx,
+                                input: &mut input,
+                                interactive,
+                                conversations: &mut conversations,
+                                groups: &mut groups,
+                                focused: &mut focused,
+                                focused_group: &mut focused_group,
+                                connected: &connected,
+                                registered: &mut registered,
+                                ops: VecDeque::new(),
+                                quit: false,
+                                file: &mut file_state,
+                            };
+                            send_focused_text(&mut ctx, &text).await;
+                        }
+                        continue;
+                    }
+                    Some(InputMsg::Line(l)) => l,
                     None => {
                         if let Some((_, remaining)) = &sendstrings {
                             eprintln!(

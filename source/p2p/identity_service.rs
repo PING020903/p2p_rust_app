@@ -17,18 +17,38 @@ use super::identity::{
 /// 输入行迭代器（input 被管道接管时逐行读取）
 pub type StdinLines = tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>;
 
-/// 输入源抽象：CLI/e2e 读终端或管道（Stdin）；GUI 读 UI 输入通道（Channel）。
-/// 统一语义：next_line 返回 None = 输入结束（CLI 读错误视同结束，与主循环 break 行为一致）。
+/// 统一输入消息：
+/// - `Line`：CLI 语义行——按 `/` 前缀分流（命令树 vs 文本消息），终端/管道逐行产出
+/// - `ChatText`：GUI 文本框的纯聊天文本——**绕过命令解析**直接发送到当前焦点（多行原样）
+pub enum InputMsg {
+    Line(String),
+    ChatText(String),
+}
+
+/// 输入源抽象：CLI/e2e 读终端或管道（Stdin，逐行产出 Line）；GUI 读 UI 输入通道（Channel）。
 pub enum LineSource {
     Stdin(StdinLines),
-    Channel(tokio::sync::mpsc::UnboundedReceiver<String>),
+    Channel(tokio::sync::mpsc::UnboundedReceiver<InputMsg>),
 }
 
 impl LineSource {
-    pub async fn next_line(&mut self) -> Option<String> {
+    /// 聊天循环输入：Stdin 每行包装为 Line；Channel 原样透传 GUI 消息
+    pub async fn next_input(&mut self) -> Option<InputMsg> {
         match self {
-            LineSource::Stdin(lines) => lines.next_line().await.ok().flatten(),
+            LineSource::Stdin(lines) => {
+                lines.next_line().await.ok().flatten().map(InputMsg::Line)
+            }
             LineSource::Channel(rx) => rx.recv().await,
+        }
+    }
+
+    /// 交互提示场景的原始行读取（登录/确认；ChatText 亦取其文本）。
+    /// 登录等阶段 GUI 文本框禁用、命令框以 Line 发送，故此处只会收到 Line。
+    pub async fn next_raw_line(&mut self) -> Option<String> {
+        match self.next_input().await {
+            Some(InputMsg::Line(s)) => Some(s),
+            Some(InputMsg::ChatText(t)) => Some(t),
+            None => None,
         }
     }
 }
@@ -298,7 +318,7 @@ async fn read_line(src: &mut LineSource, prompt: &str) -> Result<String, Box<dyn
     print!("{prompt}");
     std::io::stdout().flush()?;
     let line = src
-        .next_line()
+        .next_raw_line()
         .await
         .ok_or_else(|| -> Box<dyn Error> { "输入结束".into() })?;
     Ok(line)
