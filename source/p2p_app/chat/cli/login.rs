@@ -8,12 +8,14 @@ use std::error::Error;
 use colored::Colorize;
 
 use crate::p2p::identity::{
-    decrypt_mnemonic, generate_mnemonic, keypair_from_mnemonic, load_keystores, save_keystore,
-    valid_password, IdentityInfo, LoginOutcome,
+    generate_mnemonic, keypair_from_mnemonic, load_keystores, IdentityInfo, LoginOutcome,
 };
 use crate::p2p::identity_service::{
-    normalize_birthday, normalize_gender, print_mnemonic_guide, IdentityService, LineSource,
-    LoginError,
+    normalize_gender, print_mnemonic_guide, IdentityService, LineSource, LoginError,
+};
+use crate::p2p_app::chat::login_common::{
+    confirm_first_words, persist_identity, unlock_cached, validate_birthday, validate_name,
+    validate_password,
 };
 
 /// 新身份助记词抄写确认词数
@@ -83,78 +85,38 @@ async fn login_menu(
                         "请抄下助记词，输入前 {MNEMONIC_CONFIRM_WORDS} 个词确认: "
                     ))
                     .await?;
-                let first: Vec<&str> = phrase
-                    .split_whitespace()
-                    .take(MNEMONIC_CONFIRM_WORDS)
-                    .collect();
-                let got: Vec<&str> = confirm.split_whitespace().collect();
-                if got.len() >= MNEMONIC_CONFIRM_WORDS
-                    && got[..MNEMONIC_CONFIRM_WORDS] == first[..]
-                {
+                let answers: Vec<String> =
+                    confirm.split_whitespace().map(String::from).collect();
+                if confirm_first_words(&phrase, &answers, MNEMONIC_CONFIRM_WORDS) {
                     break phrase;
                 }
                 eprintln!("{}", "确认词不匹配，请重新抄写".yellow());
             };
             let password = prompt_password(src, interactive).await?;
-            let keypair = keypair_from_mnemonic(&phrase)?;
-            let peer_id = keypair.public().to_peer_id();
-            save_keystore(&info, &peer_id, &phrase, &password)?;
-            return Ok(LoginOutcome { keypair, info });
+            return persist_identity(info, &phrase, &password).map_err(Into::into);
         } else if input == "r" {
             // 从助记词恢复身份（跨设备迁移 / 备份恢复）
             let phrase = src.prompt("助记词（12 个英文词，空格分隔）: ").await?;
-            let keypair = match keypair_from_mnemonic(&phrase) {
-                Ok(kp) => kp,
-                Err(reason) => {
-                    eprintln!("{}", reason.red());
-                    continue;
-                }
+            // 校验助记词合法（派生与保存由共享内核 persist_identity 完成）
+            if let Err(reason) = keypair_from_mnemonic(&phrase) {
+                eprintln!("{}", reason.red());
+                continue;
             };
             let info = prompt_profile(src).await?;
             let password = prompt_password(src, interactive).await?;
-            let peer_id = keypair.public().to_peer_id();
-            save_keystore(&info, &peer_id, &phrase, &password)?;
-            return Ok(LoginOutcome { keypair, info });
+            return persist_identity(info, &phrase, &password).map_err(Into::into);
         } else if let Ok(n) = input.parse::<usize>() {
             if n >= 1 && n <= cached.len() {
-                // 缓存解锁：密码错误最多重试 3 次
-                let (ks, info) = &cached[n - 1];
+                // 缓存解锁：密码错误最多重试 3 次（规则校验黄色提示，其余错误红色——文案不变）
                 for _ in 0..3 {
                     let password = src.prompt_secret(interactive, "密码: ").await?;
-                    if !valid_password(&password) {
-                        eprintln!("{}", "密码须为 8~128 字节".yellow());
+                    if let Err(reason) = validate_password(&password) {
+                        eprintln!("{}", reason.yellow());
                         continue;
                     }
-                    match decrypt_mnemonic(
-                        &password,
-                        &ks.salt,
-                        &ks.nonce,
-                        &ks.enc,
-                        ks.kdf_m,
-                        ks.kdf_t,
-                        ks.kdf_p,
-                    ) {
-                        Ok(phrase) => match keypair_from_mnemonic(&phrase) {
-                            Ok(kp) if kp.public().to_peer_id().to_string() == ks.peer_id => {
-                                return Ok(LoginOutcome {
-                                    keypair: kp,
-                                    info: IdentityInfo {
-                                        name: info.name.clone(),
-                                        birthday: info.birthday.clone(),
-                                        gender: info.gender,
-                                    },
-                                });
-                            }
-                            Ok(_) => {
-                                eprintln!("{}", "keystore 与派生身份不符，数据可能损坏".red());
-                            }
-                            Err(reason) => {
-                                eprintln!("{}", reason.red());
-                            }
-                        },
-                        Err(reason) => {
-                            eprintln!("{}", reason.red());
-                        }
+                    match unlock_cached(n, &password) {
+                        Ok(outcome) => return Ok(outcome),
+                        Err(reason) => eprintln!("{}", reason.red()),
                     }
                 }
                 eprintln!("{}", "连续多次密码错误，返回选择菜单".yellow());
@@ -167,20 +129,18 @@ async fn login_menu(
     }
 }
 
-/// 交互收集资料信息（姓名/生日/性别）
+/// 交互收集资料信息（姓名/生日/性别；校验规则来自共享内核，提示与重试为本前端职责）
 async fn prompt_profile(src: &mut LineSource) -> Result<IdentityInfo, Box<dyn Error>> {
     let name = loop {
         let raw = src.prompt("姓名: ").await?;
-        let name = raw.trim().to_string();
-        if name.is_empty() || name.len() > 64 {
-            eprintln!("{}", "姓名不能为空且不超过 64 字节".yellow());
-        } else {
-            break name;
+        match validate_name(&raw) {
+            Ok(n) => break n,
+            Err(reason) => eprintln!("{}", reason.yellow()),
         }
     };
     let birthday = loop {
         let raw = src.prompt("生日 (YYYY-MM-DD): ").await?;
-        match normalize_birthday(&raw) {
+        match validate_birthday(&raw) {
             Ok(b) => break b,
             Err(reason) => eprintln!("{}", reason.yellow()),
         }
@@ -199,16 +159,16 @@ async fn prompt_profile(src: &mut LineSource) -> Result<IdentityInfo, Box<dyn Er
     })
 }
 
-/// 交互收集并校验密码
+/// 交互收集并校验密码（规则来自共享内核）
 async fn prompt_password(
     src: &mut LineSource,
     interactive: bool,
 ) -> Result<String, Box<dyn Error>> {
     loop {
         let pwd = src.prompt_secret(interactive, "密码: ").await?;
-        if valid_password(&pwd) {
-            return Ok(pwd);
+        match validate_password(&pwd) {
+            Ok(pwd) => return Ok(pwd),
+            Err(reason) => eprintln!("{}", reason.yellow()),
         }
-        eprintln!("{}", "密码须为 8~128 字节".yellow());
     }
 }

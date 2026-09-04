@@ -7,10 +7,12 @@
 use egui::Color32;
 
 use crate::p2p::identity::{
-    decrypt_mnemonic, generate_mnemonic, keypair_from_mnemonic, load_keystores, save_keystore,
-    valid_password, IdentityInfo, LoginOutcome,
+    generate_mnemonic, keypair_from_mnemonic, load_keystores, IdentityInfo, LoginOutcome,
 };
-use crate::p2p::identity_service::normalize_birthday;
+use crate::p2p_app::chat::login_common::{
+    check_password_pair, confirm_first_words, persist_identity, unlock_cached, validate_birthday,
+    validate_name, validate_password,
+};
 
 /// 登录流程来源（资料页与密码页共用）
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -119,82 +121,24 @@ pub fn load_cached() -> Vec<CachedIdentity> {
         .collect()
 }
 
-/// 校验并归一资料 → `IdentityInfo`（姓名/生日校验复用 L2 规则；性别经表单枚举无脏值）
+/// 校验并归一资料 → `IdentityInfo`（姓名/生日走共享内核；性别经表单枚举无脏值）
 fn build_profile(name: &str, birthday: &str, gender: Gender) -> Result<IdentityInfo, String> {
-    let name = name.trim();
-    if name.is_empty() || name.len() > 64 {
-        return Err("姓名不能为空且不超过 64 字节".into());
-    }
-    let birthday = normalize_birthday(birthday)?;
     Ok(IdentityInfo {
-        name: name.to_string(),
-        birthday,
+        name: validate_name(name)?,
+        birthday: validate_birthday(birthday)?,
         gender: gender.ch(),
     })
 }
 
-/// 校验密码并检查两次输入一致
+/// 校验密码并检查两次输入一致（共享内核）
 fn check_password(pwd: &str, pwd2: &str) -> Result<String, String> {
-    if !valid_password(pwd) {
-        return Err("密码须为 8~128 字节".into());
-    }
-    if pwd != pwd2 {
-        return Err("两次输入的密码不一致".into());
-    }
-    Ok(pwd.to_string())
+    check_password_pair(pwd, pwd2)
 }
 
-/// 缓存解锁：密码 → 解密助记词 → 派生身份并核对 keystore 归属（L2 API 编排）
+/// 缓存解锁：密码规则（内核）→ 解密派生核对（内核）
 fn unlock(index: usize, password: &str) -> Result<LoginOutcome, String> {
-    if !valid_password(password) {
-        return Err("密码须为 8~128 字节".into());
-    }
-    let cached = load_keystores();
-    let Some((ks, info)) = cached.get(index - 1) else {
-        return Err("该身份不存在，请返回菜单刷新".into());
-    };
-    match decrypt_mnemonic(
-        password,
-        &ks.salt,
-        &ks.nonce,
-        &ks.enc,
-        ks.kdf_m,
-        ks.kdf_t,
-        ks.kdf_p,
-    ) {
-        Ok(phrase) => match keypair_from_mnemonic(&phrase) {
-            Ok(kp) if kp.public().to_peer_id().to_string() == ks.peer_id => {
-                Ok(LoginOutcome {
-                    keypair: kp,
-                    info: IdentityInfo {
-                        name: info.name.clone(),
-                        birthday: info.birthday.clone(),
-                        gender: info.gender,
-                    },
-                })
-            }
-            Ok(_) => Err("keystore 与派生身份不符，数据可能损坏".into()),
-            Err(reason) => Err(reason),
-        },
-        Err(reason) => Err(reason),
-    }
-}
-
-/// 由助记词 + 密码派生身份并加密保存 keystore（新建/恢复共用保存路径）
-fn save_outcome(profile: IdentityInfo, phrase: &str, password: &str) -> Result<LoginOutcome, String> {
-    let keypair = keypair_from_mnemonic(phrase)?;
-    let peer_id = keypair.public().to_peer_id();
-    save_keystore(&profile, &peer_id, phrase, password)?;
-    Ok(LoginOutcome { keypair, info: profile })
-}
-
-/// 抄写确认：输入词与助记词前 3 词一致（大小写不敏感，比 CLI 宽容）
-fn confirm_words(phrase: &str, words: &[String; 3]) -> bool {
-    let first: Vec<&str> = phrase.split_whitespace().take(3).collect();
-    words
-        .iter()
-        .zip(first.iter())
-        .all(|(got, want)| got.trim().eq_ignore_ascii_case(want))
+    validate_password(password)?;
+    unlock_cached(index, password)
 }
 
 fn show_error(ui: &mut egui::Ui, error: &Option<String>) {
@@ -416,7 +360,7 @@ pub fn view(state: &mut LoginState, ui: &mut egui::Ui) -> Option<LoginOutcome> {
             if back {
                 *state = menu_state();
             } else if proceed {
-                if confirm_words(phrase, words) {
+                if confirm_first_words(phrase, words, words.len()) {
                     let confirmed = std::mem::replace(profile, dummy_profile());
                     *state = LoginState::NewPassword {
                         profile: confirmed,
@@ -472,7 +416,7 @@ pub fn view(state: &mut LoginState, ui: &mut egui::Ui) -> Option<LoginOutcome> {
                 *state = menu_state();
             } else if submit {
                 match check_password(pwd, pwd2)
-                    .and_then(|p| save_outcome(profile.clone(), phrase, &p))
+                    .and_then(|p| persist_identity(profile.clone(), phrase, &p))
                 {
                     Ok(outcome) => return Some(outcome),
                     Err(reason) => *error = Some(reason),
@@ -542,64 +486,32 @@ fn dummy_profile() -> IdentityInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::p2p::contacts::CACHE_TEST_LOCK;
 
     #[test]
-    fn profile_and_password_validation() {
+    fn gender_maps_to_l2_domain_values() {
+        assert_eq!(Gender::Male.ch(), 'M');
+        assert_eq!(Gender::Female.ch(), 'F');
+        assert_eq!(Gender::Other.ch(), 'O');
+        assert_eq!(Gender::all().len(), 3);
+    }
+
+    #[test]
+    fn profile_compose_uses_kernel_rules() {
+        // 走共享内核：姓名/生日规则与 CLI 完全一致，性别由表单枚举映射
         assert!(build_profile("", "1990-01-01", Gender::Male).is_err());
         assert!(build_profile("alice", "1990/01/01", Gender::Male).is_err());
         let profile = build_profile("  alice ", "1990-1-1", Gender::Female).unwrap();
         assert_eq!(profile.name, "alice");
         assert_eq!(profile.birthday, "1990-01-01");
         assert_eq!(profile.gender, 'F');
-        assert_eq!(Gender::Other.ch(), 'O');
-
-        assert!(check_password("short", "short").is_err());
-        assert!(check_password("password-123", "password-456").is_err());
-        assert!(check_password("password-123", "password-123").is_ok());
     }
 
     #[test]
-    fn mnemonic_confirm_words() {
-        let phrase = "abandon ability able about Absent absorb";
-        assert!(confirm_words(
-            phrase,
-            &["abandon".into(), " ability ".into(), "ABLE".into()]
-        ));
-        assert!(!confirm_words(phrase, &["abandon".into(), "wrong".into(), "able".into()]));
-    }
-
-    #[test]
-    fn unlock_with_wrong_and_right_password() {
-        let _guard = CACHE_TEST_LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join(format!("p2p_gui_login_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        unsafe {
-            std::env::set_var("P2P_ID_CACHE_DIR", &dir);
+    fn unlock_validates_password_rule_before_decrypt() {
+        // 规则错误不解密（不触达 keystore），文本来自共享内核
+        match unlock(1, "short") {
+            Err(reason) => assert_eq!(reason, "密码须为 8~128 字节"),
+            Ok(_) => panic!("规则错误不应触达解锁"),
         }
-
-        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let profile = IdentityInfo {
-            name: "alice".into(),
-            birthday: "1990-01-01".into(),
-            gender: 'F',
-        };
-        assert!(save_outcome(profile, phrase, "password-123").is_ok());
-
-        // 密码错误 → 内联错误可重试
-        match unlock(1, "wrong-password") {
-            Err(reason) => assert_eq!(reason, "密码错误"),
-            Ok(_) => panic!("错误密码不应解锁成功"),
-        }
-        // 正确密码 → 凭据与 keystore 归属一致
-        let outcome = unlock(1, "password-123").unwrap();
-        assert_eq!(
-            outcome.keypair.public().to_peer_id().to_string(),
-            keypair_from_mnemonic(phrase).unwrap().public().to_peer_id().to_string(),
-            "解锁应返回该助记词派生的身份"
-        );
-        assert_eq!(outcome.info.name, "alice");
-        // 越界序号
-        assert!(unlock(99, "password-123").is_err());
     }
 }

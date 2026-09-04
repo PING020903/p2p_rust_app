@@ -21,7 +21,10 @@
     `LineSource::prompt/prompt_secret`（带提示符读行/密码，rpassword 语义保留）
   - **安全**：GUI 密码全程只在表单内流转（masked），不进命令框、不落 interact.log；
     engine_done 生命周期简化（登录期无引擎线程）
-  - 单测 64（+3 登录编排：资料/密码校验、抄写确认、解锁错误与成功路径）+ e2e 全量回归
+  - 单测 68（+登录编排：资料/密码校验、抄写确认、解锁错误与成功路径）+ e2e 全量回归
+  - **登录纯逻辑共享内核**（`p2p_app/chat/login_common.rs`）：姓名/生日/密码校验、抄写确认
+    （统一大小写不敏感，并修复空输入空真漏洞——恢复长度守卫）、缓存解锁、保存路径收敛为
+    单一来源；CLI/GUI 各保留原生 UX（重试策略/提示文案/二次确认），规则语义不再漂移
 - **P2.0 前提重构完成（GUI 进程内引擎）**：
   - **单 exe 双模式分发**（M2）：无参→GUI（分离进程拉起窗口+引擎线程）、`--cli`/管道→纯 CLI
   - **LineSource 输入抽象**：`Stdin`（CLI/e2e 逐行）+ `Channel`（GUI 消息）；`InputMsg{Line, ChatText}`——
