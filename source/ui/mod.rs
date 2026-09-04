@@ -29,6 +29,29 @@ enum LogView {
     Interact,
 }
 
+/// 中区时间线条目：系统文本行与结构化聊天气泡混排（单列表保时序）
+enum TimelineItem {
+    Line(String),
+    Chat {
+        msg: crate::uievent::ChatMessage,
+        /// 到达时刻（HH:MM，本地时区）
+        at: String,
+    },
+}
+
+impl TimelineItem {
+    fn line(s: impl Into<String>) -> Self {
+        TimelineItem::Line(s.into())
+    }
+
+    fn chat(msg: crate::uievent::ChatMessage) -> Self {
+        TimelineItem::Chat {
+            msg,
+            at: chrono::Local::now().format("%H:%M").to_string(),
+        }
+    }
+}
+
 /// 引擎界面状态：由引擎输出特征行推断（精确整行匹配——聊天内容都带
 /// `[对方] `/`[我 -> ` 前缀，正文同款文本不会误触发）。
 /// GUI 模式无主菜单：进程内引擎直接进入登录流程。
@@ -61,8 +84,8 @@ fn next_state(current: ChildState, line: &str) -> ChildState {
 }
 
 pub struct GuiApp {
-    /// 滚动区文本行（引擎输出 + 本机状态）
-    lines: Vec<String>,
+    /// 中区时间线（系统行 + 聊天气泡，单列表保时序）
+    timeline: Vec<TimelineItem>,
     /// 输入框内容
     input: String,
     /// 命令输入框内容（/list 等；与文本框分离）
@@ -105,7 +128,7 @@ impl GuiApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let runtime = Arc::new(LogStore::new(5000));
         let interact = Arc::new(LogStore::new(5000));
-        let mut lines = Vec::new();
+        let mut lines: Vec<TimelineItem> = Vec::new();
 
         // CJK 字体：系统优先 → 内置兜底（结果写入运行日志，无头环境可凭日志验证）
         let font = fonts::install(&cc.egui_ctx);
@@ -120,7 +143,7 @@ impl GuiApp {
                     let _ = interact.enable_file(&log_dir.join("interact.log"));
                     log_note = log_dir.display().to_string();
                 }
-                Err(e) => lines.push(format!("日志目录写入失败: {e}")),
+                Err(e) => lines.push(TimelineItem::line(format!("日志目录写入失败: {e}"))),
             }
         }
         runtime.log(Level::Info, "gui", format!("GUI 启动，日志目录: {log_note}"));
@@ -131,7 +154,7 @@ impl GuiApp {
         let engine_done = Arc::new(AtomicBool::new(false));
 
         GuiApp {
-            lines,
+            timeline: lines,
             input: String::new(),
             cmd_input: String::new(),
             ui_tx: None,
@@ -197,24 +220,27 @@ impl GuiApp {
                 self.ui_tx = Some(ui_tx);
                 self.out_rx = Some(out_rx);
                 self.child_state = ChildState::Chat;
-                self.lines.push("聊天引擎已启动（进程内模式）".to_string());
+                self.timeline
+                    .push(TimelineItem::line("聊天引擎已启动（进程内模式）"));
             }
             Err(e) => {
                 self.runtime
                     .log(Level::Error, "gui", format!("引擎线程启动失败: {e}"));
-                self.lines.push(format!("引擎线程启动失败: {e}"));
+                self.timeline
+                    .push(TimelineItem::line(format!("引擎线程启动失败: {e}")));
             }
         }
     }
-    /// 发送输入到引擎（通道未就绪时降级为滚动区提示）
+    /// 发送输入到引擎（通道未就绪时降级为时间线提示）
     fn send_input(&mut self, msg: InputMsg) {
         match &self.ui_tx {
             Some(tx) => {
                 if let Err(e) = tx.send(msg) {
-                    self.lines.push(format!("[引擎输入通道关闭: {e}]"));
+                    self.timeline
+                        .push(TimelineItem::line(format!("[引擎输入通道关闭: {e}]")));
                 }
             }
-            None => self.lines.push("[引擎未运行]".to_string()),
+            None => self.timeline.push(TimelineItem::line("[引擎未运行]")),
         }
     }
 }
@@ -232,13 +258,12 @@ impl eframe::App for GuiApp {
                     crate::uievent::EngineOut::Line(line) => {
                         self.child_state = next_state(self.child_state, &line);
                         self.interact.log(Level::Info, "engine", &line);
-                        self.lines.push(line);
+                        self.timeline.push(TimelineItem::line(line));
                     }
-                    // 子步 a 兜底：结构化消息按 CLI 文本形态渲染（子步 b 起改气泡）
+                    // 气泡：结构化消息进时间线（日志仍按 CLI 文本形态落盘）
                     crate::uievent::EngineOut::Event(crate::uievent::UiEvent::Chat(m)) => {
-                        let line = m.to_cli_line();
-                        self.interact.log(Level::Info, "engine", &line);
-                        self.lines.push(line);
+                        self.interact.log(Level::Info, "engine", m.to_cli_line());
+                        self.timeline.push(TimelineItem::chat(m));
                     }
                 }
                 ctx.request_repaint();
@@ -248,7 +273,7 @@ impl eframe::App for GuiApp {
         if self.engine_done.swap(false, Ordering::AcqRel) {
             self.runtime
                 .log(Level::Info, "engine", "引擎已退出，GUI 即将关闭");
-            self.lines.push("[引擎已退出]".to_string());
+            self.timeline.push(TimelineItem::line("[引擎已退出]"));
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             ctx.request_repaint();
         }
@@ -325,7 +350,8 @@ impl eframe::App for GuiApp {
                             self.send_input(InputMsg::Line(final_text));
                         }
                         Err((rule, reason)) => {
-                            self.lines.push(format!("[已拦截] {reason}"));
+                            self.timeline
+                                .push(TimelineItem::line(format!("[已拦截] {reason}")));
                             self.runtime
                                 .log(Level::Warn, "guard", format!("拦截命令[{rule}]: {reason}"));
                         }
@@ -375,7 +401,8 @@ impl eframe::App for GuiApp {
                             self.send_input(InputMsg::ChatText(text));
                         }
                         Err((rule, reason)) => {
-                            self.lines.push(format!("[已拦截] {reason}"));
+                            self.timeline
+                                .push(TimelineItem::line(format!("[已拦截] {reason}")));
                             self.runtime
                                 .log(Level::Warn, "guard", format!("拦截文本[{rule}]: {reason}"));
                         }
@@ -403,16 +430,23 @@ impl eframe::App for GuiApp {
             });
             ui.separator();
 
-            // 滚动输出区（最新自动滚底）
+            // 滚动输出区（最新自动滚底）：系统行 + 聊天气泡混排
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    if self.lines.is_empty() {
+                    if self.timeline.is_empty() {
                         ui.weak("（暂无输出）");
                     } else {
-                        for line in &self.lines {
-                            ui.label(line);
+                        for item in &self.timeline {
+                            match item {
+                                TimelineItem::Line(s) => {
+                                    ui.label(s);
+                                }
+                                TimelineItem::Chat { msg, at } => {
+                                    render_bubble(ui, msg, at);
+                                }
+                            }
                         }
                     }
                 });
@@ -423,10 +457,73 @@ impl eframe::App for GuiApp {
     }
 }
 
+/// 聊天气泡：对侧左对齐、我侧右对齐；头部小字（名字/群前缀 + 时刻），正文自动换行。
+/// 配色：我侧绿、对侧深灰蓝、未信任黄（描边语义用文字 ⚠ 前缀）。
+fn render_bubble(ui: &mut egui::Ui, msg: &crate::uievent::ChatMessage, at: &str) {
+    let header = if msg.outgoing {
+        format!("我 -> {}", msg.group.as_deref().unwrap_or(&msg.from))
+    } else {
+        let name = match &msg.group {
+            Some(g) if !msg.focused => format!("[{g}] {}", msg.from),
+            _ => msg.from.clone(),
+        };
+        if msg.untrusted {
+            format!("⚠ 未信任 {name}")
+        } else {
+            name
+        }
+    };
+    let (fill, text_color, head_color) = if msg.untrusted {
+        (
+            egui::Color32::from_rgb(64, 52, 16),
+            egui::Color32::from_rgb(240, 210, 120),
+            egui::Color32::from_rgb(230, 180, 0),
+        )
+    } else if msg.outgoing {
+        (
+            egui::Color32::from_rgb(22, 72, 54),
+            egui::Color32::from_rgb(200, 245, 215),
+            egui::Color32::from_rgb(140, 200, 165),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(42, 47, 58),
+            egui::Color32::from_rgb(225, 230, 240),
+            egui::Color32::from_rgb(150, 160, 180),
+        )
+    };
+
+    let layout = if msg.outgoing {
+        egui::Layout::right_to_left(egui::Align::TOP)
+    } else {
+        egui::Layout::left_to_right(egui::Align::TOP)
+    };
+    ui.with_layout(layout, |ui| {
+        egui::Frame::group(ui.style())
+            .fill(fill)
+            .corner_radius(10.0)
+            .inner_margin(egui::Margin::symmetric(9, 6))
+            .show(ui, |ui| {
+                ui.set_max_width(ui.available_width() * 0.72);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(&header)
+                                .small()
+                                .color(head_color),
+                        );
+                    });
+                    ui.label(egui::RichText::new(&msg.text).color(text_color));
+                });
+            });
+        ui.weak(at);
+    });
+    ui.add_space(2.0);
+}
+
 impl GuiApp {
     /// 延迟状态行（配合日志面板时间线对照分析）
-    fn status_line(&self) -> String {
-        let f = |label: &'static str| -> String {
+    fn status_line(&self) -> String {        let f = |label: &'static str| -> String {
             match self.stats.get(label) {
                 Some(x) => format!("last={} max={}", ms(x.last), ms(x.max)),
                 None => "-".to_string(),

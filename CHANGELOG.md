@@ -9,6 +9,11 @@
 
 ### 新增
 
+- **P2.2 子步 b：中区气泡时间线**：
+  - GuiApp `lines: Vec<String>` → `timeline: Vec<TimelineItem>`——系统行与聊天气泡混排单列表保时序
+  - 气泡渲染（egui Frame 圆角）：对侧左对齐/我侧右对齐；头部小字（名字、群前缀 `[群名] 名`、
+    未信任 ⚠ 标记、到达时刻 HH:MM）；配色 我侧绿/对侧深灰蓝/未信任黄；正文自动换行（上限 72% 宽）
+  - 聊天消息仍按 to_cli_line 落 interact.log（日志与界面解耦）
 - **P2.2 子步 a：消息结构化通道**（GUI 气泡化的管线铺垫）：
   - `source/uievent.rs`：ChatMessage（from/outgoing/focused/group/untrusted）+ UiEvent + EngineOut
   - sink 单通道统一 `EngineOut{Line, Event}`——文本行与结构化事件 FIFO 保序（气泡与系统提示不打乱时序）
