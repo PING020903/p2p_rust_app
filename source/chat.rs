@@ -14,6 +14,7 @@ use crate::p2p::identity::LoginOutcome;
 use crate::p2p::identity_service::{
     is_l2_signal, IdentityService, InputMsg, LineSource, TextTag,
 };
+use crate::p2p_app::chat::display;
 use crate::p2p::seam::{self, is_global_ipv6_listen, Event, SignalRegistry, BYE_HANDSHAKE_TIMEOUT};
 
 // ---- 语义注册表（L3 应用层）：text=Custom(tag) 承载协议语义，binary 承载负载 ----
@@ -260,27 +261,16 @@ async fn on_peer_bye_signal(ctx: &mut AppCtx<'_>, from: &PeerId, _payload: Optio
     true
 }
 
-/// 展示 chat.text 消息：trusted 用 `[对方]`/`[名字]` 前缀；untrusted 带 `[未信任]` 标记
+/// 展示 chat.text 消息：显示路由分流（CLI 文本 / GUI 结构化事件）。
+/// trusted 焦点 `[对方]`、非焦点 `[名字]` 前缀；untrusted 带 `[未信任]` 标记——
+/// 前缀规则集中在 display::incoming_chat 与 ChatMessage::to_cli_line。
 fn show_chat_text(from: &PeerId, text: &str, conv_name: &str, focused: bool, untrusted: bool) {
-    if untrusted {
-        let who = if conv_name.is_empty() {
-            from.to_string()
-        } else {
-            conv_name.to_string()
-        };
-        println!("{}", format!("[未信任] {who}: {text}").yellow());
-        return;
-    }
-    if focused {
-        println!("{}", format!("[对方] {text}").bright_cyan());
+    let who = if conv_name.is_empty() {
+        from.to_string()
     } else {
-        let who = if conv_name.is_empty() {
-            from.to_string()
-        } else {
-            conv_name.to_string()
-        };
-        println!("{}", format!("[{who}] {text}").bright_cyan());
-    }
+        conv_name.to_string()
+    };
+    display::incoming_chat(&who, text, focused, None, untrusted);
 }
 
 async fn on_chat_text(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
@@ -1610,7 +1600,7 @@ async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
                 data: payload,
             })
             .await;
-        println!("{}", format!("[我 -> {}] {text}", g.name).green());
+        display::outgoing_chat(&g.name, text, Some(&g.name));
         return;
     }
     match *ctx.focused {
@@ -1661,7 +1651,7 @@ async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
                     payload: Some(payload),
                 })
                 .await;
-            println!("{}", format!("[我 -> {who}] {text}").green());
+            display::outgoing_chat(&who, text, None);
         }
         None => eprintln!(
             "{}",
@@ -2153,18 +2143,15 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                         } else {
                                             peer_name(&source, &conversations, &identity)
                                         };
-                                        if focused_group.as_deref() == Some(group_id.as_str()) {
-                                            println!(
-                                                "{}",
-                                                format!("[{who}] {text}").bright_cyan()
-                                            );
-                                        } else {
-                                            println!(
-                                                "{}",
-                                                format!("[{}] [{who}] {text}", g.name)
-                                                    .bright_cyan()
-                                            );
-                                        }
+                                        let focused =
+                                            focused_group.as_deref() == Some(group_id.as_str());
+                                        display::incoming_chat(
+                                            &who,
+                                            &text,
+                                            focused,
+                                            Some(&g.name),
+                                            false,
+                                        );
                                     }
                                 }
                             }

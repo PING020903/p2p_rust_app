@@ -9,6 +9,14 @@
 
 ### 新增
 
+- **P2.2 子步 a：消息结构化通道**（GUI 气泡化的管线铺垫）：
+  - `source/uievent.rs`：ChatMessage（from/outgoing/focused/group/untrusted）+ UiEvent + EngineOut
+  - sink 单通道统一 `EngineOut{Line, Event}`——文本行与结构化事件 FIFO 保序（气泡与系统提示不打乱时序）
+  - `p2p_app/chat/display.rs` 显示路由：1v1 收/发、群收/发四个漏斗统一入口——
+    CLI 分支逐字节保持历史文本（群焦点 `[{谁}]`、群非焦点 `[{群名}] [{谁}]` 双前缀、
+    1v1 焦点 `[对方]`、未信任 `[未信任]` 标记），GUI 分支发结构化事件
+  - GUI 子步 a 兜底：Chat 事件按 to_cli_line 文本渲染（视觉不变，子步 b 起改气泡）
+  - e2e 抓漏：群消息 CLI 分支初版丢失群名前缀——已恢复语义并补 to_cli_line 对应分支
 - **P2.1 GUI 登录页 + 应用层结构（p2p_app/）**：
   - **应用层落地**：`source/p2p_app/`（按应用细分，应用内分 cli/gui）——聊天应用 `chat/{cli,gui}`、
     文件传输占位；CLI 文本登录流程自 identity_service.rs 迁入 `chat/cli/login.rs`（文案逐字节不变）；

@@ -30,6 +30,7 @@ mod p2p_app;
 mod sink;
 mod student;
 mod ui;
+mod uievent;
 
 // Color 提升到 crate 根：debug_print! 宏展开引用 `$crate::Color`
 use color_print::Color;

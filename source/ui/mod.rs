@@ -69,8 +69,8 @@ pub struct GuiApp {
     cmd_input: String,
     /// UI → 引擎输入通道（引擎启动后有效；文本框 ChatText / 命令框 Line）
     ui_tx: Option<mpsc::UnboundedSender<InputMsg>>,
-    /// 引擎 → UI 输出通道（TextSink 捕获的引擎输出；引擎启动后有效）
-    out_rx: Option<mpsc::UnboundedReceiver<String>>,
+    /// 引擎 → UI 输出通道（TextSink 捕获的引擎输出；Line/Event 统一枚举保序）
+    out_rx: Option<mpsc::UnboundedReceiver<crate::uievent::EngineOut>>,
     /// 引擎任务结束标记（聊天退出 → GUI 联动关闭）
     engine_done: Arc<AtomicBool>,
     /// 登录页状态机（引擎未启动阶段的全窗口卡片）
@@ -161,7 +161,7 @@ impl GuiApp {
     /// 启动聊天引擎线程：GUI 登录表单凭据（Some）直建会话；
     /// 单线程 current_thread runtime，线程局部 sink 在本线程生效。
     fn start_engine(&mut self, pre: Option<LoginOutcome>) {
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<crate::uievent::EngineOut>();
         let (ui_tx, ui_rx) = mpsc::unbounded_channel::<InputMsg>();
         let done = self.engine_done.clone();
         let engine_log = self.runtime.clone();
@@ -224,13 +224,23 @@ impl eframe::App for GuiApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let _t = timing::ScopeTimer::start("frame.logic", &self.stats);
         if let Some(out_rx) = &mut self.out_rx {
-            while let Ok(line) = out_rx.try_recv() {
+            while let Ok(out) = out_rx.try_recv() {
                 if let Some(t0) = self.input_sent_at.take() {
                     self.stats.record("roundtrip.input->resp", t0.elapsed());
                 }
-                self.child_state = next_state(self.child_state, &line);
-                self.interact.log(Level::Info, "engine", &line);
-                self.lines.push(line);
+                match out {
+                    crate::uievent::EngineOut::Line(line) => {
+                        self.child_state = next_state(self.child_state, &line);
+                        self.interact.log(Level::Info, "engine", &line);
+                        self.lines.push(line);
+                    }
+                    // 子步 a 兜底：结构化消息按 CLI 文本形态渲染（子步 b 起改气泡）
+                    crate::uievent::EngineOut::Event(crate::uievent::UiEvent::Chat(m)) => {
+                        let line = m.to_cli_line();
+                        self.interact.log(Level::Info, "engine", &line);
+                        self.lines.push(line);
+                    }
+                }
                 ctx.request_repaint();
             }
         }
