@@ -9,6 +9,15 @@
 
 ### 新增
 
+- **P2.2 子步 e：引擎主动唤醒（纯事件驱动，零轮询）**：
+  - sink 基础设施加通知回调：`install(tx, notify)`——GUI 传 `ctx.request_repaint` 闭包
+    （egui 类型封在闭包内不穿透签名），四出口（line/err/raw/event）send 成功后即唤醒 UI
+  - 消息/侧栏快照显示延迟 500ms→~0；突发输出合并为一帧（request_repaint 置标记不排队）
+  - 引擎退出也推送：线程闭包持 ctx 副本，`done.store(true)` **先于** `request_repaint`
+    （顺序防竞态：保证唤醒帧必能看到退出标记 → GUI 联动关闭）；
+    runtime 构建失败路径同步补唤醒（此前靠轮询兜底）
+  - 删除 logic() 的 500ms 空闲轮询——空闲时主线程阻塞在事件队列（零 CPU），
+    用户输入/缩放由 OS 事件天然触发
 - **P2.2 子步 b1+b2：气泡布局修正（手工测量 + 手绘）**：
   - 症状：我侧（RTL）气泡撑满锚定列且不贴右缘，对侧（LTR）正常——egui Frame 自动尺寸
     与 RTL 布局交互不对称，自动尺寸路径不可靠

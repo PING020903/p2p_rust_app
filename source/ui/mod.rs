@@ -186,7 +186,9 @@ impl GuiApp {
 
     /// 启动聊天引擎线程：GUI 登录表单凭据（Some）直建会话；
     /// 单线程 current_thread runtime，线程局部 sink 在本线程生效。
-    fn start_engine(&mut self, pre: Option<LoginOutcome>) {
+    /// `egui_ctx` 供引擎主动唤醒 UI：输出 send 后 notify、退出前置位 done 再唤醒
+    /// （纯事件驱动，无轮询；顺序关键——先置位再唤醒，保证唤醒帧必能看到退出标记）。
+    fn start_engine(&mut self, pre: Option<LoginOutcome>, egui_ctx: egui::Context) {
         let (out_tx, out_rx) = mpsc::unbounded_channel::<crate::uievent::EngineOut>();
         let (ui_tx, ui_rx) = mpsc::unbounded_channel::<InputMsg>();
         let done = self.engine_done.clone();
@@ -194,6 +196,11 @@ impl GuiApp {
         let spawn_result = std::thread::Builder::new()
             .name("chat-engine".into())
             .spawn(move || {
+                // 唤醒回调：sink 每次 send 后调用（egui 类型封在闭包内，不穿透 sink 签名）
+                let notify = {
+                    let ctx = egui_ctx.clone();
+                    Box::new(move || ctx.request_repaint()) as Box<dyn Fn() + Send>
+                };
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -206,17 +213,20 @@ impl GuiApp {
                             format!("引擎 runtime 构建失败: {e}"),
                         );
                         done.store(true, Ordering::Release);
+                        egui_ctx.request_repaint();
                         return;
                     }
                 };
-                sink::install(out_tx);
+                sink::install(out_tx, Some(notify));
                 engine_log.log(Level::Info, "engine", "引擎线程启动（进程内聊天核心）");
                 if let Err(e) = rt.block_on(chat::run_engine(LineSource::Channel(ui_rx), pre)) {
                     engine_log.log(Level::Error, "engine", format!("引擎错误: {e}"));
                 }
                 engine_log.log(Level::Info, "engine", "引擎已退出");
                 sink::uninstall();
+                // 先置位再唤醒：这一帧必能看到退出标记 → GUI 联动关闭
                 done.store(true, Ordering::Release);
+                egui_ctx.request_repaint();
             });
         match spawn_result {
             Ok(_) => {
@@ -289,8 +299,8 @@ impl eframe::App for GuiApp {
         cap(&mut self.pending_runtime, 5000);
         cap(&mut self.pending_interact, 5000);
 
-        // 空闲时低频轮询：引擎无输出时 logic() 不被调用，保证引擎退出能被及时检测
-        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        // 纯事件驱动，无轮询：引擎输出/退出均由引擎线程主动 request_repaint 唤醒；
+        // 空闲时主线程阻塞在事件队列上（零 CPU），用户输入/缩放由 OS 事件天然触发
     }
 
     /// 根 UI 回调：给定的 `ui` 无外边距/背景，用面板分区布局。
@@ -316,7 +326,7 @@ impl eframe::App for GuiApp {
                     self.interact.log(Level::Info, "user", "登录成功（GUI 表单）");
                     self.runtime
                         .log(Level::Info, "gui", "GUI 登录完成，启动聊天引擎");
-                    self.start_engine(Some(outcome));
+                    self.start_engine(Some(outcome), ui.ctx().clone());
                 }
             });
             self.first_frame = false;
