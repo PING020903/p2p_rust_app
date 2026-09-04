@@ -9,6 +9,14 @@
 
 ### 新增
 
+- **P2.2 子步 b1+b2：气泡布局修正（手工测量 + 手绘）**：
+  - 症状：我侧（RTL）气泡撑满锚定列且不贴右缘，对侧（LTR）正常——egui Frame 自动尺寸
+    与 RTL 布局交互不对称，自动尺寸路径不可靠
+  - 修复：render_bubble 重写为方向无关的确定性布局——`painter.layout/layout_no_wrap`
+    先排版测量（正文按列宽−内边距换行，galley 缓存兜底，缩放窗口即时重排），
+    气泡尺寸 = max(头宽, 文宽) + 内边距，`allocate_exact_size` 精确放置 + `rect_filled`
+    画圆角 + galley 手绘；两侧同一代码路径，仅锚定方向不同
+  - 反应式重绘模型澄清入文档：egui 事件驱动（无事不画），非全速刷新
 - **P2.2 子步 c：左栏联系人 + 群列表**：
   - 侧栏快照事件 `UiEvent::Sidebar(SidebarState{contacts, groups})`——推送点：命令处理后 +
     每个传输事件后（联系人/信任/连接/焦点变化全覆盖）；CLI 无事件通道 no-op

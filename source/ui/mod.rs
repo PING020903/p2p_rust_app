@@ -547,6 +547,13 @@ fn render_sidebar(
 
 /// 聊天气泡：对侧左对齐、我侧右对齐；头部小字（名字/群前缀 + 时刻），正文自动换行。
 /// 配色：我侧绿、对侧深灰蓝、未信任黄（描边语义用文字 ⚠ 前缀）。
+///
+/// 布局（手工测量 + 手绘，方向无关的确定性尺寸）：
+/// 1. 先用 galley 排版测量——正文按 `列宽 − 内边距` 换行（支持多行），头部单行；
+/// 2. 气泡尺寸 = max(头宽, 文宽) + 内边距，与布局方向完全无关；
+/// 3. `with_layout` 定锚定侧（我侧右/对侧左）→ `allocate_exact_size` 精确放置 →
+///    painter 画圆角矩形 + 放置两个 galley；时间戳贴气泡旁。
+/// （不用 Frame 自动尺寸：egui RTL 下 Frame 撑满锚定列与 LTR 行为不对称，见 b1 实测）
 fn render_bubble(ui: &mut egui::Ui, msg: &crate::uievent::ChatMessage, at: &str) {
     let header = if msg.outgoing {
         format!("我 -> {}", msg.group.as_deref().unwrap_or(&msg.from))
@@ -581,29 +588,49 @@ fn render_bubble(ui: &mut egui::Ui, msg: &crate::uievent::ChatMessage, at: &str)
         )
     };
 
-    let layout = if msg.outgoing {
+    // 字体随主题（Body/Small），颜色在排版时写入 galley
+    let body_font = ui
+        .style()
+        .text_styles
+        .get(&egui::TextStyle::Body)
+        .cloned()
+        .unwrap_or_else(|| egui::FontId::proportional(14.0));
+    let small_font = ui
+        .style()
+        .text_styles
+        .get(&egui::TextStyle::Small)
+        .cloned()
+        .unwrap_or_else(|| egui::FontId::proportional(10.0));
+
+    // 排版测量（每帧执行、galley 缓存兜底；缩放窗口即重排）
+    let col_w = ui.available_width() * 0.80;
+    let (pad_x, pad_y, head_gap) = (8.0_f32, 5.0_f32, 3.0_f32);
+    let wrap_w = (col_w - pad_x * 2.0).max(60.0);
+    let painter = ui.painter().clone();
+    let head_gal = painter.layout_no_wrap(header, small_font, head_color);
+    let text_gal = painter.layout(msg.text.clone(), body_font, text_color, wrap_w);
+
+    let bubble_w = head_gal.size().x.max(text_gal.size().x) + pad_x * 2.0;
+    let bubble_h = head_gal.size().y + head_gap + text_gal.size().y + pad_y * 2.0;
+
+    let layout_dir = if msg.outgoing {
         egui::Layout::right_to_left(egui::Align::TOP)
     } else {
         egui::Layout::left_to_right(egui::Align::TOP)
     };
-    ui.with_layout(layout, |ui| {
-        egui::Frame::group(ui.style())
-            .fill(fill)
-            .corner_radius(10.0)
-            .inner_margin(egui::Margin::symmetric(9, 6))
-            .show(ui, |ui| {
-                ui.set_max_width(ui.available_width() * 0.72);
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(&header)
-                                .small()
-                                .color(head_color),
-                        );
-                    });
-                    ui.label(egui::RichText::new(&msg.text).color(text_color));
-                });
-            });
+    ui.with_layout(layout_dir, |ui| {
+        let (rect, _resp) =
+            ui.allocate_exact_size(egui::vec2(bubble_w, bubble_h), egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, egui::CornerRadius::same(10), fill);
+        let head_h = head_gal.size().y;
+        let origin = rect.min + egui::vec2(pad_x, pad_y);
+        painter.galley(origin, head_gal, head_color);
+        painter.galley(
+            origin + egui::vec2(0.0, head_h + head_gap),
+            text_gal,
+            text_color,
+        );
         ui.weak(at);
     });
     ui.add_space(2.0);
@@ -611,7 +638,8 @@ fn render_bubble(ui: &mut egui::Ui, msg: &crate::uievent::ChatMessage, at: &str)
 
 impl GuiApp {
     /// 延迟状态行（配合日志面板时间线对照分析）
-    fn status_line(&self) -> String {        let f = |label: &'static str| -> String {
+    fn status_line(&self) -> String {
+        let f = |label: &'static str| -> String {
             match self.stats.get(label) {
                 Some(x) => format!("last={} max={}", ms(x.last), ms(x.max)),
                 None => "-".to_string(),
