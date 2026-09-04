@@ -9,6 +9,13 @@
 
 ### 新增
 
+- **P2.2 子步 c：左栏联系人 + 群列表**：
+  - 侧栏快照事件 `UiEvent::Sidebar(SidebarState{contacts, groups})`——推送点：命令处理后 +
+    每个传输事件后（联系人/信任/连接/焦点变化全覆盖）；CLI 无事件通道 no-op
+  - L2 只读快照 API：`ContactBook::all()` + `IdentityService::contact_entries()`（按名排序）
+  - GUI 左栏（`Panel::left`）：联系人 = 在线圆点 ●/○ + 名字（焦点加粗）+ 信任徽标
+    [互信]绿/[我信任]黄/[未信任]灰 + 悬浮显示节点ID；群列表 = 名字 + 成员数（焦点加粗）；
+    点击即发 `/chat <名>` / `/group <名>`（复用 CLI 命令语义，无新增引擎输入协议）
 - **P2.2 子步 b：中区气泡时间线**：
   - GuiApp `lines: Vec<String>` → `timeline: Vec<TimelineItem>`——系统行与聊天气泡混排单列表保时序
   - 气泡渲染（egui Frame 圆角）：对侧左对齐/我侧右对齐；头部小字（名字、群前缀 `[群名] 名`、

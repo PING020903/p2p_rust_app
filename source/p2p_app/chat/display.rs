@@ -8,7 +8,7 @@
 use colored::Colorize;
 
 use crate::sink;
-use crate::uievent::{ChatMessage, UiEvent};
+use crate::uievent::{ChatMessage, ContactView, GroupView, SidebarState, UiEvent};
 
 /// 收到聊天消息（1v1 与群共用）
 /// - `from_display`：对方显示名（联系人名/群内自报名/节点ID）
@@ -64,4 +64,11 @@ pub fn outgoing_chat(who: &str, text: &str, group: Option<&str>) {
         return;
     }
     sink::line(format!("[我 -> {who}] {text}").green());
+}
+
+/// 侧栏快照推送（联系人 + 群列表；CLI 无事件通道时 no-op）
+pub fn sidebar(contacts: Vec<ContactView>, groups: Vec<GroupView>) {
+    if sink::event_mode() {
+        sink::event(UiEvent::Sidebar(SidebarState { contacts, groups }));
+    }
 }

@@ -45,10 +45,40 @@ impl ChatMessage {
     }
 }
 
+/// 侧栏联系人条目（信任徽标/在线/焦点由引擎侧判定，GUI 只渲染）
+#[derive(Debug, Clone)]
+pub struct ContactView {
+    pub peer_id: String,
+    pub name: String,
+    pub online: bool,
+    /// 当前焦点会话（高亮）
+    pub focused: bool,
+    /// 互信（我信任 且 对方信任我）
+    pub effective_trusted: bool,
+    /// 我已信任（对方未确认）
+    pub i_trust: bool,
+}
+
+/// 侧栏群条目
+#[derive(Debug, Clone)]
+pub struct GroupView {
+    pub name: String,
+    pub focused: bool,
+    pub member_count: usize,
+}
+
+/// 侧栏快照（联系人 + 群；GUI 左栏整体替换渲染）
+#[derive(Debug, Clone, Default)]
+pub struct SidebarState {
+    pub contacts: Vec<ContactView>,
+    pub groups: Vec<GroupView>,
+}
+
 /// 结构化显示事件（随界面功能扩展；文本行永远走 Line，事件只承载结构化语义）
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     Chat(ChatMessage),
+    Sidebar(SidebarState),
 }
 
 /// 引擎输出统一项：单通道 FIFO 保证 Line 与 Event 的相对顺序

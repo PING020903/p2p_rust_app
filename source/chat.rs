@@ -148,6 +148,49 @@ async fn run_terminal_escape(program: &str, args: &[&str], rest: &str) {
     }
 }
 
+/// 侧栏快照推送：联系人（信任徽标/在线/焦点）+ 群列表。
+/// 推送点：命令处理后（/trust /chat /group 等）与每个传输事件处理后。
+/// CLI 无事件通道时 no-op（display::sidebar 内部判定）。
+fn push_sidebar(
+    identity: &IdentityService,
+    groups: &HashMap<String, Group>,
+    connected: &HashSet<PeerId>,
+    focused: &Option<PeerId>,
+    focused_group: &Option<String>,
+) {
+    use crate::uievent::{ContactView, GroupView};
+    let contacts = identity
+        .contact_entries()
+        .into_iter()
+        .filter_map(|e| {
+            let peer: PeerId = e.peer_id.parse().ok()?;
+            let name = if e.name.is_empty() {
+                e.peer_id.chars().take(10).collect()
+            } else {
+                e.name
+            };
+            Some(ContactView {
+                peer_id: e.peer_id,
+                name,
+                online: connected.contains(&peer),
+                focused: *focused == Some(peer),
+                effective_trusted: e.verified && e.their_trust,
+                i_trust: e.verified,
+            })
+        })
+        .collect();
+    let mut gvs: Vec<GroupView> = groups
+        .values()
+        .map(|g| GroupView {
+            name: g.name.clone(),
+            focused: focused_group.as_deref() == Some(g.id.as_str()),
+            member_count: g.members.len(),
+        })
+        .collect();
+    gvs.sort_by(|a, b| a.name.cmp(&b.name));
+    display::sidebar(contacts, gvs);
+}
+
 /// 打印本机可分享地址：全局 IPv6 直连地址（标题一次 + 逐条列出），其余监听地址另列（/listen）
 fn print_listen_addrs(addrs: &[Multiaddr], peer_id: &PeerId) {
     let globals: Vec<&Multiaddr> = addrs
@@ -1962,6 +2005,13 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                         let _ = ctx.cmd_tx.send(seam::Cmd::Shutdown).await;
                         break;
                     }
+                    push_sidebar(
+                        ctx.identity,
+                        ctx.groups,
+                        ctx.connected,
+                        ctx.focused,
+                        &ctx.focused_group,
+                    );
                     continue;
                 }
                 // 非命令：作为消息发送给当前聊天对象（与 /sendStrings 共用同一发送逻辑）
@@ -2173,6 +2223,10 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                 }
                             }
                         }
+                        // 侧栏快照：任何事件后都可能改变联系人/群/连接状态
+                        push_sidebar(
+                            &identity, &groups, &connected, &focused, &focused_group,
+                        );
                     }
                     None => break,
                 }

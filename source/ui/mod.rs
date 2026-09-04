@@ -98,6 +98,8 @@ pub struct GuiApp {
     engine_done: Arc<AtomicBool>,
     /// 登录页状态机（引擎未启动阶段的全窗口卡片）
     login: login::LoginState,
+    /// 左栏侧栏快照（联系人 + 群；引擎侧推送，登录期为 None）
+    sidebar: Option<crate::uievent::SidebarState>,
     /// 首帧标记：自动聚焦输入框
     first_frame: bool,
     /// 耗时统计
@@ -164,6 +166,7 @@ impl GuiApp {
                 identities: login::load_cached(),
                 error: None,
             },
+            sidebar: None,
             first_frame: true,
             stats: timing::TimingStats::default(),
             runtime,
@@ -265,6 +268,10 @@ impl eframe::App for GuiApp {
                         self.interact.log(Level::Info, "engine", m.to_cli_line());
                         self.timeline.push(TimelineItem::chat(m));
                     }
+                    // 侧栏快照：整体替换（推送点：命令处理后 + 每个传输事件后）
+                    crate::uievent::EngineOut::Event(crate::uievent::UiEvent::Sidebar(s)) => {
+                        self.sidebar = Some(s);
+                    }
                 }
                 ctx.request_repaint();
             }
@@ -314,6 +321,22 @@ impl eframe::App for GuiApp {
             });
             self.first_frame = false;
             return;
+        }
+
+        // 左栏：联系人（信任徽标/在线/焦点）+ 群列表；点击发 /chat|/group 命令（复用 CLI 语义）
+        let mut sidebar_cmd: Option<String> = None;
+        if let Some(sb) = &self.sidebar {
+            egui::Panel::left("sidebar")
+                .default_size(210.0)
+                .resizable(true)
+                .show(ui, |ui| {
+                    sidebar_cmd = render_sidebar(ui, sb);
+                });
+        }
+        if let Some(cmd) = sidebar_cmd {
+            self.interact.log(Level::Info, "user", format!("/cmd: {cmd}"));
+            self.input_sent_at = Some(Instant::now());
+            self.send_input(InputMsg::Line(cmd));
         }
 
         // 底部输入面板先声明 → 先占位，CentralPanel 只拿剩余高度（ScrollArea 不会挤掉输入行）
@@ -455,6 +478,71 @@ impl eframe::App for GuiApp {
         frame_timer.stop_and_record("frame.ui", &self.stats);
         self.first_frame = false;
     }
+}
+
+/// 侧栏视图：联系人（在线点 + 名字 + 信任徽标）与群列表；返回点击产生的命令
+fn render_sidebar(
+    ui: &mut egui::Ui,
+    sb: &crate::uievent::SidebarState,
+) -> Option<String> {
+    let mut cmd = None;
+
+    ui.heading("联系人");
+    if sb.contacts.is_empty() {
+        ui.weak("（暂无联系人）");
+    }
+    for c in &sb.contacts {
+        ui.horizontal(|ui| {
+            let (dot, dot_color) = if c.online {
+                ("●", egui::Color32::from_rgb(90, 200, 120))
+            } else {
+                ("○", egui::Color32::from_rgb(110, 118, 130))
+            };
+            ui.label(egui::RichText::new(dot).color(dot_color));
+            // 焦点会话加粗高亮；悬浮显示节点ID（重名时人工核对）
+            let name_text = if c.focused {
+                egui::RichText::new(&c.name).strong()
+            } else {
+                egui::RichText::new(&c.name)
+            };
+            let resp = ui.add(egui::Label::new(name_text).selectable(false));
+            if resp.clicked() {
+                cmd = Some(format!("/chat {}", c.name));
+            }
+            resp.on_hover_text(&c.peer_id);
+            let (badge, color) = if c.effective_trusted {
+                ("[互信]", egui::Color32::from_rgb(90, 200, 120))
+            } else if c.i_trust {
+                ("[我信任]", egui::Color32::from_rgb(230, 180, 0))
+            } else {
+                ("[未信任]", egui::Color32::from_rgb(110, 118, 130))
+            };
+            ui.label(egui::RichText::new(badge).small().color(color));
+        });
+    }
+
+    ui.separator();
+    ui.heading("群");
+    if sb.groups.is_empty() {
+        ui.weak("（暂无群）");
+    }
+    for g in &sb.groups {
+        ui.horizontal(|ui| {
+            let label = if g.focused {
+                egui::RichText::new(&g.name).strong()
+            } else {
+                egui::RichText::new(&g.name)
+            };
+            if ui
+                .add(egui::Label::new(label).selectable(false))
+                .clicked()
+            {
+                cmd = Some(format!("/group {}", g.name));
+            }
+            ui.weak(format!("{}人", g.member_count));
+        });
+    }
+    cmd
 }
 
 /// 聊天气泡：对侧左对齐、我侧右对齐；头部小字（名字/群前缀 + 时刻），正文自动换行。

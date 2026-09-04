@@ -84,6 +84,11 @@ impl ContactBook {
         self.entries.get(peer_id)
     }
 
+    /// 全部条目遍历（前端侧栏快照等只读展示用）
+    pub fn all(&self) -> impl Iterator<Item = &ContactEntry> {
+        self.entries.values()
+    }
+
     pub fn verified(&self, peer_id: &str) -> bool {
         self.entries.get(peer_id).map(|e| e.verified).unwrap_or(false)
     }

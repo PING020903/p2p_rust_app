@@ -199,6 +199,13 @@ impl IdentityService {
         self.contacts.get(&peer.to_string())
     }
 
+    /// 联系人只读快照（按名字排序；前端侧栏等展示用，条目为克隆）
+    pub fn contact_entries(&self) -> Vec<ContactEntry> {
+        let mut all: Vec<ContactEntry> = self.contacts.all().cloned().collect();
+        all.sort_by(|a, b| a.name.cmp(&b.name).then(a.peer_id.cmp(&b.peer_id)));
+        all
+    }
+
     /// 联系人的显示名（非空时返回；未知节点返回 None）
     pub fn contact_name(&self, peer: &PeerId) -> Option<String> {
         self.contact(peer)
