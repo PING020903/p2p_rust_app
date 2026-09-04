@@ -25,6 +25,7 @@ mod chat;
 mod cmd_tree;
 mod color_print;
 mod file_transfer;
+mod lineio;
 mod p2p;
 mod p2p_app;
 mod sink;

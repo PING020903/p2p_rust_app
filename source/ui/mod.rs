@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use crate::chat;
 use crate::p2p::identity::LoginOutcome;
-use crate::p2p::identity_service::{InputMsg, LineSource};
+use crate::lineio::{Control, InputMsg, LineSource};
 use crate::p2p_app::chat::gui::login;
 use crate::sink;
 use input_guard::InputGuard;
@@ -333,20 +333,24 @@ impl eframe::App for GuiApp {
             return;
         }
 
-        // 左栏：联系人（信任徽标/在线/焦点）+ 群列表；点击发 /chat|/group 命令（复用 CLI 语义）
-        let mut sidebar_cmd: Option<String> = None;
+        // 左栏：联系人（信任徽标/在线/焦点）+ 群列表；点击发结构化 Control 动作（不经命令文本）
+        let mut sidebar_action: Option<InputMsg> = None;
         if let Some(sb) = &self.sidebar {
             egui::Panel::left("sidebar")
                 .default_size(210.0)
                 .resizable(true)
                 .show(ui, |ui| {
-                    sidebar_cmd = render_sidebar(ui, sb);
+                    sidebar_action = render_sidebar(ui, sb);
                 });
         }
-        if let Some(cmd) = sidebar_cmd {
-            self.interact.log(Level::Info, "user", format!("/cmd: {cmd}"));
+        if let Some(msg) = sidebar_action {
+            let note = match &msg {
+                InputMsg::Control(c) => c.describe(),
+                _ => "侧栏动作".to_string(),
+            };
+            self.interact.log(Level::Info, "user", format!("点击: {note}"));
             self.input_sent_at = Some(Instant::now());
-            self.send_input(InputMsg::Line(cmd));
+            self.send_input(msg);
         }
 
         // 底部输入面板先声明 → 先占位，CentralPanel 只拿剩余高度（ScrollArea 不会挤掉输入行）
@@ -490,12 +494,13 @@ impl eframe::App for GuiApp {
     }
 }
 
-/// 侧栏视图：联系人（在线点 + 名字 + 信任徽标）与群列表；返回点击产生的命令
+/// 侧栏视图：联系人（在线点 + 名字 + 信任徽标 + 信任按钮）与群列表；
+/// 返回点击产生的结构化动作（FocusPeer/Trust/FocusGroup——不经命令文本解析）
 fn render_sidebar(
     ui: &mut egui::Ui,
     sb: &crate::uievent::SidebarState,
-) -> Option<String> {
-    let mut cmd = None;
+) -> Option<InputMsg> {
+    let mut action: Option<InputMsg> = None;
 
     ui.heading("联系人");
     if sb.contacts.is_empty() {
@@ -509,7 +514,7 @@ fn render_sidebar(
                 ("○", egui::Color32::from_rgb(110, 118, 130))
             };
             ui.label(egui::RichText::new(dot).color(dot_color));
-            // 焦点会话加粗高亮；悬浮显示节点ID（重名时人工核对）
+            // 点击切会话；焦点会话加粗高亮；悬浮显示节点ID（重名时人工核对）
             let name_text = if c.focused {
                 egui::RichText::new(&c.name).strong()
             } else {
@@ -517,9 +522,31 @@ fn render_sidebar(
             };
             let resp = ui.add(egui::Label::new(name_text).selectable(false));
             if resp.clicked() {
-                cmd = Some(format!("/chat {}", c.name));
+                if let Ok(peer) = c.peer_id.parse::<libp2p::PeerId>() {
+                    action = Some(InputMsg::Control(Control::FocusPeer {
+                        peer,
+                        name: c.name.clone(),
+                    }));
+                }
             }
             resp.on_hover_text(&c.peer_id);
+            // 信任按钮：已方已信任 → 取消信任；否则 → 信任
+            let (label, btn_color) = if c.i_trust {
+                ("取消信任", egui::Color32::from_rgb(230, 180, 0))
+            } else {
+                ("信任", egui::Color32::from_rgb(90, 200, 120))
+            };
+            if ui
+                .small_button(egui::RichText::new(label).small().color(btn_color))
+                .clicked()
+            {
+                if let Ok(peer) = c.peer_id.parse::<libp2p::PeerId>() {
+                    action = Some(InputMsg::Control(Control::Trust {
+                        peer,
+                        trusted: !c.i_trust,
+                    }));
+                }
+            }
             let (badge, color) = if c.effective_trusted {
                 ("[互信]", egui::Color32::from_rgb(90, 200, 120))
             } else if c.i_trust {
@@ -547,12 +574,12 @@ fn render_sidebar(
                 .add(egui::Label::new(label).selectable(false))
                 .clicked()
             {
-                cmd = Some(format!("/group {}", g.name));
+                action = Some(InputMsg::Control(Control::FocusGroup(g.name.clone())));
             }
             ui.weak(format!("{}人", g.member_count));
         });
     }
-    cmd
+    action
 }
 
 /// 聊天气泡：对侧左对齐、我侧右对齐；头部小字（名字/群前缀 + 时刻），正文自动换行。

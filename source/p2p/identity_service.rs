@@ -12,68 +12,7 @@ use super::contacts::{fingerprint_of, ContactBook, ContactEntry};
 use super::identity::{
     decrypt_mnemonic, load_keystores, probe_duplicate_id, probe_window, IdentityInfo, LoginOutcome,
 };
-
-/// 输入行迭代器（input 被管道接管时逐行读取）
-pub type StdinLines = tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>;
-
-/// 统一输入消息：
-/// - `Line`：CLI 语义行——按 `/` 前缀分流（命令树 vs 文本消息），终端/管道逐行产出
-/// - `ChatText`：GUI 文本框的纯聊天文本——**绕过命令解析**直接发送到当前焦点（多行原样）
-pub enum InputMsg {
-    Line(String),
-    ChatText(String),
-}
-
-/// 输入源抽象：CLI/e2e 读终端或管道（Stdin，逐行产出 Line）；GUI 读 UI 输入通道（Channel）。
-pub enum LineSource {
-    Stdin(StdinLines),
-    Channel(tokio::sync::mpsc::UnboundedReceiver<InputMsg>),
-}
-
-impl LineSource {
-    /// 聊天循环输入：Stdin 每行包装为 Line；Channel 原样透传 GUI 消息
-    pub async fn next_input(&mut self) -> Option<InputMsg> {
-        match self {
-            LineSource::Stdin(lines) => {
-                lines.next_line().await.ok().flatten().map(InputMsg::Line)
-            }
-            LineSource::Channel(rx) => rx.recv().await,
-        }
-    }
-
-    /// 交互提示场景的原始行读取（登录/确认；ChatText 亦取其文本）。
-    /// 登录等阶段 GUI 文本框禁用、命令框以 Line 发送，故此处只会收到 Line。
-    pub async fn next_raw_line(&mut self) -> Option<String> {
-        match self.next_input().await {
-            Some(InputMsg::Line(s)) => Some(s),
-            Some(InputMsg::ChatText(t)) => Some(t),
-            None => None,
-        }
-    }
-
-    /// 带提示符读取一行（登录/确认等交互场景；I/O 属输入抽象自身）
-    pub async fn prompt(&mut self, prompt: &str) -> Result<String, Box<dyn Error>> {
-        use std::io::Write;
-        print!("{prompt}");
-        std::io::stdout().flush()?;
-        self.next_raw_line()
-            .await
-            .ok_or_else(|| -> Box<dyn Error> { "输入结束".into() })
-    }
-
-    /// 带提示符读取密码：交互终端不回显（rpassword）；管道环境（测试/脚本）退回行读取
-    pub async fn prompt_secret(
-        &mut self,
-        interactive: bool,
-        prompt: &str,
-    ) -> Result<String, Box<dyn Error>> {
-        if interactive {
-            Ok(rpassword::prompt_password(prompt)?)
-        } else {
-            self.prompt(prompt).await
-        }
-    }
-}
+use crate::lineio::LineSource;
 
 /// L2 内化信号枚举：hello/bye/trust 同一组，仅 L2 认识，L3 业务不触碰。
 /// `Frame.text` 线缆仍是字符串，应用侧用 `from_str`/`as_str` 与本枚举互转，

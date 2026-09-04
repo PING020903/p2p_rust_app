@@ -9,6 +9,19 @@
 
 ### 新增
 
+- **P2.3 子步 a+b：GUI 原生操作化（切会话/信任脱离命令文本）**：
+  - **输入协议结构化**：新建 `source/lineio.rs`（输入 I/O 基础设施，与 sink/uievent 对称）——
+    `LineSource`/`InputMsg`/`prompt*` 自 p2p/identity_service.rs 迁出（p2p 只是使用方）；
+    `InputMsg` 增 `Control(Control)` 变体（p2p 零引用，仅 chat.rs 应用编排层消费；
+    CLI/e2e 永不产出）
+  - **Control 枚举**：FocusPeer{peer, name}（复刻 /chat：已连接仅聚焦/未连接建会话+拨号或待 mDNS）、
+    FocusGroup（复刻 /group 聚焦+拨群成员）、Trust{peer, trusted}（复刻 /trust：trust()+
+    清 send_confirmed+在线发 TrustConfirm/Revoke 信号）；`describe()` 供交互日志
+  - **GUI 侧栏**：点击联系人/群 → 结构化动作（**peer_id 直传**，名字歧义/注入根除）；
+    行尾信任按钮（信任/取消信任，指纹信息行照打时间线——核对弹窗留弹窗批）；
+    interact.log 记动作语义（"点击: 切换会话: 名"），不再记 /cmd
+  - **消重**：ChatCtx 构造（4 处）与 ops 消费（2 处）提取 make_chat_ctx/consume_ops 共用
+  - next_raw_line 防御：提示符阶段收到 Control 不作答继续等待
 - **P2.2 子步 e：引擎主动唤醒（纯事件驱动，零轮询）**：
   - sink 基础设施加通知回调：`install(tx, notify)`——GUI 传 `ctx.request_repaint` 闭包
     （egui 类型封在闭包内不穿透签名），四出口（line/err/raw/event）send 成功后即唤醒 UI

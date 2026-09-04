@@ -10,10 +10,9 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::cmd_tree::{CmdError, CmdTree, ROOT};
 use crate::p2p::{cache_dir, load_discovery_mode, save_discovery_mode, save_download_dir, DiscoveryMode};
+use crate::lineio::{Control, InputMsg, LineSource};
 use crate::p2p::identity::LoginOutcome;
-use crate::p2p::identity_service::{
-    is_l2_signal, IdentityService, InputMsg, LineSource, TextTag,
-};
+use crate::p2p::identity_service::{is_l2_signal, IdentityService, TextTag};
 use crate::p2p_app::chat::display;
 use crate::p2p::seam::{self, is_global_ipv6_listen, Event, SignalRegistry, BYE_HANDSHAKE_TIMEOUT};
 
@@ -93,7 +92,6 @@ struct ChatCtx<'a> {
     quit: bool,
     file: &'a mut crate::file_transfer::FileTransferState,
 }
-
 impl<'a> ChatCtx<'a> {
     /// 按名字/节点ID 解析目标 peer：会话名 → 联系人名（L2）→ 直接解析节点ID
     fn resolve(&self, target: &str) -> Option<PeerId> {
@@ -111,6 +109,180 @@ impl<'a> ChatCtx<'a> {
             .iter()
             .find(|(_, g)| g.name == name)
             .map(|(id, _)| id.clone())
+    }
+}
+
+/// 构造一次性会话上下文（借用随本次处理结束释放；命令/文本/Control 各输入分支共用）
+#[allow(clippy::too_many_arguments)]
+fn make_chat_ctx<'a>(
+    identity: &'a mut IdentityService,
+    cmd_tx: &'a tokio::sync::mpsc::Sender<seam::Cmd>,
+    input: &'a mut LineSource,
+    interactive: bool,
+    conversations: &'a mut HashMap<PeerId, Conversation>,
+    groups: &'a mut HashMap<String, Group>,
+    focused: &'a mut Option<PeerId>,
+    focused_group: &'a mut Option<String>,
+    connected: &'a HashSet<PeerId>,
+    registered: &'a mut HashMap<PeerId, Vec<Multiaddr>>,
+    file: &'a mut crate::file_transfer::FileTransferState,
+) -> ChatCtx<'a> {
+    ChatCtx {
+        identity,
+        cmd_tx,
+        input,
+        interactive,
+        conversations,
+        groups,
+        focused,
+        focused_group,
+        connected,
+        registered,
+        ops: VecDeque::new(),
+        quit: false,
+        file,
+    }
+}
+
+/// 消费 ctx 排队的异步动作（同步生产者 → 异步消费者；命令与 Control 分支共用）
+async fn consume_ops(ctx: &mut ChatCtx<'_>) {
+    while let Some(op) = ctx.ops.pop_front() {
+        match op {
+            AsyncOp::Cmd(c) => {
+                if let Err(e) = ctx.cmd_tx.send(c).await {
+                    eprintln!("{}", format!("命令发送失败: {e}").red());
+                }
+            }
+            AsyncOp::Backup => {
+                if let Err(e) = ctx.identity.backup(ctx.input, ctx.interactive).await {
+                    eprintln!("{}", format!("备份失败: {e}").red());
+                }
+            }
+            AsyncOp::Listen => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if ctx.cmd_tx.send(seam::Cmd::GetListenAddr(tx)).await.is_ok() {
+                    if let Ok(addrs) = rx.await {
+                        print_listen_addrs(&addrs, ctx.identity.my_id());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 结构化控制动作（GUI 点击/按钮）处理：复刻对应命令的非文本逻辑。
+/// 名字一律 `peer_name()`（会话名 → 联系人名 → 节点ID）；提示行照打（CLI 同款文案）；
+/// 指纹信息照打（核对弹窗属弹窗批，本轮按钮与 /trust 同粒度直接执行）。
+async fn handle_control(ctx: &mut ChatCtx<'_>, c: Control) {
+    match c {
+        Control::FocusPeer { peer, name } => {
+            *ctx.focused_group = None;
+            if ctx.connected.contains(&peer) {
+                // 已连接：仅切换焦点
+                *ctx.focused = Some(peer);
+                let conv_name = ctx
+                    .conversations
+                    .get(&peer)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                let who = if conv_name.is_empty() { name } else { conv_name };
+                let badge = trust_badge(
+                    ctx.identity.effective_trusted(&peer),
+                    ctx.identity.is_verified(&peer),
+                );
+                println!(
+                    "{}",
+                    format!("已切换到会话: {who}（{peer}）{badge}").green()
+                );
+            } else {
+                // 未连接：建/复用会话并拨号（或待 mDNS 发现）
+                ctx.conversations.entry(peer).or_insert_with(Conversation::new);
+                *ctx.focused = Some(peer);
+                let conv = ctx.conversations.get_mut(&peer).unwrap();
+                if conv.name.is_empty() {
+                    conv.name = name.clone();
+                }
+                match ctx.registered.get(&peer) {
+                    Some(addrs) if !addrs.is_empty() => {
+                        println!("{}", format!("正在连接 {name}...").cyan());
+                        ctx.conversations.get_mut(&peer).unwrap().pending_dial = false;
+                        push_cmd(&mut ctx.ops, seam::Cmd::DialPeer(peer));
+                    }
+                    _ => {
+                        ctx.conversations.get_mut(&peer).unwrap().pending_dial = true;
+                        println!(
+                            "{}",
+                            format!("{name} 暂无已知地址，等待 mDNS 发现，发现后自动连接").cyan()
+                        );
+                    }
+                }
+            }
+        }
+        Control::FocusGroup(gname) => {
+            match ctx.group_id(&gname) {
+                Some(gid) => {
+                    *ctx.focused_group = Some(gid.clone());
+                    *ctx.focused = None;
+                    let g = ctx.groups[&gid].clone();
+                    // 聚焦即连：拨号群成员（常驻群维持 mesh，普通群按需连接）
+                    dial_group_members(
+                        &mut ctx.ops,
+                        &g,
+                        ctx.identity.my_id(),
+                        ctx.connected,
+                        ctx.registered,
+                    );
+                    println!(
+                        "{}",
+                        format!("已切换到群聊: {}（输入直接发群里）", g.name).green()
+                    );
+                }
+                None => eprintln!("{}", format!("未知群: {gname}").yellow()),
+            }
+        }
+        Control::Trust { peer, trusted } => {
+            let name = peer_name(&peer, ctx.conversations, ctx.identity);
+            if trusted {
+                // D4：信任前展示节点ID + 指纹，供人工复核（信息行进时间线/终端）
+                println!("{}", "请核对对方身份:".yellow());
+                println!("  节点ID: {peer}");
+                println!("  指纹: {}", ctx.identity.fingerprint(&peer).dimmed());
+                ctx.identity.trust(&peer, &name, true);
+                // 对称信任：通知对方"我已信任你"；离线则静默跳过（重连时 hello 自愈补发）
+                if ctx.connected.contains(&peer) {
+                    let my_name = ctx.identity.my_name().to_string();
+                    let bin = serde_cbor::to_vec(&my_name).unwrap_or_default();
+                    push_cmd(
+                        &mut ctx.ops,
+                        seam::Cmd::Send {
+                            peer,
+                            tag: TextTag::TrustConfirm.as_str().to_string(),
+                            payload: Some(bin),
+                        },
+                    );
+                }
+                println!("{}", format!("已信任: {name}").green());
+            } else {
+                ctx.identity.trust(&peer, &name, false);
+                // 对称信任：取消后 D3 需重新生效，清掉本会话的已确认标记
+                if let Some(conv) = ctx.conversations.get_mut(&peer) {
+                    conv.send_confirmed = false;
+                }
+                if ctx.connected.contains(&peer) {
+                    let my_name = ctx.identity.my_name().to_string();
+                    let bin = serde_cbor::to_vec(&my_name).unwrap_or_default();
+                    push_cmd(
+                        &mut ctx.ops,
+                        seam::Cmd::Send {
+                            peer,
+                            tag: TextTag::TrustRevoke.as_str().to_string(),
+                            payload: Some(bin),
+                        },
+                    );
+                }
+                println!("{}", format!("已取消信任: {name}").yellow());
+            }
+        }
     }
 }
 
@@ -1856,25 +2028,27 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
             msg = input.next_input() => {
                 // None = 输入结束（EOF/通道关闭）：多行收集中则报未闭合丢弃
                 let line = match msg {
+                    // 结构化控制动作（GUI 点击/按钮）：不经命令文本解析，复刻对应命令逻辑
+                    Some(InputMsg::Control(c)) => {
+                        let mut ctx = make_chat_ctx(
+                            &mut identity, &cmd_tx, &mut input, interactive,
+                            &mut conversations, &mut groups, &mut focused, &mut focused_group,
+                            &connected, &mut registered, &mut file_state,
+                        );
+                        handle_control(&mut ctx, c).await;
+                        consume_ops(&mut ctx).await;
+                        push_sidebar(ctx.identity, ctx.groups, ctx.connected, ctx.focused, &ctx.focused_group);
+                        continue;
+                    }
                     Some(InputMsg::ChatText(text)) => {
                         // GUI 文本框：纯聊天文本直发当前焦点（多行原样；以 / 开头也不解析为命令）
                         let text = text.trim();
                         if !text.is_empty() {
-                            let mut ctx = ChatCtx {
-                                identity: &mut identity,
-                                cmd_tx: &cmd_tx,
-                                input: &mut input,
-                                interactive,
-                                conversations: &mut conversations,
-                                groups: &mut groups,
-                                focused: &mut focused,
-                                focused_group: &mut focused_group,
-                                connected: &connected,
-                                registered: &mut registered,
-                                ops: VecDeque::new(),
-                                quit: false,
-                                file: &mut file_state,
-                            };
+                            let mut ctx = make_chat_ctx(
+                                &mut identity, &cmd_tx, &mut input, interactive,
+                                &mut conversations, &mut groups, &mut focused, &mut focused_group,
+                                &connected, &mut registered, &mut file_state,
+                            );
                             send_focused_text(&mut ctx, &text).await;
                         }
                         continue;
@@ -1893,21 +2067,11 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                 // 多行收集态优先：不 trim、空行原样保留，正文以 / 开头也不解析为命令
                 if let Some((mut buf, mut remaining)) = sendstrings.take() {
                     if let Some(content) = collect_multiline(&mut buf, &mut remaining, &line) {
-                        let mut ctx = ChatCtx {
-                            identity: &mut identity,
-                            cmd_tx: &cmd_tx,
-                            input: &mut input,
-                            interactive,
-                            conversations: &mut conversations,
-                            groups: &mut groups,
-                            focused: &mut focused,
-                            focused_group: &mut focused_group,
-                            connected: &connected,
-                            registered: &mut registered,
-                            ops: VecDeque::new(),
-                            quit: false,
-                            file: &mut file_state,
-                        };
+                        let mut ctx = make_chat_ctx(
+                            &mut identity, &cmd_tx, &mut input, interactive,
+                            &mut conversations, &mut groups, &mut focused, &mut focused_group,
+                            &connected, &mut registered, &mut file_state,
+                        );
                         send_focused_text(&mut ctx, &content).await;
                     } else {
                         sendstrings = Some((buf, remaining));
@@ -1955,50 +2119,17 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                     // 命令上下文：一次性借用全部状态，handler 同步改状态 + 排异步动作队列。
                     // 指令树每行重建（无状态 builder，开销可忽略）：其 `ChatCtx<'a>` 生命周期
                     // 随本次处理结束释放，借用不跨 select 迭代存活。
-                    let mut ctx = ChatCtx {
-                        identity: &mut identity,
-                        cmd_tx: &cmd_tx,
-                        input: &mut input,
-                        interactive,
-                        conversations: &mut conversations,
-                        groups: &mut groups,
-                        focused: &mut focused,
-                        focused_group: &mut focused_group,
-                        connected: &connected,
-                        registered: &mut registered,
-                        ops: VecDeque::new(),
-                        quit: false,
-                        file: &mut file_state,
-                    };
+                    let mut ctx = make_chat_ctx(
+                        &mut identity, &cmd_tx, &mut input, interactive,
+                        &mut conversations, &mut groups, &mut focused, &mut focused_group,
+                        &connected, &mut registered, &mut file_state,
+                    );
                     let mut tree = build_tree();
                     if let Err(CmdError::NotFound) = tree.parse(cmd, &mut ctx) {
                         eprintln!("{}", format!("未知命令: {cmd}").yellow());
                     }
                     // 异步消费 handler 排队的动作（同步生产者 → 异步消费者）
-                    while let Some(op) = ctx.ops.pop_front() {
-                        match op {
-                            AsyncOp::Cmd(c) => {
-                                if let Err(e) = ctx.cmd_tx.send(c).await {
-                                    eprintln!("{}", format!("命令发送失败: {e}").red());
-                                }
-                            }
-                            AsyncOp::Backup => {
-                                if let Err(e) =
-                                    ctx.identity.backup(ctx.input, ctx.interactive).await
-                                {
-                                    eprintln!("{}", format!("备份失败: {e}").red());
-                                }
-                            }
-                            AsyncOp::Listen => {
-                                let (tx, rx) = tokio::sync::oneshot::channel();
-                                if ctx.cmd_tx.send(seam::Cmd::GetListenAddr(tx)).await.is_ok() {
-                                    if let Ok(addrs) = rx.await {
-                                        print_listen_addrs(&addrs, ctx.identity.my_id());
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    consume_ops(&mut ctx).await;
                     if ctx.quit {
                         // 等 Bye 帧送达（传输任务独立处理），再关闭传输任务
                         tokio::time::sleep(BYE_HANDSHAKE_TIMEOUT).await;
@@ -2015,21 +2146,11 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                     continue;
                 }
                 // 非命令：作为消息发送给当前聊天对象（与 /sendStrings 共用同一发送逻辑）
-                let mut ctx = ChatCtx {
-                    identity: &mut identity,
-                    cmd_tx: &cmd_tx,
-                    input: &mut input,
-                    interactive,
-                    conversations: &mut conversations,
-                    groups: &mut groups,
-                    focused: &mut focused,
-                    focused_group: &mut focused_group,
-                    connected: &connected,
-                    registered: &mut registered,
-                    ops: VecDeque::new(),
-                    quit: false,
-                    file: &mut file_state,
-                };
+                let mut ctx = make_chat_ctx(
+                    &mut identity, &cmd_tx, &mut input, interactive,
+                    &mut conversations, &mut groups, &mut focused, &mut focused_group,
+                    &connected, &mut registered, &mut file_state,
+                );
                 send_focused_text(&mut ctx, line).await;
             }
             event = ev_rx.recv() => {

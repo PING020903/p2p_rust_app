@@ -10,8 +10,9 @@ use colored::Colorize;
 use crate::p2p::identity::{
     generate_mnemonic, keypair_from_mnemonic, load_keystores, IdentityInfo, LoginOutcome,
 };
+use crate::lineio::LineSource;
 use crate::p2p::identity_service::{
-    normalize_gender, print_mnemonic_guide, IdentityService, LineSource, LoginError,
+    normalize_gender, print_mnemonic_guide, IdentityService, LoginError,
 };
 use crate::p2p_app::chat::login_common::{
     confirm_first_words, persist_identity, unlock_cached, validate_birthday, validate_name,
