@@ -393,7 +393,11 @@ impl P2pNode {
                     "{}",
                     format!("监听地址: {address}/p2p/{}", self.swarm.local_peer_id()).green()
                 );
-                let _ = events.send(P2pEvent::Listening(address.clone()));
+                // 事件携带完整可分享地址（拼 /p2p/{节点ID}，与打印行一致；
+                // 内部 listen_addrs 表保持裸地址——GetListenAddr 语义不变）
+                let mut shareable = address.clone();
+                shareable.push(libp2p::multiaddr::Protocol::P2p(*self.swarm.local_peer_id()));
+                let _ = events.send(P2pEvent::Listening(shareable));
                 if !self.listen_addrs.contains(&address) {
                     self.listen_addrs.push(address.clone());
                 }

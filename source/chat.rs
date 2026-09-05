@@ -163,8 +163,12 @@ async fn consume_ops(ctx: &mut ChatCtx<'_>) {
                 if ctx.cmd_tx.send(seam::Cmd::GetListenAddr(tx)).await.is_ok() {
                     if let Ok(addrs) = rx.await {
                         print_listen_addrs(&addrs, ctx.identity.my_id());
+                        // GUI"我的地址"：与打印行同源同形（拼 /p2p/{节点ID}）
                         for a in &addrs {
-                            crate::p2p_app::chat::display::listen_addr(a.to_string());
+                            crate::p2p_app::chat::display::listen_addr(format!(
+                                "{a}/p2p/{}",
+                                ctx.identity.my_id()
+                            ));
                         }
                     }
                 }
