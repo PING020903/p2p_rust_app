@@ -514,13 +514,20 @@ fn render_sidebar(
                 ("○", egui::Color32::from_rgb(110, 118, 130))
             };
             ui.label(egui::RichText::new(dot).color(dot_color));
-            // 点击切会话；焦点会话加粗高亮；悬浮显示节点ID（重名时人工核对）
+            // 点击切会话；焦点会话加粗高亮；悬浮显示节点ID（重名时人工核对）。
+            // sense(click) 必须显式声明——egui Label 默认 Sense::hover，点击不触发
             let name_text = if c.focused {
                 egui::RichText::new(&c.name).strong()
             } else {
                 egui::RichText::new(&c.name)
             };
-            let resp = ui.add(egui::Label::new(name_text).selectable(false));
+            let resp = ui
+                .add(
+                    egui::Label::new(name_text)
+                        .selectable(false)
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
             if resp.clicked() {
                 if let Ok(peer) = c.peer_id.parse::<libp2p::PeerId>() {
                     action = Some(InputMsg::Control(Control::FocusPeer {
@@ -571,7 +578,12 @@ fn render_sidebar(
                 egui::RichText::new(&g.name)
             };
             if ui
-                .add(egui::Label::new(label).selectable(false))
+                .add(
+                    egui::Label::new(label)
+                        .selectable(false)
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked()
             {
                 action = Some(InputMsg::Control(Control::FocusGroup(g.name.clone())));

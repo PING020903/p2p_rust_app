@@ -31,3 +31,12 @@ tokio = { version = "1.53.1", features = ["full"] }
 eframe = "0.36.1"
 egui = "0.36.1"
 chrono = "0.4.45"
+
+# target 瘦身：本体保留行号表（回溯带行号、可断点），依赖零调试信息
+# （代价：无法单步进依赖库源码；收益：target 从 20GB+ 降至 GB 级、依赖重编更快）
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = false
+

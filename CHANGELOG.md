@@ -9,6 +9,19 @@
 
 ### 新增
 
+- **P2.3 子步 f1：侧栏点击修复 + Python GUI 冒烟 + target 瘦身**：
+  - **修复**：联系人名/群名 `Label` 加 `Sense::click()`——egui Label 默认 `Sense::hover`
+    不可点击（点击事件从未触发的根因）；悬停改手型光标
+  - **tests/gui_smoke.py**（pywinauto UIA/accesskit 驱动 + 交互日志断言，自足式）：
+    临时缓存目录 → CLI 管道建测试身份（固定 BIP39 向量，feed 先发 "4" 进聊天——
+    CLI=菜单运行器）→ CHILD_ENV 分离启动 GUI → **UIA Invoke 语义点击**（鼠标坐标点击
+    对 egui 不可靠，实测 invoke 才稳）→ 密码**剪贴板粘贴**（UIA ValuePattern 对 egui
+    无效 + pyautogui 逐字符键入会被中文 IME 拦截——剪贴板绕开）→ 断言 interact.log
+    （登录成功//list 回显；--contact 可选联系人/信任点击断言）；收尾 taskkill 防残留
+  - **target 瘦身**：`[profile.dev] debug = 1`（本体保留行号表）+
+    `[profile.dev.package."*"] debug = false`（依赖零调试信息）——
+    20GB+ → 1.89GB，exe 503MB → 165MB，依赖重编更快；代价：无法单步进依赖库源码
+  - e2e 曾连挂 3 场景：冒烟残留 GUI 进程干扰（mDNS/端口）——已加脚本收尾，重跑即绿
 - **P2.3 子步 a+b：GUI 原生操作化（切会话/信任脱离命令文本）**：
   - **输入协议结构化**：新建 `source/lineio.rs`（输入 I/O 基础设施，与 sink/uievent 对称）——
     `LineSource`/`InputMsg`/`prompt*` 自 p2p/identity_service.rs 迁出（p2p 只是使用方）；
