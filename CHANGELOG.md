@@ -9,6 +9,18 @@
 
 ### 新增
 
+- **P2.3 子步 c：GUI 添加联系人 + 侧栏可见性补全**：
+  - **添加联系人表单**（侧栏内联折叠）：地址框（粘对方"监听地址"整行）+ 可选备注名 +
+    连接按钮 → `Control::Dial{addr, name}` 复刻 /dial（parse_dial_addr 校验→registered
+    登记→Cmd::Dial；name 预登记会话名，侧栏显示名生效；CLI 不传名零影响）
+  - **"已发现节点"独立分段**：registered ∖ 联系人簿的未握手节点（节点ID 短码 + 在线点，
+    提取 discovered_views 纯函数+单测）——mDNS 发现即见可点（不等 hello），点击拨号聚焦，
+    握手后升级正式联系人
+  - **"我的地址"**（侧栏底部，点击复制）：新 `P2pEvent::Listening` → seam
+    `Event::Listening` → `UiEvent::ListenAddr`（单条去重累积；CLI 打印走 L1 照旧）；
+    全局 IPv6 直连地址排前——把地址发给对方即可互加
+  - **堵住可见性缺口**：此前跨网段（无 mDNS）既无发现也无联系人簿记录，侧栏永远空白；
+    现在表单添加 / mDNS 发现 / hello 握手三层可见性齐备
 - **P2.3 子步 f1：侧栏点击修复 + Python GUI 冒烟 + target 瘦身**：
   - **修复**：联系人名/群名 `Label` 加 `Sense::click()`——egui Label 默认 `Sense::hover`
     不可点击（点击事件从未触发的根因）；悬停改手型光标

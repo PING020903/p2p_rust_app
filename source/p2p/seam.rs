@@ -133,6 +133,8 @@ pub enum Event {
     Connected(PeerId),
     Disconnected { peer: PeerId, bye: bool },
     Discovered { peer: PeerId, addr: Multiaddr },
+    /// 本机新增监听地址（GUI"我的地址"等展示用；CLI 打印走 L1 原有输出）
+    Listening(Multiaddr),
     /// 收到一个信号帧：tag=协议语义标签 + payload=该标签的 binary 负载
     Signal {
         from: PeerId,
@@ -231,6 +233,7 @@ fn to_l2(ev: P2pEvent) -> Option<Event> {
         P2pEvent::PeerConnected(p) => Some(Event::Connected(p)),
         P2pEvent::PeerDisconnected { peer, bye } => Some(Event::Disconnected { peer, bye }),
         P2pEvent::PeerDiscovered { peer, addr } => Some(Event::Discovered { peer, addr }),
+        P2pEvent::Listening(addr) => Some(Event::Listening(addr)),
         P2pEvent::Message { from, frame } => {
             // control 心跳是 L1 内部交通，L3 无感；只转发带 text 标签的信号帧
             if frame.control.is_some() {

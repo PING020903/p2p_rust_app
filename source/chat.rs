@@ -163,6 +163,9 @@ async fn consume_ops(ctx: &mut ChatCtx<'_>) {
                 if ctx.cmd_tx.send(seam::Cmd::GetListenAddr(tx)).await.is_ok() {
                     if let Ok(addrs) = rx.await {
                         print_listen_addrs(&addrs, ctx.identity.my_id());
+                        for a in &addrs {
+                            crate::p2p_app::chat::display::listen_addr(a.to_string());
+                        }
                     }
                 }
             }
@@ -238,6 +241,33 @@ async fn handle_control(ctx: &mut ChatCtx<'_>, c: Control) {
                     );
                 }
                 None => eprintln!("{}", format!("未知群: {gname}").yellow()),
+            }
+        }
+        Control::Dial { addr, name } => {
+            // 复刻 /dial：解析地址 → registered 登记 → 拨号；name 预登记会话名
+            match parse_dial_addr(&addr) {
+                Ok(ma) => {
+                    if let Some(p) = ma.iter().find_map(|seg| match seg {
+                        libp2p::multiaddr::Protocol::P2p(pid) => Some(pid),
+                        _ => None,
+                    }) {
+                        let recorded = ctx.registered.entry(p).or_default();
+                        if !recorded.contains(&ma) {
+                            recorded.push(ma.clone());
+                        }
+                        if !name.is_empty() {
+                            let conv = ctx.conversations.entry(p).or_insert_with(Conversation::new);
+                            if conv.name.is_empty() {
+                                conv.name = name.clone();
+                            }
+                        }
+                    }
+                    push_cmd(&mut ctx.ops, seam::Cmd::Dial { addr: ma });
+                }
+                Err(reason) => {
+                    eprintln!("{}", format!("地址无效: {reason}").red());
+                    print_dial_template();
+                }
             }
         }
         Control::Trust { peer, trusted } => {
@@ -320,7 +350,26 @@ async fn run_terminal_escape(program: &str, args: &[&str], rest: &str) {
     }
 }
 
-/// 侧栏快照推送：联系人（信任徽标/在线/焦点）+ 群列表。
+/// 侧栏"已发现节点"视图：registered 地址表中不在联系人簿的节点（未握手）。
+/// 纯函数供单测——mDNS 发现即见（不等 hello），跨网段 /dial 后亦见。
+fn discovered_views(
+    registered: &HashMap<PeerId, Vec<Multiaddr>>,
+    known_contact_ids: &HashSet<String>,
+    connected: &HashSet<PeerId>,
+) -> Vec<crate::uievent::DiscoveredView> {
+    let mut out: Vec<crate::uievent::DiscoveredView> = registered
+        .keys()
+        .filter(|p| !known_contact_ids.contains(&p.to_string()))
+        .map(|p| crate::uievent::DiscoveredView {
+            peer_id: p.to_string(),
+            online: connected.contains(p),
+        })
+        .collect();
+    out.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+    out
+}
+
+/// 侧栏快照推送：联系人（信任徽标/在线/焦点）+ 已发现节点（未握手）+ 群列表。
 /// 推送点：命令处理后（/trust /chat /group 等）与每个传输事件处理后。
 /// CLI 无事件通道时 no-op（display::sidebar 内部判定）。
 fn push_sidebar(
@@ -329,10 +378,12 @@ fn push_sidebar(
     connected: &HashSet<PeerId>,
     focused: &Option<PeerId>,
     focused_group: &Option<String>,
+    registered: &HashMap<PeerId, Vec<Multiaddr>>,
 ) {
     use crate::uievent::{ContactView, GroupView};
-    let contacts = identity
-        .contact_entries()
+    let entries = identity.contact_entries();
+    let known: HashSet<String> = entries.iter().map(|e| e.peer_id.clone()).collect();
+    let contacts = entries
         .into_iter()
         .filter_map(|e| {
             let peer: PeerId = e.peer_id.parse().ok()?;
@@ -351,6 +402,7 @@ fn push_sidebar(
             })
         })
         .collect();
+    let discovered = discovered_views(registered, &known, connected);
     let mut gvs: Vec<GroupView> = groups
         .values()
         .map(|g| GroupView {
@@ -360,7 +412,7 @@ fn push_sidebar(
         })
         .collect();
     gvs.sort_by(|a, b| a.name.cmp(&b.name));
-    display::sidebar(contacts, gvs);
+    display::sidebar(contacts, discovered, gvs);
 }
 
 /// 打印本机可分享地址：全局 IPv6 直连地址（标题一次 + 逐条列出），其余监听地址另列（/listen）
@@ -2037,7 +2089,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                         );
                         handle_control(&mut ctx, c).await;
                         consume_ops(&mut ctx).await;
-                        push_sidebar(ctx.identity, ctx.groups, ctx.connected, ctx.focused, &ctx.focused_group);
+                        push_sidebar(ctx.identity, ctx.groups, ctx.connected, ctx.focused, &ctx.focused_group, ctx.registered);
                         continue;
                     }
                     Some(InputMsg::ChatText(text)) => {
@@ -2142,6 +2194,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                         ctx.connected,
                         ctx.focused,
                         &ctx.focused_group,
+                        ctx.registered,
                     );
                     continue;
                 }
@@ -2326,6 +2379,10 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                     }
                                 }
                             }
+                            Event::Listening(addr) => {
+                                // GUI"我的地址"去重累积（CLI 的监听地址行由 L1 打印照旧）
+                                crate::p2p_app::chat::display::listen_addr(addr.to_string());
+                            }
                             Event::SendFailure { peer, error } => {
                                 let bye = conversations
                                     .get(&peer)
@@ -2346,7 +2403,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                         }
                         // 侧栏快照：任何事件后都可能改变联系人/群/连接状态
                         push_sidebar(
-                            &identity, &groups, &connected, &focused, &focused_group,
+                            &identity, &groups, &connected, &focused, &focused_group, &registered,
                         );
                     }
                     None => break,
@@ -2485,6 +2542,29 @@ mod tests {
         let mut remaining = 1;
         let done = collect_multiline(&mut buf, &mut remaining, "仅一行").unwrap();
         assert_eq!(done, "仅一行");
+    }
+
+    #[test]
+    fn discovered_views_excludes_known_contacts() {
+        use crate::uievent::DiscoveredView;
+        use std::collections::HashSet;
+        let pa: PeerId = PEER.parse().unwrap();
+        // 另一合法节点 ID（legal winner 测试向量派生；与 PEER 不同）
+        let pb: PeerId = "12D3KooWPCyWnZCXR3VGdrQjLr5d8TBaAHD956XZvo6xoCXYB5AR"
+            .parse()
+            .unwrap();
+        let mut registered = HashMap::new();
+        registered.insert(pa, vec![]);
+        registered.insert(pb, vec![]);
+        let mut known = HashSet::new();
+        known.insert(pa.to_string());
+        let mut connected = HashSet::new();
+        connected.insert(pb);
+        let views: Vec<DiscoveredView> = discovered_views(&registered, &known, &connected);
+        // 簿内联系人（pa）不出现；未握手节点（pb）出现且带在线态
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].peer_id, pb.to_string());
+        assert!(views[0].online);
     }
 }
 

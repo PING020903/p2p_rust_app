@@ -39,6 +39,15 @@ enum TimelineItem {
     },
 }
 
+/// 添加联系人表单状态（地址 + 可选备注名）
+#[derive(Default)]
+struct AddForm {
+    addr: String,
+    name: String,
+    /// 折叠面板展开态
+    open: bool,
+}
+
 impl TimelineItem {
     fn line(s: impl Into<String>) -> Self {
         TimelineItem::Line(s.into())
@@ -100,6 +109,10 @@ pub struct GuiApp {
     login: login::LoginState,
     /// 左栏侧栏快照（联系人 + 群；引擎侧推送，登录期为 None）
     sidebar: Option<crate::uievent::SidebarState>,
+    /// 本机可分享监听地址（ListenAddr 事件去重累积；侧栏底部"点击复制"）
+    my_addrs: Vec<String>,
+    /// 添加联系人表单（侧栏折叠面板；纯 GUI 侧状态）
+    add_form: AddForm,
     /// 首帧标记：自动聚焦输入框
     first_frame: bool,
     /// 耗时统计
@@ -167,6 +180,8 @@ impl GuiApp {
                 error: None,
             },
             sidebar: None,
+            my_addrs: Vec::new(),
+            add_form: AddForm::default(),
             first_frame: true,
             stats: timing::TimingStats::default(),
             runtime,
@@ -282,6 +297,12 @@ impl eframe::App for GuiApp {
                     crate::uievent::EngineOut::Event(crate::uievent::UiEvent::Sidebar(s)) => {
                         self.sidebar = Some(s);
                     }
+                    // 本机监听地址：去重累积（引擎启动每条一次，/listen 重查重发）
+                    crate::uievent::EngineOut::Event(crate::uievent::UiEvent::ListenAddr(a)) => {
+                        if !self.my_addrs.contains(&a) {
+                            self.my_addrs.push(a);
+                        }
+                    }
                 }
                 ctx.request_repaint();
             }
@@ -333,15 +354,21 @@ impl eframe::App for GuiApp {
             return;
         }
 
-        // 左栏：联系人（信任徽标/在线/焦点）+ 群列表；点击发结构化 Control 动作（不经命令文本）
+        // 左栏：联系人（信任徽标/在线/焦点）+ 已发现节点 + 添加表单 + 我的地址；
+        // 点击发结构化 Control 动作（不经命令文本）
         let mut sidebar_action: Option<InputMsg> = None;
-        if let Some(sb) = &self.sidebar {
-            egui::Panel::left("sidebar")
-                .default_size(210.0)
-                .resizable(true)
-                .show(ui, |ui| {
-                    sidebar_action = render_sidebar(ui, sb);
-                });
+        {
+            let sidebar = &self.sidebar;
+            let my_addrs = &self.my_addrs;
+            let add_form = &mut self.add_form;
+            if sidebar.is_some() || !my_addrs.is_empty() {
+                egui::Panel::left("sidebar")
+                    .default_size(230.0)
+                    .resizable(true)
+                    .show(ui, |ui| {
+                        sidebar_action = render_sidebar(ui, sidebar.as_ref(), my_addrs, add_form);
+                    });
+            }
         }
         if let Some(msg) = sidebar_action {
             let note = match &msg {
@@ -350,6 +377,10 @@ impl eframe::App for GuiApp {
             };
             self.interact.log(Level::Info, "user", format!("点击: {note}"));
             self.input_sent_at = Some(Instant::now());
+            // 表单提交成功后清空地址框（备注名保留与否均无妨，一并清空）
+            if matches!(&msg, InputMsg::Control(Control::Dial { .. })) {
+                self.add_form = AddForm::default();
+            }
             self.send_input(msg);
         }
 
@@ -494,19 +525,27 @@ impl eframe::App for GuiApp {
     }
 }
 
-/// 侧栏视图：联系人（在线点 + 名字 + 信任徽标 + 信任按钮）与群列表；
-/// 返回点击产生的结构化动作（FocusPeer/Trust/FocusGroup——不经命令文本解析）
+/// 侧栏视图：联系人（信任徽标/在线/焦点/信任按钮）+ 已发现节点（未握手）+
+/// 添加联系人表单 + 我的地址（点击复制）；返回点击产生的结构化动作
 fn render_sidebar(
     ui: &mut egui::Ui,
-    sb: &crate::uievent::SidebarState,
+    sb: Option<&crate::uievent::SidebarState>,
+    my_addrs: &[String],
+    add_form: &mut AddForm,
 ) -> Option<InputMsg> {
     let mut action: Option<InputMsg> = None;
 
     ui.heading("联系人");
-    if sb.contacts.is_empty() {
+    let empty_c: Vec<crate::uievent::ContactView> = Vec::new();
+    let empty_d: Vec<crate::uievent::DiscoveredView> = Vec::new();
+    let empty_g: Vec<crate::uievent::GroupView> = Vec::new();
+    let contacts = sb.map(|s| &s.contacts).unwrap_or(&empty_c);
+    let discovered = sb.map(|s| &s.discovered).unwrap_or(&empty_d);
+    let groups = sb.map(|s| &s.groups).unwrap_or(&empty_g);
+    if contacts.is_empty() {
         ui.weak("（暂无联系人）");
     }
-    for c in &sb.contacts {
+    for c in contacts {
         ui.horizontal(|ui| {
             let (dot, dot_color) = if c.online {
                 ("●", egui::Color32::from_rgb(90, 200, 120))
@@ -565,12 +604,79 @@ fn render_sidebar(
         });
     }
 
+    // 已发现节点（未握手）：mDNS 发现 / 添加联系人后立即可见，点击即拨号聚焦
+    if !discovered.is_empty() {
+        ui.separator();
+        ui.heading("已发现节点");
+        ui.weak("（未握手，点击连接）");
+        for d in discovered {
+            ui.horizontal(|ui| {
+                let (dot, dot_color) = if d.online {
+                    ("●", egui::Color32::from_rgb(90, 200, 120))
+                } else {
+                    ("○", egui::Color32::from_rgb(110, 118, 130))
+                };
+                ui.label(egui::RichText::new(dot).color(dot_color));
+                let short: String = d.peer_id.chars().take(14).collect();
+                let resp = ui
+                    .add(
+                        egui::Label::new(egui::RichText::new(&short).weak())
+                            .selectable(false)
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(&d.peer_id);
+                if resp.clicked() {
+                    if let Ok(peer) = d.peer_id.parse::<libp2p::PeerId>() {
+                        action = Some(InputMsg::Control(Control::FocusPeer {
+                            peer,
+                            name: short,
+                        }));
+                    }
+                }
+            });
+        }
+    }
+
+    // 添加联系人表单（内联折叠；提交 → Control::Dial）
+    ui.separator();
+    egui::CollapsingHeader::new("➕ 添加联系人")
+        .default_open(add_form.open)
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut add_form.addr)
+                    .hint_text("粘贴对方\"监听地址\"整行\n/ip4|6/.../tcp/.../p2p/节点ID")
+                    .desired_rows(2)
+                    .desired_width(ui.available_width() - 12.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            ui.horizontal(|ui| {
+                ui.label("备注");
+                ui.add(
+                    egui::TextEdit::singleline(&mut add_form.name)
+                        .hint_text("可选")
+                        .desired_width(120.0),
+                );
+            });
+            if ui.button("连接").clicked() {
+                let addr = add_form.addr.trim().to_string();
+                if !addr.is_empty() {
+                    action = Some(InputMsg::Control(Control::Dial {
+                        addr,
+                        name: add_form.name.trim().to_string(),
+                    }));
+                }
+            }
+            ui.weak("对方可在侧栏复制地址发给你");
+        });
+
+    // 群
     ui.separator();
     ui.heading("群");
-    if sb.groups.is_empty() {
+    if groups.is_empty() {
         ui.weak("（暂无群）");
     }
-    for g in &sb.groups {
+    for g in groups {
         ui.horizontal(|ui| {
             let label = if g.focused {
                 egui::RichText::new(&g.name).strong()
@@ -590,6 +696,37 @@ fn render_sidebar(
             }
             ui.weak(format!("{}人", g.member_count));
         });
+    }
+
+    // 我的地址（点击复制；全局 IPv6 排前）
+    if !my_addrs.is_empty() {
+        ui.separator();
+        ui.heading("我的地址");
+        let mut sorted: Vec<&String> = my_addrs.iter().collect();
+        // 全局 IPv6 直连地址排前（解析失败按非全局处理）
+        let is_global =
+            |a: &String| a.parse::<libp2p::Multiaddr>().map(|m| crate::p2p::seam::is_global_ipv6_listen(&m)).unwrap_or(false);
+        sorted.sort_by_key(|a| !is_global(a));
+        for addr in sorted {
+            let short: String = if addr.chars().count() > 34 {
+                format!("{}…", addr.chars().take(34).collect::<String>())
+            } else {
+                addr.clone()
+            };
+            if ui
+                .add(
+                    egui::Label::new(egui::RichText::new(&short).small().weak())
+                        .selectable(false)
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_text(format!("{addr}\n（点击复制，发给对方添加联系人）"))
+                .clicked()
+            {
+                ui.ctx().copy_text(addr.clone());
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(1));
+            }
+        }
     }
     action
 }

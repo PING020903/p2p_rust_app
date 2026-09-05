@@ -67,10 +67,18 @@ pub struct GroupView {
     pub member_count: usize,
 }
 
-/// 侧栏快照（联系人 + 群；GUI 左栏整体替换渲染）
+/// 侧栏"已发现节点"条目（registered 地址表中有、联系人簿中没有——未握手的节点）
+#[derive(Debug, Clone)]
+pub struct DiscoveredView {
+    pub peer_id: String,
+    pub online: bool,
+}
+
+/// 侧栏快照（联系人 + 已发现节点 + 群；GUI 左栏整体替换渲染）
 #[derive(Debug, Clone, Default)]
 pub struct SidebarState {
     pub contacts: Vec<ContactView>,
+    pub discovered: Vec<DiscoveredView>,
     pub groups: Vec<GroupView>,
 }
 
@@ -79,6 +87,8 @@ pub struct SidebarState {
 pub enum UiEvent {
     Chat(ChatMessage),
     Sidebar(SidebarState),
+    /// 本机新增一条可分享监听地址（GUI 去重累积、"我的地址"点击复制）
+    ListenAddr(String),
 }
 
 /// 引擎输出统一项：单通道 FIFO 保证 Line 与 Event 的相对顺序

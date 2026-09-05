@@ -32,6 +32,9 @@ pub enum Control {
     FocusGroup(String),
     /// 信任/取消信任（复刻 /trust：trust() + 清 send_confirmed + 在线发确认/撤销信号）
     Trust { peer: PeerId, trusted: bool },
+    /// 添加联系人（复刻 /dial：解析地址 → registered 登记 → 拨号；
+    /// `name` 非空时预登记会话名——GUI 侧栏显示名生效，CLI 不传名零影响）
+    Dial { addr: String, name: String },
 }
 
 impl Control {
@@ -45,6 +48,13 @@ impl Control {
                     "信任联系人".to_string()
                 } else {
                     "取消信任".to_string()
+                }
+            }
+            Control::Dial { name, .. } => {
+                if name.is_empty() {
+                    "添加联系人".to_string()
+                } else {
+                    format!("添加联系人: {name}")
                 }
             }
         }

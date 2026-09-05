@@ -74,6 +74,8 @@ pub enum P2pEvent {
     PeerConnected(PeerId),
     PeerDisconnected { peer: PeerId, bye: bool },
     PeerDiscovered { peer: PeerId, addr: Multiaddr },
+    /// 本机新增监听地址（NewListenAddr；打印照旧，事件供 GUI"我的地址"等展示）
+    Listening(Multiaddr),
     Message { from: PeerId, frame: Frame },
     Gossip { source: PeerId, data: Vec<u8> },
     SendFailure { peer: PeerId, error: String },
@@ -391,6 +393,7 @@ impl P2pNode {
                     "{}",
                     format!("监听地址: {address}/p2p/{}", self.swarm.local_peer_id()).green()
                 );
+                let _ = events.send(P2pEvent::Listening(address.clone()));
                 if !self.listen_addrs.contains(&address) {
                     self.listen_addrs.push(address.clone());
                 }
