@@ -9,6 +9,18 @@
 
 ### 新增
 
+- **P2.4 GUI 调试 trace + 悬浮调试**：
+  - runtime.log 新 "ui" 诊断通道（`GuiApp::ui_trace`，Debug 级默认可见，切 Info 静音），
+    key=value 格式 grep/自动化断言友好——**触发 → 执行 → 状态变化 → 弹出**四类全覆盖：
+    `event=send/click`（send_input 一处覆盖全部出站：Line/ChatText/Control）/
+    `event=state`（ChildState 切换，cause 归因引擎行或登录成功）/
+    `event=login_state`（登录向导 Menu→Unlock→…→NewPassword 转移，discriminant 集中比对
+    零侵入 login.rs）/ `event=panel`（日志面板与添加表单折叠开合）/ `event=copy`
+    （我的地址复制）；弹窗批落地沿用 event=popup 钩子
+  - Control 增 `trace_detail()`（key=value 含 peer/name；与 interact 用的 describe 分工）
+  - 日志面板增"悬浮调试"开关 → `ctx.set_debug_on_hover`——悬停显示 widget 尺寸/ID，
+    自绘布局（气泡/侧栏）排查利器
+  - 冒烟脚本扩展：断言 runtime.log 出现 `event=send kind=line`（实测 trace 三连输出）
 - **P2.3 子步 c：GUI 添加联系人 + 侧栏可见性补全**：
   - **添加联系人表单**（侧栏内联折叠）：地址框（粘对方"监听地址"整行）+ 可选备注名 +
     连接按钮 → `Control::Dial{addr, name}` 复刻 /dial（parse_dial_addr 校验→registered

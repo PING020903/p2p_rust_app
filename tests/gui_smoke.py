@@ -29,14 +29,14 @@ SMOKE_PROFILE = ["1990-01-01", "M"]
 CHAT_TITLE = "P2P 聊天 GUI"
 
 
-def find_newest_interact_log() -> Path:
+def find_newest_gui_dir() -> Path:
     # 缓存根跟随 P2P_ID_CACHE_DIR（冒烟用临时目录）；缺省= 用户主目录
     root = Path(os.environ.get("P2P_ID_CACHE_DIR", str(Path.home() / ".p2p_rust_app")))
     root = root / "gui_logs"
     dirs = sorted(d for d in root.iterdir() if d.is_dir())
     if not dirs:
         raise RuntimeError(f"gui_logs 下无日志目录（GUI 未启动过？）: {root}")
-    return dirs[-1] / "interact.log"
+    return dirs[-1]
 
 
 def wait_log_contains(log: Path, needle: str, timeout: float = 20.0) -> bool:
@@ -117,8 +117,10 @@ def main() -> int:
         del os.environ["P2P_GUI_CHILD"]
     win = Desktop(backend="uia").window(title=CHAT_TITLE)
     win.wait("visible", timeout=60)
-    log = find_newest_interact_log()
-    print(f"[2/4] GUI 已启动，日志: {log}")
+    gui_dir = find_newest_gui_dir()
+    log = gui_dir / "interact.log"
+    runtime_log = gui_dir / "runtime.log"
+    print(f"[2/4] GUI 已启动，日志: {gui_dir}")
 
     def find(name: str, types=("Button", "Edit", "Text", "Document", "Pane"), timeout=15):
         """按控件名在多种 control_type 中等待查找（egui/accesskit 命名）"""
@@ -181,7 +183,7 @@ def main() -> int:
             return 5
         print("[3/4] 登录成功（日志断言通过）")
 
-    # 4) 聊天态冒烟：/list 快捷按钮回显 + 可选联系人点击
+    # 4) 聊天态冒烟：/list 快捷按钮回显 + GUI 调试 trace 断言 + 可选联系人点击
     time.sleep(2.0)
     list_btn = find("/list")
     if list_btn is None:
@@ -193,7 +195,11 @@ def main() -> int:
         if not wait_log_contains(log, "/cmd: /list"):
             print("FAIL：/list 点击未落日志")
             return 6
-        print("[4/4] /list 回显断言通过")
+        # GUI 调试 trace：点击经 send_input 应在 runtime.log 留下 event= 行
+        if not wait_log_contains(runtime_log, "event=send kind=line"):
+            print("FAIL：runtime.log 未见 ui trace（event=send kind=line）")
+            return 6
+        print("[4/4] /list 回显 + ui trace 断言通过")
 
     if args.contact:
         el = find(args.contact, types=("Text", "ListItem", "Button"))

@@ -1,4 +1,4 @@
-//! GUI 应用（P2.0 进程内引擎）：滚动区 + 输入区直驱聊天核心。
+﻿//! GUI 应用（P2.0 进程内引擎）：滚动区 + 输入区直驱聊天核心。
 //! 引擎线程（单线程 current_thread runtime）跑 run_node(LineSource::Channel)——
 //! 聊天核心与 GUI 同进程：文本框直发引擎（无 /sendStrings 协议）、输出经 sink 通道进滚动区。
 //! 诊断组件与双文件日志保留；纯 CLI 模式（--cli/管道）与 GUI 共用同一份核心代码。
@@ -131,6 +131,8 @@ pub struct GuiApp {
     log_view: LogView,
     log_follow: bool,
     log_level: Level,
+    /// 悬浮调试（egui 内建：悬停显示 widget 尺寸/ID；自绘布局排查用）
+    debug_hover: bool,
     /// 命令输入框的检查&修改规则链（拦终端逃逸穿透 + /sendStrings）
     cmd_guard: InputGuard,
     /// 文本框的检查&修改规则链（当前为空，纯文本语义；接口保留供未来加长度/敏感词等检查）
@@ -193,6 +195,7 @@ impl GuiApp {
             log_view: LogView::Runtime,
             log_follow: true,
             log_level: Level::Debug,
+            debug_hover: false,
             cmd_guard: InputGuard::command_box(),
             text_guard: InputGuard::text_box(),
             child_state: ChildState::Login,
@@ -247,7 +250,9 @@ impl GuiApp {
             Ok(_) => {
                 self.ui_tx = Some(ui_tx);
                 self.out_rx = Some(out_rx);
+                let from = self.child_state;
                 self.child_state = ChildState::Chat;
+                self.ui_trace(format!("event=state from={from:?} to=Chat cause=gui_login_success"));
                 self.timeline
                     .push(TimelineItem::line("聊天引擎已启动（进程内模式）"));
             }
@@ -259,8 +264,28 @@ impl GuiApp {
             }
         }
     }
-    /// 发送输入到引擎（通道未就绪时降级为时间线提示）
+
+    /// UI 调试 trace：runtime.log "ui" 通道（Debug 级默认可见，Info 可静音）。
+    /// 格式 `event=... key=value`——grep/自动化断言友好。
+    fn ui_trace(&self, msg: impl std::fmt::Display) {
+        self.runtime.log(Level::Debug, "ui", format!("{msg}"));
+    }
+
+    /// 发送输入到引擎（通道未就绪时降级为时间线提示）。
+    /// 所有出站动作在此统一 trace（触发什么 → 一条 event=send/click 全覆盖）。
     fn send_input(&mut self, msg: InputMsg) {
+        let (event, detail) = match &msg {
+            InputMsg::Line(l) => (
+                "event=send",
+                format!("kind=line detail={}", l.chars().take(60).collect::<String>()),
+            ),
+            InputMsg::ChatText(t) => (
+                "event=send",
+                format!("kind=chat_text chars={}", t.chars().count()),
+            ),
+            InputMsg::Control(c) => ("event=click", c.trace_detail()),
+        };
+        self.ui_trace(format!("{event} {detail}"));
         match &self.ui_tx {
             Some(tx) => {
                 if let Err(e) = tx.send(msg) {
@@ -277,14 +302,23 @@ impl eframe::App for GuiApp {
     /// 每帧（含窗口隐藏时）的逻辑回调：drain 引擎输出 + 轮询引擎退出 + 计时（不能画 UI）。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let _t = timing::ScopeTimer::start("frame.logic", &self.stats);
-        if let Some(out_rx) = &mut self.out_rx {
+        ctx.set_debug_on_hover(self.debug_hover);
+        // take() 暂取通道：drain 中可借 &self 记 trace，结束后归还
+        if let Some(mut out_rx) = self.out_rx.take() {
             while let Ok(out) = out_rx.try_recv() {
                 if let Some(t0) = self.input_sent_at.take() {
                     self.stats.record("roundtrip.input->resp", t0.elapsed());
                 }
                 match out {
                     crate::uievent::EngineOut::Line(line) => {
-                        self.child_state = next_state(self.child_state, &line);
+                        let new_state = next_state(self.child_state, &line);
+                        if new_state != self.child_state {
+                            self.ui_trace(format!(
+                                "event=state from={:?} to={new_state:?} cause=engine_line({line})",
+                                self.child_state
+                            ));
+                        }
+                        self.child_state = new_state;
                         self.interact.log(Level::Info, "engine", &line);
                         self.timeline.push(TimelineItem::line(line));
                     }
@@ -306,6 +340,7 @@ impl eframe::App for GuiApp {
                 }
                 ctx.request_repaint();
             }
+            self.out_rx = Some(out_rx); // 归还通道
         }
         // 生命周期联动：引擎任务结束（聊天退出）→ GUI 一并关闭
         if self.engine_done.swap(false, Ordering::AcqRel) {
@@ -328,7 +363,8 @@ impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let mut frame_timer = timing::Timer::start();
 
-        // 日志侧栏（可开关）
+        // 日志侧栏（可开关；开合 trace）
+        let show_log_prev = self.show_log;
         if self.show_log {
             egui::Panel::right("log")
                 .default_size(380.0)
@@ -338,10 +374,16 @@ impl eframe::App for GuiApp {
 
         // 登录页（引擎未启动）：全窗口卡片，无底部输入面板；成功后带凭据启动引擎
         if self.child_state == ChildState::Login {
+            let login_prev = login_state_name(&self.login);
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("P2P 聊天");
-                    ui.toggle_value(&mut self.show_log, "日志");
+                    if ui
+                        .toggle_value(&mut self.show_log, "日志")
+                        .changed()
+                    {
+                        self.ui_trace(format!("event=panel name=log open={}", self.show_log));
+                    }
                 });
                 if let Some(outcome) = login::view(&mut self.login, ui) {
                     self.interact.log(Level::Info, "user", "登录成功（GUI 表单）");
@@ -350,6 +392,13 @@ impl eframe::App for GuiApp {
                     self.start_engine(Some(outcome), ui.ctx().clone());
                 }
             });
+            let login_now = login_state_name(&self.login);
+            if login_now != login_prev {
+                self.ui_trace(format!("event=login_state from={login_prev} to={login_now}"));
+            }
+            if self.show_log != show_log_prev {
+                self.ui_trace(format!("event=panel name=log open={}", self.show_log));
+            }
             self.first_frame = false;
             return;
         }
@@ -357,6 +406,7 @@ impl eframe::App for GuiApp {
         // 左栏：联系人（信任徽标/在线/焦点）+ 已发现节点 + 添加表单 + 我的地址；
         // 点击发结构化 Control 动作（不经命令文本）
         let mut sidebar_action: Option<InputMsg> = None;
+        let mut sidebar_traces: Vec<String> = Vec::new();
         {
             let sidebar = &self.sidebar;
             let my_addrs = &self.my_addrs;
@@ -366,9 +416,14 @@ impl eframe::App for GuiApp {
                     .default_size(230.0)
                     .resizable(true)
                     .show(ui, |ui| {
-                        sidebar_action = render_sidebar(ui, sidebar.as_ref(), my_addrs, add_form);
+                        let (a, t) = render_sidebar(ui, sidebar.as_ref(), my_addrs, add_form);
+                        sidebar_action = a;
+                        sidebar_traces = t;
                     });
             }
+        }
+        for t in sidebar_traces {
+            self.ui_trace(t);
         }
         if let Some(msg) = sidebar_action {
             let note = match &msg {
@@ -482,7 +537,9 @@ impl eframe::App for GuiApp {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("P2P 聊天 GUI");
-                ui.toggle_value(&mut self.show_log, "日志");
+                if ui.toggle_value(&mut self.show_log, "日志").changed() {
+                    self.ui_trace(format!("event=panel name=log open={}", self.show_log));
+                }
             });
             ui.horizontal(|ui| {
                 let state_color = match self.child_state {
@@ -525,15 +582,28 @@ impl eframe::App for GuiApp {
     }
 }
 
+/// 登录向导状态名（LoginUi 变体名；转移 trace 用）
+fn login_state_name(s: &login::LoginState) -> &'static str {
+    match s {
+        login::LoginState::Menu { .. } => "Menu",
+        login::LoginState::Unlock { .. } => "Unlock",
+        login::LoginState::Profile { .. } => "Profile",
+        login::LoginState::MnemonicConfirm { .. } => "MnemonicConfirm",
+        login::LoginState::NewPassword { .. } => "NewPassword",
+        login::LoginState::RestorePhrase { .. } => "RestorePhrase",
+    }
+}
+
 /// 侧栏视图：联系人（信任徽标/在线/焦点/信任按钮）+ 已发现节点（未握手）+
-/// 添加联系人表单 + 我的地址（点击复制）；返回点击产生的结构化动作
+/// 添加联系人表单 + 我的地址（点击复制）；返回点击产生的结构化动作与 trace 行
 fn render_sidebar(
     ui: &mut egui::Ui,
     sb: Option<&crate::uievent::SidebarState>,
     my_addrs: &[String],
     add_form: &mut AddForm,
-) -> Option<InputMsg> {
+) -> (Option<InputMsg>, Vec<String>) {
     let mut action: Option<InputMsg> = None;
+    let mut traces: Vec<String> = Vec::new();
 
     ui.heading("联系人");
     let empty_c: Vec<crate::uievent::ContactView> = Vec::new();
@@ -639,9 +709,10 @@ fn render_sidebar(
     }
 
     // 添加联系人表单（内联折叠；提交 → Control::Dial）
+    // 折叠态受控于 add_form.open（.open(Some) 受控模式）——header 点击翻转并 trace
     ui.separator();
-    egui::CollapsingHeader::new("➕ 添加联系人")
-        .default_open(add_form.open)
+    let header = egui::CollapsingHeader::new("➕ 添加联系人")
+        .open(Some(add_form.open))
         .show(ui, |ui| {
             ui.add(
                 egui::TextEdit::multiline(&mut add_form.addr)
@@ -669,6 +740,13 @@ fn render_sidebar(
             }
             ui.weak("对方可在侧栏复制地址发给你");
         });
+    if header.header_response.clicked() {
+        add_form.open = !add_form.open;
+        traces.push(format!(
+            "event=panel name=add_contact open={}",
+            add_form.open
+        ));
+    }
 
     // 群
     ui.separator();
@@ -723,12 +801,14 @@ fn render_sidebar(
                 .clicked()
             {
                 ui.ctx().copy_text(addr.clone());
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(1));
+                traces.push(format!(
+                    "event=copy kind=listen_addr chars={}",
+                    addr.chars().count()
+                ));
             }
         }
     }
-    action
+    (action, traces)
 }
 
 /// 聊天气泡：对侧左对齐、我侧右对齐；头部小字（名字/群前缀 + 时刻），正文自动换行。
@@ -858,6 +938,10 @@ impl GuiApp {
                 }
             }
             ui.checkbox(&mut self.log_follow, "跟随");
+            ui.checkbox(&mut self.debug_hover, "悬浮调试");
+            if self.debug_hover {
+                ui.weak("(widget 尺寸/ID)");
+            }
             egui::ComboBox::from_id_salt("log_level")
                 .selected_text(self.log_level.as_str())
                 .show_ui(ui, |ui| {

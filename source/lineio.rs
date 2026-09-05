@@ -59,6 +59,23 @@ impl Control {
             }
         }
     }
+
+    /// 调试 trace 明细（key=value；交互日志用 [`Control::describe`]，runtime 诊断用本方法）
+    pub fn trace_detail(&self) -> String {
+        match self {
+            Control::FocusPeer { peer, name } => {
+                format!("action=focus_peer peer={peer} name={name}")
+            }
+            Control::FocusGroup(g) => format!("action=focus_group group={g}"),
+            Control::Trust { peer, trusted } => {
+                format!("action=trust peer={peer} trusted={trusted}")
+            }
+            Control::Dial { name, .. } => format!(
+                "action=dial name={}",
+                if name.is_empty() { "-" } else { name }
+            ),
+        }
+    }
 }
 
 /// 输入源抽象：CLI/e2e 读终端或管道（Stdin，逐行产出 Line）；GUI 读 UI 输入通道（Channel）。
