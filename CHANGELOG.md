@@ -9,6 +9,17 @@
 
 ### 新增
 
+- **P2.5 D：chat.rs（2483 行）迁入 p2p_app/chat/ 12 模块（三步纯搬家）**：
+  - 步1 叶子域：payloads.rs（TAG×5+载荷×5）/ group.rs（群域+持久化）/ dial.rs（地址解析，
+    10 单测随迁）
+  - 步2 中间层：ctx.rs（ChatCtx/AppCtx/Conversation/AsyncOp/peer_name）/ control.rs
+    （handle_control）/ sidebar.rs（侧栏快照/徽标/监听打印）/ handlers.rs（SignalCtx+语义 handlers）；
+    file_transfer.rs 引用改指新家
+  - 步3 大块收尾：commands.rs（build_tree 759 行命令树，框架 cmd_tree.rs 留根——对应固件惯例
+    CommandParse/ 与 userTasks_cmds.c 分离）/ session.rs（run/run_engine/run_node 主循环 +
+    send_focused_text + sendstrings/discovered 单测随迁）；chat.rs 壳退役，main.rs/ui 引用改指
+    p2p_app::chat::session
+  - 每步独立 e2e 全量门禁，CLI 行为逐字节不变；UI_PLAN 界面清单勾选同步
 - **P2.4 GUI 调试 trace + 悬浮调试**：
   - runtime.log 新 "ui" 诊断通道（`GuiApp::ui_trace`，Debug 级默认可见，切 Info 静音），
     key=value 格式 grep/自动化断言友好——**触发 → 执行 → 状态变化 → 弹出**四类全覆盖：

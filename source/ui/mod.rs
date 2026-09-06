@@ -13,10 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::chat;
 use crate::p2p::identity::LoginOutcome;
 use crate::lineio::{Control, InputMsg, LineSource};
 use crate::p2p_app::chat::gui::login;
+use crate::p2p_app::chat::session;
 use crate::sink;
 use input_guard::InputGuard;
 use logging::{Level, LogStore};
@@ -237,7 +237,7 @@ impl GuiApp {
                 };
                 sink::install(out_tx, Some(notify));
                 engine_log.log(Level::Info, "engine", "引擎线程启动（进程内聊天核心）");
-                if let Err(e) = rt.block_on(chat::run_engine(LineSource::Channel(ui_rx), pre)) {
+                if let Err(e) = rt.block_on(session::run_engine(LineSource::Channel(ui_rx), pre)) {
                     engine_log.log(Level::Error, "engine", format!("引擎错误: {e}"));
                 }
                 engine_log.log(Level::Info, "engine", "引擎已退出");

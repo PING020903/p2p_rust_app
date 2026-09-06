@@ -21,7 +21,6 @@ macro_rules! print {
 }
 
 mod calculator;
-mod chat;
 mod cmd_tree;
 mod color_print;
 mod file_transfer;
@@ -139,7 +138,7 @@ fn run_cli() {
         color_print::demo();
     });
     tree.set_help(c3, "彩色打印演示");
-    let c4 = tree.register(ROOT, "4", |_, _| chat::run());
+    let c4 = tree.register(ROOT, "4", |_, _| p2p_app::chat::session::run());
     tree.set_help(c4, "P2P 聊天");
     let c5 = tree.register(ROOT, "5", |_, _| clear_logs_menu());
     tree.set_help(c5, "清除会话日志（gui_logs/，保留最近 1 次；不影响身份/联系人/群）");

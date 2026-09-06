@@ -170,11 +170,25 @@ GUI：tokio 后台线程跑核心，UI 主线程每帧 drain 事件通道
   登录成功后带凭据启动引擎（`run_engine(Some(outcome))`）切聊天布局
   ——架构：视图+状态机在 `p2p_app/chat/gui/login.rs`，编排只调 p2p 领域 API；
   密码全程只在表单内流转（masked），不进命令框、不落 interact.log（CLI 命令框明文问题随之消除）
-- [ ] **左栏**：联系人（含信任徽标 `[互信]/[我信任/对方未确认]/[未信任]`）+ 群列表 + 发现节点
-- [ ] **中区**：会话气泡（焦点/非焦点带名）、群消息（`[群名] [成员名]`）——需消息结构化（`UiEvent::ChatText{from, text, focused}`，引擎显示逻辑拆分：CLI 格式化文本 / GUI 渲染气泡）
-- [ ] **底部**：输入框 + `/` 命令快捷入口（P2.1 起登录期隐藏，仅聊天态显示）
+- [x] **左栏**：联系人（信任徽标/在线点/信任按钮）+ 已发现节点（未握手分段）+ 添加联系人表单 + 我的地址（点击复制）+ 群列表（✅ P2.2c/P2.3b/c）
+- [x] **中区**：会话气泡（手工测量手绘，对侧左/我侧右，未信任黄）+ 系统行混排时间线；消息结构化（`ChatMessage` 事件经 sink 单通道保序，CLI 文本格式与 GUI 渲染分流）（✅ P2.2a/b/b2）
+- [x] **底部**：输入框（ChatText 直发）+ 命令框（guard 拦穿透）+ `/list` `/q` 快捷按钮（登录期隐藏）（✅ P2.1/P2.2）
 - [ ] **弹窗**：TOFU 指纹确认、`/backup` 助记词、未信任发送确认、文件接收、下载目录选择
 - [ ] **状态栏**：发现模式、下载目录、本机节点 ID
+
+### P2.5 应用层结构（chat.rs 2483 行 → p2p_app/chat/ 12 模块，✅ 纯搬家）
+
+```
+p2p_app/chat/
+├── payloads.rs   载荷×5 + TAG×5        ├── commands.rs  build_tree 命令树（CLI 文本层）
+├── group.rs      群域逻辑+持久化        ├── session.rs   run/run_engine/run_node 主循环
+├── dial.rs       拨号地址解析+模板      ├── ctx.rs       ChatCtx/AppCtx/Conversation/AsyncOp
+├── control.rs    handle_control        ├── handlers.rs  SignalCtx + 语义 handlers
+├── sidebar.rs    侧栏快照/徽标/监听打印 ├── display.rs   显示路由（CLI/GUI 分流）
+└── cli/gui/login_common（登录域）
+```
+- 框架 cmd_tree.rs 留 crate 根（全局组件）；build_tree 随域——对应固件惯例 CommandParse/ 与 userTasks_cmds.c 分离
+- 三步纯搬家（叶子→中间层→大块），每步 e2e 全量门禁，CLI 行为逐字节不变
 
 ### 应用层结构（P2.1 起生效，架构纪律）
 
