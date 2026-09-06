@@ -1,19 +1,27 @@
 use colored::Colorize;
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use rand::{rngs::OsRng, RngCore};
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::io::IsTerminal;
-use std::path::PathBuf;
 use tokio::io::AsyncBufReadExt;
 
 use crate::cmd_tree::{CmdError, CmdTree, ROOT};
-use crate::p2p::{cache_dir, load_discovery_mode, save_discovery_mode, save_download_dir, DiscoveryMode};
+use crate::p2p::{load_discovery_mode, save_discovery_mode, save_download_dir, DiscoveryMode};
 use crate::lineio::{Control, InputMsg, LineSource};
 use crate::p2p::identity::LoginOutcome;
 use crate::p2p::identity_service::{is_l2_signal, IdentityService, TextTag};
 use crate::p2p_app::chat::display;
+use crate::p2p_app::chat::dial::{parse_dial_addr, print_dial_template};
+use crate::p2p_app::chat::group::{
+    dedup_members, dial_group_members, fanout_member_list, fanout_member_list_async, group_topic,
+    load_groups, next_creator, save_groups, Group, GroupPayload,
+};
+use crate::p2p_app::chat::payloads::{
+    ChatTextPayload, GroupInvitePayload, GroupLeavePayload, GroupMemberListPayload,
+    GroupOwnerTransferPayload, TAG_CHAT_TEXT, TAG_GROUP_INVITE, TAG_GROUP_LEAVE,
+    TAG_GROUP_MEMBER_LIST, TAG_GROUP_OWNER_TRANSFER,
+};
 use crate::p2p::seam::{self, is_global_ipv6_listen, Event, SignalRegistry, BYE_HANDSHAKE_TIMEOUT};
 
 // ---- 语义注册表（L3 应用层）：text=Custom(tag) 承载协议语义，binary 承载负载 ----
@@ -21,48 +29,7 @@ use crate::p2p::seam::{self, is_global_ipv6_listen, Event, SignalRegistry, BYE_H
 // 基础语义 Hello/Bye 由 L2（IdentityService）直接在事件分支处理；
 // chat 业务注册为自定义语义 tag，按 tag 分发到注册的 handler。
 // 新应用（文件传输/固件升级）注册自己的 tag + handler，不动核心。
-
-/// chat 应用注册的自定义语义标签
-const TAG_CHAT_TEXT: &str = "chat.text";
-const TAG_GROUP_INVITE: &str = "chat.group_invite";
-const TAG_GROUP_LEAVE: &str = "chat.group_leave";
-const TAG_GROUP_MEMBER_LIST: &str = "chat.group_member_list";
-const TAG_GROUP_OWNER_TRANSFER: &str = "chat.group_owner_transfer";
-
-/// chat 业务负载结构（各自 tag 的 binary 负载，cbor 序列化）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ChatTextPayload {
-    text: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GroupInvitePayload {
-    group_id: String,
-    group_name: String,
-    version: u64,
-    members: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GroupLeavePayload {
-    group_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GroupMemberListPayload {
-    group_id: String,
-    version: u64,
-    members: Vec<String>,
-}
-
-/// 群主退群时一步顺位转移：携带新群主 + 移除群主后的名单（版本门控整体替换）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GroupOwnerTransferPayload {
-    group_id: String,
-    new_creator: String,
-    version: u64,
-    members: Vec<String>,
-}
+// 载荷结构与 tag 常量见 p2p_app/chat/payloads.rs（步1 迁出）。
 
 /// 命令 handler 产出的异步动作：同步逻辑跑在指令树 handler 里，真正需要 `.await`
 /// 的 I/O（发命令给传输适配层 / 读密码）排进 `ChatCtx.ops`，由主循环统一消费。
@@ -816,160 +783,7 @@ impl Conversation {
     }
 }
 
-/// 群：本地注册表（id/name/members）。**群主为中心**的单一权威模型：
-/// 群主（creator）是成员表唯一权威——仅群主可邀请新成员、处理成员退群；
-/// 每次成员变更版本 +1，并向最新名单所有成员 1v1 扇出全量名单（版本化整体替换）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Group {
-    id: String,
-    name: String,
-    members: Vec<String>, // peer_id 字符串
-    #[serde(default)]
-    version: u64, // 成员变更计数，仅接受更高版本
-    #[serde(default)]
-    creator: String, // 群主 peer_id（唯一权威）
-    /// 常驻接收（per-node 本地偏好，不随名单传播）：常驻群成员上线自动拨号维持 mesh，
-    /// 普通群只在聚焦时按需连接（防"所有群都 mesh"的通讯风暴）
-    #[serde(default)]
-    resident: bool,
-}
-
-/// 群消息载荷（gossipsub data，JSON 编码）。
-/// 群文本经 gossipsub 分发；成员名单由群主 1v1 扇出（见 GroupMemberList），不走 gossip
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum GroupPayload {
-    Text {
-        group_id: String,
-        text: String,
-        /// 发送者自己的显示名（Signed 签名保证来源真实，名字是展示元数据）
-        sender: String,
-    },
-}
-
-/// 群 topic 字符串（L1 不解释 topic，直接透传；订阅/发布/接收须用同一格式）
-fn group_topic(group_id: &str) -> String {
-    format!("/group/{group_id}/v1")
-}
-
-/// 群主向目标成员 1v1 扇出名单更新（版本化整体替换）：同步排入命令队列，主循环统一消费
-fn fanout_member_list(
-    ops: &mut VecDeque<AsyncOp>,
-    group_id: &str,
-    version: u64,
-    members: &[String],
-    targets: &[PeerId],
-) {
-    let payload = serde_cbor::to_vec(&GroupMemberListPayload {
-        group_id: group_id.to_string(),
-        version,
-        members: members.to_vec(),
-    })
-    .unwrap_or_default();
-    for p in targets {
-        ops.push_back(AsyncOp::Cmd(seam::Cmd::Send {
-            peer: *p,
-            tag: TAG_GROUP_MEMBER_LIST.to_string(),
-            payload: Some(payload.clone()),
-        }));
-    }
-}
-
-/// 事件 handler（async）用的异步扇出：直接 await cmd_tx
-async fn fanout_member_list_async(
-    cmd_tx: &tokio::sync::mpsc::Sender<seam::Cmd>,
-    group_id: &str,
-    version: u64,
-    members: &[String],
-    targets: &[PeerId],
-) {
-    let payload = serde_cbor::to_vec(&GroupMemberListPayload {
-        group_id: group_id.to_string(),
-        version,
-        members: members.to_vec(),
-    })
-    .unwrap_or_default();
-    for p in targets {
-        let _ = cmd_tx
-            .send(seam::Cmd::Send {
-                peer: *p,
-                tag: TAG_GROUP_MEMBER_LIST.to_string(),
-                payload: Some(payload.clone()),
-            })
-            .await;
-    }
-}
-
-/// 拨号群成员（跳过自己/已连接/无已知地址）：常驻群保持 mesh 与聚焦群按需连接的共用入口
-fn dial_group_members(
-    ops: &mut VecDeque<AsyncOp>,
-    g: &Group,
-    my_id: &PeerId,
-    connected: &HashSet<PeerId>,
-    registered: &HashMap<PeerId, Vec<Multiaddr>>,
-) {
-    let my_id_str = my_id.to_string();
-    for m in &g.members {
-        if m == &my_id_str {
-            continue;
-        }
-        let Ok(pid) = m.parse::<PeerId>() else {
-            continue;
-        };
-        if connected.contains(&pid) {
-            continue;
-        }
-        if registered.get(&pid).map(|a| !a.is_empty()).unwrap_or(false) {
-            ops.push_back(AsyncOp::Cmd(seam::Cmd::DialPeer(pid)));
-        }
-    }
-}
-
-fn groups_path(my_peer_id: &PeerId) -> PathBuf {
-    let dir = cache_dir().unwrap_or_else(|_| PathBuf::from("."));
-    dir.join(format!("groups_{my_peer_id}.json"))
-}
-
-fn load_groups(my_peer_id: &PeerId) -> HashMap<String, Group> {
-    let path = groups_path(my_peer_id);
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Vec<Group>>(&s).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|mut g| {
-            dedup_members(&mut g.members);
-            (g.id.clone(), g)
-        })
-        .collect()
-}
-
-fn save_groups(my_peer_id: &PeerId, groups: &HashMap<String, Group>) -> Result<(), String> {
-    let path = groups_path(my_peer_id);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("创建群目录失败: {e}"))?;
-    }
-    let list: Vec<&Group> = groups.values().collect();
-    let s = serde_json::to_string_pretty(&list).map_err(|e| format!("群序列化失败: {e}"))?;
-    std::fs::write(&path, s).map_err(|e| format!("写入群注册表失败: {e}"))
-}
-
-/// 保序去重成员名单（幽灵/重复防御：加载、接收名单、处理退群后统一归一化）
-fn dedup_members(members: &mut Vec<String>) {
-    let mut seen: HashSet<String> = HashSet::new();
-    members.retain(|m| seen.insert(m.clone()));
-}
-
-/// 群主顺位转移的"下一位"：members 数组里群主之后的下一个成员；
-/// 群主在末尾时回卷取第一个非群主成员；名单只有群主返回 None（解散）
-fn next_creator(members: &[String], creator: &str) -> Option<String> {
-    let pos = members.iter().position(|m| m == creator)?;
-    members[pos + 1..]
-        .iter()
-        .find(|m| *m != creator)
-        .or_else(|| members[..pos].iter().find(|m| *m != creator))
-        .cloned()
-}
+// 群域（Group/topic/扇出/拨号成员/持久化/dedup/next_creator）已迁 p2p_app/chat/group.rs
 
 /// 由 peer 解析显示名：先查 1v1 会话名，再查 L2 联系人，兜底完整节点ID
 fn peer_name(
@@ -998,70 +812,6 @@ fn group_owner_label(
         Ok(owner) => format!("群主 {} ({owner})", peer_name(&owner, conversations, identity)),
         Err(_) => format!("群主 {}", g.creator),
     }
-}
-
-fn print_dial_template() {
-    println!("{}", "地址格式:".yellow());
-    println!("  /ip4/<IPv4地址>/tcp/<端口>/p2p/<节点ID>");
-    println!("  /ip6/<IPv6地址>/tcp/<端口>/p2p/<节点ID>");
-    println!("{}", "有效性规则:".yellow());
-    println!("  <IPv4地址> 点分十进制 4 段，每段 0-255，如 192.168.31.10");
-    println!("  <端口>     对方监听的端口号，0-65535");
-    println!("  <节点ID>   12D3KooW 开头的串，代表对方节点身份");
-    println!(
-        "{}",
-        "提示: 直接粘贴对方启动时打印的\"监听地址\"整行即可".dimmed()
-    );
-}
-
-fn parse_dial_addr(input: &str) -> Result<Multiaddr, String> {
-    let mut s = input.trim();
-    for prefix in ["监听地址:", "监听地址："] {
-        if let Some(stripped) = s.strip_prefix(prefix) {
-            s = stripped.trim();
-        }
-    }
-    if !s.starts_with('/') {
-        return Err("地址须以 / 开头，格式: /ip4/<IPv4地址>/tcp/<端口>/p2p/<节点ID>".into());
-    }
-    let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
-
-    match parts.first() {
-        Some(&"ip4") => {
-            let ip = parts.get(1).ok_or("缺少 IP 地址: /ip4/ 后应跟 IPv4 地址")?;
-            ip.parse::<std::net::Ipv4Addr>().map_err(|_| {
-                format!("IPv4 地址无效: {ip}（应为 4 段点分十进制，每段 0-255）")
-            })?;
-        }
-        Some(&"ip6") => {
-            let ip = parts.get(1).ok_or("缺少 IP 地址: /ip6/ 后应跟 IPv6 地址")?;
-            ip.parse::<std::net::Ipv6Addr>()
-                .map_err(|_| format!("IPv6 地址无效: {ip}"))?;
-        }
-        Some(other) => {
-            return Err(format!("地址须以 /ip4/ 或 /ip6/ 开头，当前是 /{other}/"))
-        }
-        None => return Err("地址为空".into()),
-    }
-
-    let tcp_pos = parts
-        .iter()
-        .position(|&p| p == "tcp")
-        .ok_or("缺少 /tcp/<端口> 部分（如 .../tcp/12082/...）")?;
-    let port_str = parts.get(tcp_pos + 1).ok_or("/tcp/ 后缺少端口号")?;
-    port_str
-        .parse::<u16>()
-        .map_err(|_| format!("端口须为 0-65535 的数字，当前: {port_str}"))?;
-
-    let p2p_pos = parts.iter().position(|&p| p == "p2p").ok_or(
-        "缺少 /p2p/<节点ID> 部分（节点ID 在对方的监听地址里，12D3KooW 开头）",
-    )?;
-    let peer_str = parts.get(p2p_pos + 1).ok_or("/p2p/ 后缺少节点ID")?;
-    peer_str
-        .parse::<PeerId>()
-        .map_err(|_| format!("节点ID无效: {peer_str}（应以 12D3KooW 开头）"))?;
-
-    s.parse::<Multiaddr>().map_err(|e| format!("地址整体解析失败: {e}"))
 }
 
 fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
@@ -2423,98 +2173,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
 mod tests {
     use super::*;
 
-    const PEER: &str = "12D3KooWGpERtoeJ1M482Kkx7p9czC9yKYuXGsvUvDBG3589iPKq";
-
-    fn valid_addr() -> String {
-        format!("/ip4/192.168.31.10/tcp/12082/p2p/{PEER}")
-    }
-
-    #[test]
-    fn accept_valid_ipv4() {
-        assert!(parse_dial_addr(&valid_addr()).is_ok());
-    }
-
-    #[test]
-    fn accept_valid_ipv6() {
-        let a = format!("/ip6/::1/tcp/12082/p2p/{PEER}");
-        assert!(parse_dial_addr(&a).is_ok());
-    }
-
-    #[test]
-    fn strip_listen_label_prefix() {
-        let a = format!("监听地址: {}", valid_addr());
-        assert!(parse_dial_addr(&a).is_ok());
-        let b = format!("监听地址：{}", valid_addr());
-        assert!(parse_dial_addr(&b).is_ok());
-    }
-
-    #[test]
-    fn reject_no_leading_slash() {
-        let e = parse_dial_addr("ip4/1.2.3.4/tcp/1/p2p/x").unwrap_err();
-        assert!(e.contains("以 / 开头"));
-    }
-
-    #[test]
-    fn reject_bad_protocol() {
-        let e = parse_dial_addr("/ipx/1.2.3.4/tcp/1").unwrap_err();
-        assert!(e.contains("/ip4/ 或 /ip6/"));
-    }
-
-    #[test]
-    fn reject_bad_ipv4() {
-        let e = parse_dial_addr("/ip4/300.1.2.3/tcp/1/p2p/x").unwrap_err();
-        assert!(e.contains("IPv4 地址无效"));
-    }
-
-    #[test]
-    fn reject_missing_tcp() {
-        let e = parse_dial_addr("/ip4/1.2.3.4/p2p/x").unwrap_err();
-        assert!(e.contains("/tcp/"));
-    }
-
-    #[test]
-    fn reject_bad_port() {
-        let e = parse_dial_addr("/ip4/1.2.3.4/tcp/abc/p2p/x").unwrap_err();
-        assert!(e.contains("端口"));
-        let e = parse_dial_addr("/ip4/1.2.3.4/tcp/70000/p2p/x").unwrap_err();
-        assert!(e.contains("端口"));
-    }
-
-    #[test]
-    fn reject_missing_p2p() {
-        let e = parse_dial_addr("/ip4/1.2.3.4/tcp/1").unwrap_err();
-        assert!(e.contains("/p2p/"));
-    }
-
-    #[test]
-    fn reject_bad_peer_id() {
-        let e = parse_dial_addr("/ip4/1.2.3.4/tcp/1/p2p/not-a-peer-id").unwrap_err();
-        assert!(e.contains("节点ID无效"));
-    }
-
-    #[test]
-    fn dedup_members_keeps_order_and_removes_dups() {
-        let mut m = vec!["A".into(), "B".into(), "A".into(), "C".into(), "B".into()];
-        dedup_members(&mut m);
-        assert_eq!(m, vec!["A", "B", "C"]);
-        let mut single = vec!["X".into()];
-        dedup_members(&mut single);
-        assert_eq!(single, vec!["X"]);
-    }
-
-    #[test]
-    fn next_creator_wraps_after_owner() {
-        let members: Vec<String> = vec!["A".into(), "B".into(), "C".into()];
-        assert_eq!(next_creator(&members, "A").as_deref(), Some("B"));
-        assert_eq!(next_creator(&members, "B").as_deref(), Some("C"));
-        // 群主在末尾：回卷取第一个非群主
-        assert_eq!(next_creator(&members, "C").as_deref(), Some("A"));
-        // 仅自己：无下一位（解散）
-        let solo = vec!["A".into()];
-        assert_eq!(next_creator(&solo, "A"), None);
-        // 群主不在名单（数据异常防御）：不猜测继任者
-        assert_eq!(next_creator(&members, "Z"), None);
-    }
+    // parse_dial_addr/群域（dedup/next_creator）单测随迁 dial.rs/group.rs（步1）
 
     #[test]
     fn sendstrings_parse_count() {
@@ -2552,8 +2211,10 @@ mod tests {
     fn discovered_views_excludes_known_contacts() {
         use crate::uievent::DiscoveredView;
         use std::collections::HashSet;
-        let pa: PeerId = PEER.parse().unwrap();
-        // 另一合法节点 ID（legal winner 测试向量派生；与 PEER 不同）
+        // 两个合法节点 ID（BIP39 测试向量派生，互不相同）
+        let pa: PeerId = "12D3KooWGpERtoeJ1M482Kkx7p9czC9yKYuXGsvUvDBG3589iPKq"
+            .parse()
+            .unwrap();
         let pb: PeerId = "12D3KooWPCyWnZCXR3VGdrQjLr5d8TBaAHD956XZvo6xoCXYB5AR"
             .parse()
             .unwrap();
