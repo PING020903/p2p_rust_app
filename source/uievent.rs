@@ -91,6 +91,8 @@ pub enum AskKind {
         name: String,
         fingerprint: String,
     },
+    /// /backup 解锁密码（secret=true；答案即密码行）
+    BackupPassword,
 }
 
 /// Ask 请求：引擎单飞行（同时最多一个）；id 自增防御错位
@@ -120,6 +122,8 @@ pub enum UiEvent {
     ListenAddr(String),
     /// 引擎等待 GUI 作答（系统消息区域渲染卡片；答案经 InputMsg::Line 回程）
     Ask(AskRequest),
+    /// 助记词展示（/backup 解锁成功后；系统消息区域大字卡片 + 复制按钮）
+    MnemonicShow { phrase: String },
 }
 
 /// 引擎输出统一项：单通道 FIFO 保证 Line 与 Event 的相对顺序

@@ -280,7 +280,9 @@ impl IdentityService {
         on_bye(peer);
     }
 
-    /// /backup：重新查看本身份助记词（需再输密码解锁 keystore）
+    /// /backup：重新查看本身份助记词（需再输密码解锁 keystore）。
+    /// 三态：Interactive=终端不回显输入；**Ask=发 BackupPassword 卡片（masked）+ 读行**；
+    /// Auto=管道行读取（e2e）。解锁成功后 CLI 打印照旧，Ask 模式附加 MnemonicShow 卡片。
     pub async fn backup(
         &mut self,
         src: &mut LineSource,
@@ -291,7 +293,15 @@ impl IdentityService {
             .iter()
             .find(|(k, _)| k.peer_id == self.my_id.to_string())
         {
-            println!("{}", "请输入密码以解锁本身份".yellow());
+            if mode == ConfirmMode::Ask {
+                crate::sink::ask(AskRequest {
+                    id: crate::uievent::next_ask_id(),
+                    kind: crate::uievent::AskKind::BackupPassword,
+                    secret: true,
+                });
+            } else if mode.is_interactive() {
+                println!("{}", "请输入密码以解锁本身份".yellow());
+            }
             let password = src.prompt_secret(mode, "密码: ").await?;
             match decrypt_mnemonic(
                 &password,
@@ -305,6 +315,11 @@ impl IdentityService {
                 Ok(phrase) => {
                     print_mnemonic_guide(&phrase);
                     println!("{}", "助记词是唯一备份，请妥善保管".dimmed());
+                    if mode == ConfirmMode::Ask {
+                        crate::sink::event(crate::uievent::UiEvent::MnemonicShow {
+                            phrase,
+                        });
+                    }
                 }
                 Err(reason) => eprintln!("{}", reason.red()),
             }

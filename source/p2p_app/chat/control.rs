@@ -8,7 +8,7 @@ use colored::Colorize;
 use crate::lineio::Control;
 use crate::p2p::identity_service::TextTag;
 use crate::p2p::seam;
-use crate::p2p_app::chat::ctx::{peer_name, push_cmd, ChatCtx, Conversation};
+use crate::p2p_app::chat::ctx::{peer_name, push_cmd, AsyncOp, ChatCtx, Conversation};
 use crate::p2p_app::chat::dial::{parse_dial_addr, print_dial_template};
 use crate::p2p_app::chat::group::dial_group_members;
 use crate::p2p_app::chat::sidebar::trust_badge;
@@ -106,6 +106,10 @@ pub(crate) async fn handle_control(ctx: &mut ChatCtx<'_>, c: Control) {
                     print_dial_template();
                 }
             }
+        }
+        Control::Backup => {
+            // 复刻 /backup：Ask 模式弹 BackupPassword 卡片（masked），解锁后 MnemonicShow 展示
+            ctx.ops.push_back(AsyncOp::Backup);
         }
         Control::Trust { peer, trusted } => {
             let name = peer_name(&peer, ctx.conversations, ctx.identity);

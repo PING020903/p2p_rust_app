@@ -62,6 +62,8 @@ pub enum Control {
     /// 添加联系人（复刻 /dial：解析地址 → registered 登记 → 拨号；
     /// `name` 非空时预登记会话名——GUI 侧栏显示名生效，CLI 不传名零影响）
     Dial { addr: String, name: String },
+    /// 备份助记词（复刻 /backup：Ask 模式弹 BackupPassword 卡片，解锁后 MnemonicShow 展示）
+    Backup,
 }
 
 impl Control {
@@ -84,6 +86,7 @@ impl Control {
                     format!("添加联系人: {name}")
                 }
             }
+            Control::Backup => "备份助记词".to_string(),
         }
     }
 
@@ -101,6 +104,7 @@ impl Control {
                 "action=dial name={}",
                 if name.is_empty() { "-" } else { name }
             ),
+            Control::Backup => "action=backup".to_string(),
         }
     }
 }

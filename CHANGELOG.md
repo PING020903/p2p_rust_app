@@ -16,6 +16,17 @@
     （只命中 contacts_*.json，群缓存/其它文件不受影响）
   - 服务 TOFU 卡片等首次接触流程的重复测试（此前默认读缓存无法重测）；仅主菜单入口，
     不影响身份 keystore/群缓存/会话日志
+- **P2.6 步2：BackupPassword Ask + MnemonicShow 卡片**：
+  - /backup 三态：Ask 模式发 BackupPassword 卡片（masked 密码框 + 解锁按钮，回车提交），
+    解锁成功后 CLI 打印照旧 + 附加 `UiEvent::MnemonicShow` 卡片（大字助记词 + 复制 +
+    [我已保存，关闭]）——助记词脱离命令框/滚动区，GUI 用户可安全查看备份
+  - `Control::Backup`（侧栏"备份助记词"按钮 → control.rs → AsyncOp::Backup）；
+    describe/trace_detail 同步
+  - GUI 密码卡片 masked 输入 + ask_input 状态（提交后清空）；密码提交的
+    interact.log 记"(密码已提交)"掩码；错误密码行为与 CLI 一致（提示后重按按钮）
+  - 冒烟扩展：备份链路断言（event=ask kind=BackupPassword → 剪贴板粘贴 → 解锁 →
+    助记词输出 + event=mnemonic_show）；UIA 多 Edit 歧义（accesskit 残留）用
+    逐个点击粘贴策略规避
 - **P2.6 步1：Ask/Answer 基建 + TOFU 试点（系统消息区域）**：
   - **ConfirmMode 三态**替换 interactive bool（lineio.rs）：Interactive（CLI 终端文字提示）/
     **Ask（GUI Channel：发 UiEvent::Ask 系统消息卡片 + 照常读行）**/ Auto（管道 e2e 自动语义，

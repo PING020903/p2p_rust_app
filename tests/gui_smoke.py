@@ -201,6 +201,43 @@ def main() -> int:
             return 6
         print("[4/4] /list 回显 + ui trace 断言通过")
 
+    # 4.5) 备份助记词链路冒烟：侧栏按钮 → BackupPassword 密码卡片 → 解锁 → MnemonicShow 卡片
+    time.sleep(1.0)
+    backup_btn = find("备份助记词")
+    if backup_btn is None:
+        print("FAIL：未找到 备份助记词 按钮")
+        return 9
+    click(backup_btn)
+    time.sleep(1.0)
+    if not wait_log_contains(runtime_log, "kind=BackupPassword"):
+        print("FAIL：BackupPassword Ask 未触发（runtime.log 无 event=ask）")
+        return 9
+    # UIA 树可能有多个 Edit（accesskit 残留 + 新卡片）——逐个点击粘贴：
+    # 真实卡片的 Edit 是最后一个获得焦点的（残留在 UIA 树里但无实际焦点响应），随后单次解锁
+    time.sleep(1.0)
+    edits = [e for e in win.descendants(control_type="Edit") if e.element_info.enabled]
+    if not edits:
+        print("FAIL：无可用的 Edit 控件")
+        return 9
+    for e in reversed(edits):
+        e.click_input()
+        time.sleep(0.3)
+        pyperclip.copy(args.password)
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(0.2)
+    unlock = find("解锁")
+    if unlock is None:
+        print("FAIL：密码卡片无 解锁 按钮")
+        return 9
+    click(unlock)
+    if not wait_log_contains(log, "你的身份助记词", timeout=8):
+        print("FAIL：解锁后未见助记词输出")
+        return 9
+    if not wait_log_contains(runtime_log, "event=mnemonic_show"):
+        print("FAIL：MnemonicShow 事件未触发")
+        return 9
+    print("[4.5/5] 备份助记词链路断言通过（Ask 卡片→解锁→MnemonicShow）")
+
     if args.contact:
         el = find(args.contact, types=("Text", "ListItem", "Button"))
         if el is None:

@@ -115,6 +115,10 @@ pub struct GuiApp {
     add_form: AddForm,
     /// 引擎等待作答的 Ask（单飞行；系统消息区域渲染卡片，答案经 Line 回程）
     pending_ask: Option<crate::uievent::AskRequest>,
+    /// 系统消息卡片上的行内输入（BackupPassword 密码框等；提交后清空）
+    ask_input: String,
+    /// 助记词展示卡片（MnemonicShow 事件；[我已保存] 关闭）
+    mnemonic_show: Option<String>,
     /// 首帧标记：自动聚焦输入框
     first_frame: bool,
     /// 耗时统计
@@ -187,6 +191,8 @@ impl GuiApp {
             my_addrs: Vec::new(),
             add_form: AddForm::default(),
             pending_ask: None,
+            ask_input: String::new(),
+            mnemonic_show: None,
             first_frame: true,
             stats: timing::TimingStats::default(),
             runtime,
@@ -356,7 +362,15 @@ impl eframe::App for GuiApp {
                             "event=ask id={} kind={:?} secret={}",
                             req.id, req.kind, req.secret
                         ));
+                        self.ask_input.clear();
                         self.pending_ask = Some(req);
+                    }
+                    // 助记词展示卡片（/backup 解锁成功；关门前可复制）
+                    crate::uievent::EngineOut::Event(crate::uievent::UiEvent::MnemonicShow {
+                        phrase,
+                    }) => {
+                        self.ui_trace("event=mnemonic_show");
+                        self.mnemonic_show = Some(phrase);
                     }
                 }
                 ctx.request_repaint();
@@ -616,6 +630,29 @@ impl eframe::App for GuiApp {
                                     }
                                 });
                             }
+                            crate::uievent::AskKind::BackupPassword => {
+                                ui.label(
+                                    egui::RichText::new("备份助记词：输入密码解锁 keystore")
+                                        .strong(),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.label("密码");
+                                    let resp = ui.add(
+                                        egui::TextEdit::singleline(&mut self.ask_input)
+                                            .password(true)
+                                            .desired_width(240.0),
+                                    );
+                                    let enter = resp.lost_focus()
+                                        && ui
+                                            .ctx()
+                                            .input(|i| i.key_pressed(egui::Key::Enter));
+                                    if (ui.button("解锁").clicked() || enter)
+                                        && !self.ask_input.is_empty()
+                                    {
+                                        answered = Some("submit");
+                                    }
+                                });
+                            }
                         }
                     });
                 if answered.is_some() {
@@ -628,11 +665,69 @@ impl eframe::App for GuiApp {
                 ui.add_space(2.0);
             }
             if let Some(ans) = answered {
-                self.interact
-                    .log(Level::Info, "user", format!("系统消息作答: {ans}"));
+                let is_submit = ans == "submit";
+                self.ui_trace(format!(
+                    "event=answer id={} action={}",
+                    self.pending_ask.as_ref().map(|a| a.id).unwrap_or(0),
+                    if is_submit { "submit_password" } else { ans }
+                ));
+                self.interact.log(
+                    Level::Info,
+                    "user",
+                    if is_submit {
+                        "系统消息作答: (密码已提交)".to_string()
+                    } else {
+                        format!("系统消息作答: {ans}")
+                    },
+                );
                 self.input_sent_at = Some(Instant::now());
-                self.send_input(InputMsg::Line(ans.to_string()));
+                let line = if is_submit {
+                    std::mem::take(&mut self.ask_input)
+                } else {
+                    ans.to_string()
+                };
+                self.send_input(InputMsg::Line(line));
                 self.pending_ask = None;
+            }
+
+            // 助记词展示卡片（/backup 解锁成功；大字 + 复制 + 显式关闭）
+            if let Some(phrase) = &self.mnemonic_show {
+                let mut close = false;
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::from_rgb(64, 40, 24))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::symmetric(10, 7))
+                    .show(ui, |ui| {
+                        ui.set_max_width(ui.available_width());
+                        ui.colored_label(
+                            egui::Color32::from_rgb(240, 200, 90),
+                            "⚠ 你的身份助记词（12 词，唯一备份；丢失即永久丢失身份，泄露即身份被窃取）",
+                        );
+                        // 只读展示（每帧用副本渲染，内容可选中复制且不回写状态）
+                        let mut display = phrase.clone();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut display)
+                                .desired_rows(2)
+                                .desired_width(ui.available_width() - 20.0)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.button("复制").clicked() {
+                                ui.ctx().copy_text(phrase.clone());
+                                self.ui_trace(format!(
+                                    "event=copy kind=mnemonic chars={}",
+                                    phrase.chars().count()
+                                ));
+                            }
+                            if ui.button("我已保存，关闭").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+                if close {
+                    self.mnemonic_show = None;
+                }
+                ui.add_space(2.0);
             }
 
             // 滚动输出区（最新自动滚底）：系统行 + 聊天气泡混排
@@ -752,6 +847,12 @@ fn render_sidebar(
             };
             ui.label(egui::RichText::new(badge).small().color(color));
         });
+    }
+
+    // 备份助记词入口（→ Control::Backup：Ask 模式弹密码卡片，解锁后 MnemonicShow 展示）
+    ui.separator();
+    if ui.button("备份助记词").clicked() {
+        action = Some(InputMsg::Control(Control::Backup));
     }
 
     // 已发现节点（未握手）：mDNS 发现 / 添加联系人后立即可见，点击即拨号聚焦
