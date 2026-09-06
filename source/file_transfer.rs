@@ -168,7 +168,7 @@ pub async fn on_file_offer(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<
         return false;
     };
     let name = sanitize_file_name(&p.name);
-    let accept = if ctx.interactive {
+    let accept = if ctx.mode.is_interactive() {
         println!(
             "{}",
             format!("收到文件: {name}（{} 字节，来自 {from}），保存到 downloads/ ？(y/n)", p.size)

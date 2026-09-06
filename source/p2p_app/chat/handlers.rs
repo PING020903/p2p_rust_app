@@ -1,11 +1,11 @@
-//! chat 业务语义 handler（注册到 SignalRegistry）：hello/bye/chat.text/trust/群事件。
+﻿//! chat 业务语义 handler（注册到 SignalRegistry）：hello/bye/chat.text/trust/群事件。
 
 use std::collections::HashMap;
 
 use colored::Colorize;
 use libp2p::PeerId;
 
-use crate::lineio::LineSource;
+use crate::lineio::{ConfirmMode, LineSource};
 use crate::p2p::identity_service::{IdentityService, TextTag};
 use crate::p2p::seam;
 use crate::p2p_app::chat::ctx::Conversation;
@@ -26,7 +26,7 @@ pub(crate) struct AppCtx<'a> {
     pub(crate) groups: &'a mut HashMap<String, Group>,
     pub(crate) focused: &'a mut Option<PeerId>,
     pub(crate) input: &'a mut LineSource,
-    pub(crate) interactive: bool,
+    pub(crate) mode: ConfirmMode,
     pub(crate) cmd_tx: &'a tokio::sync::mpsc::Sender<seam::Cmd>,
     pub(crate) file: &'a mut crate::file_transfer::FileTransferState,
 }
@@ -52,7 +52,7 @@ pub(crate) async fn on_peer_hello_signal(
     let conversations = &mut *ctx.conversations;
     let ok = ctx
         .identity
-        .handle_peer_hello(ctx.input, ctx.interactive, from, &name, |peer, name| {
+        .handle_peer_hello(ctx.input, ctx.mode, from, &name, |peer, name| {
             let conv = conversations.entry(*peer).or_insert_with(Conversation::new);
             conv.name = name.to_string();
             println!("{}", format!("对方已上线: {name}").green());

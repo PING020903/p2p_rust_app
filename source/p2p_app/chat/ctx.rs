@@ -1,11 +1,11 @@
-//! 会话上下文：命令树/Control/发送路径共用的可变状态束 + 异步动作队列。
+﻿//! 会话上下文：命令树/Control/发送路径共用的可变状态束 + 异步动作队列。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use colored::Colorize;
 use libp2p::{Multiaddr, PeerId};
 
-use crate::lineio::LineSource;
+use crate::lineio::{ConfirmMode, LineSource};
 use crate::p2p::identity_service::IdentityService;
 use crate::p2p::seam;
 use crate::p2p_app::chat::group::Group;
@@ -26,7 +26,7 @@ pub(crate) struct ChatCtx<'a> {
     pub(crate) identity: &'a mut IdentityService,
     pub(crate) cmd_tx: &'a tokio::sync::mpsc::Sender<seam::Cmd>,
     pub(crate) input: &'a mut LineSource,
-    pub(crate) interactive: bool,
+    pub(crate) mode: ConfirmMode,
     pub(crate) conversations: &'a mut HashMap<PeerId, Conversation>,
     pub(crate) groups: &'a mut HashMap<String, Group>,
     pub(crate) focused: &'a mut Option<PeerId>,
@@ -65,7 +65,7 @@ pub(crate) fn make_chat_ctx<'a>(
     identity: &'a mut IdentityService,
     cmd_tx: &'a tokio::sync::mpsc::Sender<seam::Cmd>,
     input: &'a mut LineSource,
-    interactive: bool,
+    mode: ConfirmMode,
     conversations: &'a mut HashMap<PeerId, Conversation>,
     groups: &'a mut HashMap<String, Group>,
     focused: &'a mut Option<PeerId>,
@@ -78,7 +78,7 @@ pub(crate) fn make_chat_ctx<'a>(
         identity,
         cmd_tx,
         input,
-        interactive,
+        mode,
         conversations,
         groups,
         focused,
@@ -101,7 +101,7 @@ pub(crate) async fn consume_ops(ctx: &mut ChatCtx<'_>) {
                 }
             }
             AsyncOp::Backup => {
-                if let Err(e) = ctx.identity.backup(ctx.input, ctx.interactive).await {
+                if let Err(e) = ctx.identity.backup(ctx.input, ctx.mode).await {
                     eprintln!("{}", format!("备份失败: {e}").red());
                 }
             }

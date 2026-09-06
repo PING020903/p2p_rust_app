@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::fmt::Display;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::uievent::{EngineOut, UiEvent};
+use crate::uievent::{AskRequest, EngineOut, UiEvent};
 
 /// 输出通道 + 可选唤醒回调（GUI 引擎线程专用；CLI 不安装 → std 回落）
 struct SinkChannel {
@@ -105,4 +105,9 @@ pub fn event(e: UiEvent) {
         }
     });
     notify_sent();
+}
+
+/// 引擎等待 GUI 作答的 Ask 请求（事件模式外为 no-op；单飞行——同一时刻最多一个）
+pub fn ask(req: AskRequest) {
+    event(UiEvent::Ask(req));
 }

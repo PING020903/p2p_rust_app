@@ -1,4 +1,4 @@
-//! CLI 文本登录流程：菜单（缓存解锁 / 新身份 / 助记词恢复）产出 `LoginOutcome`，
+﻿//! CLI 文本登录流程：菜单（缓存解锁 / 新身份 / 助记词恢复）产出 `LoginOutcome`，
 //! 再经 `IdentityService::login_pre` 建立会话（影子探测防同 ID 双在线）。
 //!
 //! 自 L2 迁出的应用层交互流程——提示文案与重试语义保持逐字节不变（e2e 兜底）。
@@ -10,7 +10,7 @@ use colored::Colorize;
 use crate::p2p::identity::{
     generate_mnemonic, keypair_from_mnemonic, load_keystores, IdentityInfo, LoginOutcome,
 };
-use crate::lineio::LineSource;
+use crate::lineio::{ConfirmMode, LineSource};
 use crate::p2p::identity_service::{
     normalize_gender, print_mnemonic_guide, IdentityService, LoginError,
 };
@@ -26,10 +26,10 @@ const MNEMONIC_CONFIRM_WORDS: usize = 3;
 /// ID 冲突（同 ID 双在线）打印提示后回菜单重试，与原 L2 文本路径行为一致。
 pub async fn run(
     src: &mut LineSource,
-    interactive: bool,
+    mode: ConfirmMode,
 ) -> Result<IdentityService, Box<dyn Error>> {
     loop {
-        let outcome = login_menu(src, interactive).await?;
+        let outcome = login_menu(src, mode).await?;
         match IdentityService::login_pre(outcome).await {
             Ok(svc) => return Ok(svc),
             Err(LoginError::IdInUse(addr)) => {
@@ -51,7 +51,7 @@ pub async fn run(
 /// 新身份与恢复都会自动加密保存 keystore。
 async fn login_menu(
     src: &mut LineSource,
-    interactive: bool,
+    mode: ConfirmMode,
 ) -> Result<LoginOutcome, Box<dyn Error>> {
     loop {
         let cached = load_keystores();
@@ -93,7 +93,7 @@ async fn login_menu(
                 }
                 eprintln!("{}", "确认词不匹配，请重新抄写".yellow());
             };
-            let password = prompt_password(src, interactive).await?;
+            let password = prompt_password(src, mode).await?;
             return persist_identity(info, &phrase, &password).map_err(Into::into);
         } else if input == "r" {
             // 从助记词恢复身份（跨设备迁移 / 备份恢复）
@@ -104,13 +104,13 @@ async fn login_menu(
                 continue;
             };
             let info = prompt_profile(src).await?;
-            let password = prompt_password(src, interactive).await?;
+            let password = prompt_password(src, mode).await?;
             return persist_identity(info, &phrase, &password).map_err(Into::into);
         } else if let Ok(n) = input.parse::<usize>() {
             if n >= 1 && n <= cached.len() {
                 // 缓存解锁：密码错误最多重试 3 次（规则校验黄色提示，其余错误红色——文案不变）
                 for _ in 0..3 {
-                    let password = src.prompt_secret(interactive, "密码: ").await?;
+                    let password = src.prompt_secret(mode, "密码: ").await?;
                     if let Err(reason) = validate_password(&password) {
                         eprintln!("{}", reason.yellow());
                         continue;
@@ -163,10 +163,10 @@ async fn prompt_profile(src: &mut LineSource) -> Result<IdentityInfo, Box<dyn Er
 /// 交互收集并校验密码（规则来自共享内核）
 async fn prompt_password(
     src: &mut LineSource,
-    interactive: bool,
+    mode: ConfirmMode,
 ) -> Result<String, Box<dyn Error>> {
     loop {
-        let pwd = src.prompt_secret(interactive, "密码: ").await?;
+        let pwd = src.prompt_secret(mode, "密码: ").await?;
         match validate_password(&pwd) {
             Ok(pwd) => return Ok(pwd),
             Err(reason) => eprintln!("{}", reason.yellow()),

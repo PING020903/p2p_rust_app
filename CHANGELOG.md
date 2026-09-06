@@ -9,6 +9,19 @@
 
 ### 新增
 
+- **P2.6 步1：Ask/Answer 基建 + TOFU 试点（系统消息区域）**：
+  - **ConfirmMode 三态**替换 interactive bool（lineio.rs）：Interactive（CLI 终端文字提示）/
+    **Ask（GUI Channel：发 UiEvent::Ask 系统消息卡片 + 照常读行）**/ Auto（管道 e2e 自动语义，
+    **零变化**）——GUI 确认交互从"自动放行"升级为"显式作答"
+  - **TOFU 试点**（identity_service on_peer_hello）：首次接触在 GUI 弹系统消息卡片
+    （指纹/节点ID + [信任并记录]/[仅记录不信任]），堵住"GUI 新联系人无指纹核对自动信任"的安全缺口；
+    拒绝语义与 CLI 一致（记录为未信任，可经侧栏按钮升级）
+  - **答案回程零新协议**：卡片按钮 → InputMsg::Line("y"/"n") → 引擎 next_raw_line 照常读
+    （登录页已验证模式）；引擎单飞行，L1 心跳不受 handler 等待影响
+  - **GUI 系统消息区域**（时间线上方固定区）：pending Ask 卡片渲染；pending 期间底部
+    输入框/命令框/快捷按钮禁用（防聊天文本被当答案吞掉）；AskRequest secret 答案
+    trace 打码（不落明文）
+  - trace：event=ask（id/kind/secret）、event=answer（id/action）
 - **P2.5 D：chat.rs（2483 行）迁入 p2p_app/chat/ 12 模块（三步纯搬家）**：
   - 步1 叶子域：payloads.rs（TAG×5+载荷×5）/ group.rs（群域+持久化）/ dial.rs（地址解析，
     10 单测随迁）

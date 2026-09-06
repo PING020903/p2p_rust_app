@@ -11,6 +11,33 @@ use libp2p::PeerId;
 /// 输入行迭代器（input 被管道接管时逐行读取）
 pub type StdinLines = tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>;
 
+/// 交互确认三态：同一交互点在不同前端下的语义。
+/// - `Interactive`：CLI 终端——文字提示 + 读行（rpassword 等）
+/// - `Ask`：GUI（Channel 源）——发 `UiEvent::Ask` 弹系统消息卡片 + 照常读行（答案经 InputMsg::Line 回程）
+/// - `Auto`：Stdin 管道（e2e/脚本）——自动放行（TOFU accept-new / 文件自动接收），e2e 语义零变化
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmMode {
+    Interactive,
+    Ask,
+    Auto,
+}
+
+impl ConfirmMode {
+    /// 由输入源判定：Stdin 终端=Interactive；Stdin 管道=Auto；Channel（GUI）=Ask
+    pub fn of(src: &LineSource, stdin_is_terminal: bool) -> Self {
+        match src {
+            LineSource::Channel(_) => ConfirmMode::Ask,
+            LineSource::Stdin(_) if stdin_is_terminal => ConfirmMode::Interactive,
+            LineSource::Stdin(_) => ConfirmMode::Auto,
+        }
+    }
+
+    /// 密码类读取是否走不回显终端输入（仅 CLI 交互终端）
+    pub fn is_interactive(self) -> bool {
+        self == ConfirmMode::Interactive
+    }
+}
+
 /// 统一输入消息：
 /// - `Line`：CLI 语义行——按 `/` 前缀分流（命令树 vs 文本消息），终端/管道逐行产出
 /// - `ChatText`：GUI 文本框的纯聊天文本——**绕过命令解析**直接发送到当前焦点（多行原样）
@@ -118,13 +145,13 @@ impl LineSource {
             .ok_or_else(|| -> Box<dyn Error> { "输入结束".into() })
     }
 
-    /// 带提示符读取密码：交互终端不回显（rpassword）；管道环境（测试/脚本）退回行读取
+    /// 带提示符读取密码：交互终端不回显（rpassword）；Ask/管道模式退回行读取
     pub async fn prompt_secret(
         &mut self,
-        interactive: bool,
+        mode: ConfirmMode,
         prompt: &str,
     ) -> Result<String, Box<dyn Error>> {
-        if interactive {
+        if mode.is_interactive() {
             Ok(rpassword::prompt_password(prompt)?)
         } else {
             self.prompt(prompt).await

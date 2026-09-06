@@ -10,7 +10,7 @@ use colored::Colorize;
 use libp2p::{Multiaddr, PeerId};
 
 use crate::cmd_tree::CmdError;
-use crate::lineio::{InputMsg, LineSource};
+use crate::lineio::{ConfirmMode, InputMsg, LineSource};
 use crate::p2p::identity::LoginOutcome;
 use crate::p2p::identity_service::{is_l2_signal, IdentityService, TextTag};
 use crate::p2p::seam::{self, Event, SignalRegistry, BYE_HANDSHAKE_TIMEOUT};
@@ -100,7 +100,7 @@ async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
             };
             // D3：未互信联系人首次发消息确认（仅交互终端；管道/e2e 自动放行）
             if !ctx.identity.effective_trusted(&p) {
-                if ctx.interactive && !ctx.conversations[&p].send_confirmed {
+                if ctx.mode == ConfirmMode::Interactive && !ctx.conversations[&p].send_confirmed {
                     println!(
                         "{}",
                         format!("对方 {who} 未互信（需双方 /trust），确认发送？(y/n)").yellow()
@@ -114,7 +114,7 @@ async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
                         return;
                     }
                     ctx.conversations.get_mut(&p).unwrap().send_confirmed = true;
-                } else if !ctx.interactive {
+                } else if ctx.mode != ConfirmMode::Interactive {
                     println!("{}", format!("对方 {who} 未信任，消息仍已发送").yellow());
                 }
             }
@@ -165,17 +165,15 @@ pub fn run() {
 }
 
 pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Result<(), Box<dyn Error>> {
-    // 交互语义按输入源判定：Stdin 终端=交互（rpassword/y 确认）；Stdin 管道与 GUI 通道=管道语义
-    let interactive = match &input {
-        LineSource::Stdin(_) => std::io::stdin().is_terminal(),
-        LineSource::Channel(_) => false,
-    };
+    // 交互确认三态：Stdin 终端=Interactive（文字提示）；Stdin 管道=Auto（e2e 自动语义）；
+    // Channel（GUI）=Ask（系统消息卡片 + InputMsg::Line 回程）
+    let mode = ConfirmMode::of(&input, std::io::stdin().is_terminal());
 
     // L2 身份基础：GUI 表单凭据直建会话（影子探测防同 ID 双在线），
     // 或 CLI 文本登录菜单产出凭据 → login_pre + 联系人簿（TOFU）
     let mut identity = match pre {
         Some(outcome) => IdentityService::login_pre(outcome).await?,
-        None => crate::p2p_app::chat::cli::login::run(&mut input, interactive).await?,
+        None => crate::p2p_app::chat::cli::login::run(&mut input, mode).await?,
     };
     let discovery_mode = load_discovery_mode(identity.my_id());
     println!(
@@ -295,7 +293,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                     // 结构化控制动作（GUI 点击/按钮）：不经命令文本解析，复刻对应命令逻辑
                     Some(InputMsg::Control(c)) => {
                         let mut ctx = make_chat_ctx(
-                            &mut identity, &cmd_tx, &mut input, interactive,
+                            &mut identity, &cmd_tx, &mut input, mode,
                             &mut conversations, &mut groups, &mut focused, &mut focused_group,
                             &connected, &mut registered, &mut file_state,
                         );
@@ -309,7 +307,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                         let text = text.trim();
                         if !text.is_empty() {
                             let mut ctx = make_chat_ctx(
-                                &mut identity, &cmd_tx, &mut input, interactive,
+                                &mut identity, &cmd_tx, &mut input, mode,
                                 &mut conversations, &mut groups, &mut focused, &mut focused_group,
                                 &connected, &mut registered, &mut file_state,
                             );
@@ -332,7 +330,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                 if let Some((mut buf, mut remaining)) = sendstrings.take() {
                     if let Some(content) = collect_multiline(&mut buf, &mut remaining, &line) {
                         let mut ctx = make_chat_ctx(
-                            &mut identity, &cmd_tx, &mut input, interactive,
+                            &mut identity, &cmd_tx, &mut input, mode,
                             &mut conversations, &mut groups, &mut focused, &mut focused_group,
                             &connected, &mut registered, &mut file_state,
                         );
@@ -384,7 +382,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                     // 指令树每行重建（无状态 builder，开销可忽略）：其 `ChatCtx<'a>` 生命周期
                     // 随本次处理结束释放，借用不跨 select 迭代存活。
                     let mut ctx = make_chat_ctx(
-                        &mut identity, &cmd_tx, &mut input, interactive,
+                        &mut identity, &cmd_tx, &mut input, mode,
                         &mut conversations, &mut groups, &mut focused, &mut focused_group,
                         &connected, &mut registered, &mut file_state,
                     );
@@ -412,7 +410,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                 }
                 // 非命令：作为消息发送给当前聊天对象（与 /sendStrings 共用同一发送逻辑）
                 let mut ctx = make_chat_ctx(
-                    &mut identity, &cmd_tx, &mut input, interactive,
+                    &mut identity, &cmd_tx, &mut input, mode,
                     &mut conversations, &mut groups, &mut focused, &mut focused_group,
                     &connected, &mut registered, &mut file_state,
                 );
@@ -524,7 +522,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                         groups: &mut groups,
                                         focused: &mut focused,
                                         input: &mut input,
-                                        interactive,
+                                        mode,
                                         cmd_tx: &cmd_tx,
                                         file: &mut file_state,
                                     };
@@ -539,7 +537,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                     groups: &mut groups,
                                     focused: &mut focused,
                                     input: &mut input,
-                                    interactive,
+                                    mode,
                                     cmd_tx: &cmd_tx,
                                     file: &mut file_state,
                                 };

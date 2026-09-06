@@ -1,4 +1,4 @@
-//! L2 身份基础服务：身份会话（登录/影子探测/keystore）、联系人簿（TOFU）、
+﻿//! L2 身份基础服务：身份会话（登录/影子探测/keystore）、联系人簿（TOFU）、
 //! 信任判定、Hello/Bye 存在处理。供 L3 业务与文件传输等多协议复用。
 //!
 //! 与聊天协议无关——`IdentityService` 不感知 Frame/群/会话，只回答
@@ -12,7 +12,8 @@ use super::contacts::{fingerprint_of, ContactBook, ContactEntry};
 use super::identity::{
     decrypt_mnemonic, load_keystores, probe_duplicate_id, probe_window, IdentityInfo, LoginOutcome,
 };
-use crate::lineio::LineSource;
+use crate::lineio::{ConfirmMode, LineSource};
+use crate::uievent::AskRequest;
 
 /// L2 内化信号枚举：hello/bye/trust 同一组，仅 L2 认识，L3 业务不触碰。
 /// `Frame.text` 线缆仍是字符串，应用侧用 `from_str`/`as_str` 与本枚举互转，
@@ -184,37 +185,62 @@ impl IdentityService {
             .unwrap_or_else(|| fingerprint_of(peer))
     }
 
-    /// 对方上线（Hello）的存在处理：首次接触做 TOFU 指纹核对（交互终端人工确认、
-    /// 管道环境按 SSH accept-new 语义自动信任），更新联系人名字与最近见时间；
+    /// 对方上线（Hello）的存在处理：首次接触做 TOFU 指纹核对（三态：
+    /// Interactive=终端人工确认 / **Ask=发 UiEvent::Ask 弹系统消息卡片 + 读行** /
+    /// Auto=管道按 SSH accept-new 语义自动信任），更新联系人名字与最近见时间；
     /// 已存在联系人保持既有信任状态（OR 合并，不会降级）。
     pub async fn on_peer_hello(
         &mut self,
         src: &mut LineSource,
-        interactive: bool,
+        mode: ConfirmMode,
         peer: &PeerId,
         name: &str,
     ) -> Result<(), Box<dyn Error>> {
         let pid = peer.to_string();
         if self.contacts.get(&pid).is_none() {
-            if interactive {
-                println!("{}", "首次连接，请核对对方身份指纹:".yellow());
-                println!("  指纹: {}", fingerprint_of(peer).dimmed());
-                println!("  节点ID: {pid}");
-                let ans = src.prompt("是否信任该节点（记录为联系人）? (y/n): ").await?;
-                let trusted = ans.trim().eq_ignore_ascii_case("y");
-                self.contacts.ensure_contact(peer, name, trusted);
-                if trusted {
-                    println!("{}", format!("已记录并信任: {name}").green());
-                } else {
-                    println!("{}", format!("已记录但未信任: {name}").yellow());
+            match mode {
+                ConfirmMode::Interactive => {
+                    println!("{}", "首次连接，请核对对方身份指纹:".yellow());
+                    println!("  指纹: {}", fingerprint_of(peer).dimmed());
+                    println!("  节点ID: {pid}");
+                    let ans = src.prompt("是否信任该节点（记录为联系人）? (y/n): ").await?;
+                    self.tofu_apply(peer, name, &ans);
                 }
-            } else {
-                self.contacts.ensure_contact(peer, name, true);
+                ConfirmMode::Ask => {
+                    // GUI：发系统消息卡片（答案经 InputMsg::Line 回程，与 CLI 同构）
+                    let req = AskRequest {
+                        id: crate::uievent::next_ask_id(),
+                        kind: crate::uievent::AskKind::TofuConfirm {
+                            peer_id: pid.clone(),
+                            name: name.to_string(),
+                            fingerprint: fingerprint_of(peer),
+                        },
+                        secret: false,
+                    };
+                    crate::sink::ask(req);
+                    let ans = src.next_raw_line().await.unwrap_or_default();
+                    self.tofu_apply(peer, name, &ans);
+                }
+                ConfirmMode::Auto => {
+                    // SSH accept-new：管道/e2e 自动信任（自愈补发机制兜底对称同步）
+                    self.contacts.ensure_contact(peer, name, true);
+                }
             }
         } else {
             self.contacts.ensure_contact(peer, name, false);
         }
         Ok(())
+    }
+
+    /// TOFU 答案落地：y=信任并记录 / 其余=记录但未信任（后续可经侧栏信任按钮升级）
+    fn tofu_apply(&mut self, peer: &PeerId, name: &str, ans: &str) {
+        let trusted = ans.trim().eq_ignore_ascii_case("y");
+        self.contacts.ensure_contact(peer, name, trusted);
+        if trusted {
+            println!("{}", format!("已记录并信任: {name}").green());
+        } else {
+            println!("{}", format!("已记录但未信任: {name}").yellow());
+        }
     }
 
     /// 对方主动下线（Bye）的存在处理：记录最近见时间；返回是否已知联系人
@@ -231,7 +257,7 @@ impl IdentityService {
     pub async fn handle_peer_hello<H>(
         &mut self,
         src: &mut LineSource,
-        interactive: bool,
+        mode: ConfirmMode,
         peer: &PeerId,
         name: &str,
         mut on_hello: H,
@@ -239,7 +265,7 @@ impl IdentityService {
     where
         H: FnMut(&PeerId, &str),
     {
-        self.on_peer_hello(src, interactive, peer, name).await?;
+        self.on_peer_hello(src, mode, peer, name).await?;
         on_hello(peer, name);
         Ok(())
     }
@@ -258,7 +284,7 @@ impl IdentityService {
     pub async fn backup(
         &mut self,
         src: &mut LineSource,
-        interactive: bool,
+        mode: ConfirmMode,
     ) -> Result<(), Box<dyn Error>> {
         let stored = load_keystores();
         if let Some((ks, _)) = stored
@@ -266,7 +292,7 @@ impl IdentityService {
             .find(|(k, _)| k.peer_id == self.my_id.to_string())
         {
             println!("{}", "请输入密码以解锁本身份".yellow());
-            let password = src.prompt_secret(interactive, "密码: ").await?;
+            let password = src.prompt_secret(mode, "密码: ").await?;
             match decrypt_mnemonic(
                 &password,
                 &ks.salt,
@@ -473,7 +499,7 @@ mod tests {
             LineSource::Stdin(tokio::io::BufReader::new(tokio::io::stdin()).lines());
         // hello 钩子触发 + 收到名字
         let mut hello_calls: Vec<(String, String)> = Vec::new();
-        svc.handle_peer_hello(&mut input, false, &peer, "bob", |p, n| {
+        svc.handle_peer_hello(&mut input, ConfirmMode::Auto, &peer, "bob", |p, n| {
             hello_calls.push((p.to_string(), n.to_string()));
         })
         .await

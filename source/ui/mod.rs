@@ -113,6 +113,8 @@ pub struct GuiApp {
     my_addrs: Vec<String>,
     /// 添加联系人表单（侧栏折叠面板；纯 GUI 侧状态）
     add_form: AddForm,
+    /// 引擎等待作答的 Ask（单飞行；系统消息区域渲染卡片，答案经 Line 回程）
+    pending_ask: Option<crate::uievent::AskRequest>,
     /// 首帧标记：自动聚焦输入框
     first_frame: bool,
     /// 耗时统计
@@ -184,6 +186,7 @@ impl GuiApp {
             sidebar: None,
             my_addrs: Vec::new(),
             add_form: AddForm::default(),
+            pending_ask: None,
             first_frame: true,
             stats: timing::TimingStats::default(),
             runtime,
@@ -274,10 +277,20 @@ impl GuiApp {
     /// 发送输入到引擎（通道未就绪时降级为时间线提示）。
     /// 所有出站动作在此统一 trace（触发什么 → 一条 event=send/click 全覆盖）。
     fn send_input(&mut self, msg: InputMsg) {
+        // secret Ask（密码类）的行答案打码——不落明文进日志
+        let masking_secret = self
+            .pending_ask
+            .as_ref()
+            .map(|a| a.secret)
+            .unwrap_or(false);
         let (event, detail) = match &msg {
             InputMsg::Line(l) => (
                 "event=send",
-                format!("kind=line detail={}", l.chars().take(60).collect::<String>()),
+                if masking_secret {
+                    "kind=line detail=***".to_string()
+                } else {
+                    format!("kind=line detail={}", l.chars().take(60).collect::<String>())
+                },
             ),
             InputMsg::ChatText(t) => (
                 "event=send",
@@ -336,6 +349,14 @@ impl eframe::App for GuiApp {
                         if !self.my_addrs.contains(&a) {
                             self.my_addrs.push(a);
                         }
+                    }
+                    // 引擎等待 GUI 作答 → 系统消息区域渲染卡片（单飞行：直接替换）
+                    crate::uievent::EngineOut::Event(crate::uievent::UiEvent::Ask(req)) => {
+                        self.ui_trace(format!(
+                            "event=ask id={} kind={:?} secret={}",
+                            req.id, req.kind, req.secret
+                        ));
+                        self.pending_ask = Some(req);
                     }
                 }
                 ctx.request_repaint();
@@ -442,6 +463,8 @@ impl eframe::App for GuiApp {
         // 底部输入面板先声明 → 先占位，CentralPanel 只拿剩余高度（ScrollArea 不会挤掉输入行）
         egui::Panel::bottom("input").show(ui, |ui| {
             let in_chat = self.child_state == ChildState::Chat;
+            // pending Ask 期间禁用输入——防聊天文本被引擎当作确认答案吞掉
+            let ask_pending = self.pending_ask.is_some();
             ui.add_space(4.0);
 
             // 命令输入行（与文本框分离；guard 拦截穿透命令；提示随状态变化）
@@ -455,7 +478,7 @@ impl eframe::App for GuiApp {
                     .hint_text(hint)
                     .desired_width(ui.available_width() - 260.0)
                     .font(egui::TextStyle::Monospace);
-                let resp = ui.add(edit);
+                let resp = ui.add_enabled(!ask_pending, edit);
                 if self.first_frame && !in_chat {
                     resp.request_focus();
                 }
@@ -480,9 +503,12 @@ impl eframe::App for GuiApp {
                         }
                     }
                 }
-                // 快捷命令（固定白名单，直接透传；仅聊天态有意义）
+                // 快捷命令（固定白名单，直接透传；仅聊天态有意义；pending Ask 期间禁用）
                 for cmd in ["/list", "/q"] {
-                    if ui.add_enabled(in_chat, egui::Button::new(cmd)).clicked() {
+                    if ui
+                        .add_enabled(in_chat && !ask_pending, egui::Button::new(cmd))
+                        .clicked()
+                    {
                         self.interact
                             .log(Level::Info, "user", format!("/cmd: {cmd}"));
                         self.input_sent_at = Some(Instant::now());
@@ -494,20 +520,23 @@ impl eframe::App for GuiApp {
             // 文本框 = 纯聊天文本：ChatText 直进引擎（多行原样、/ 开头也不解析为命令、无协议包装）
             ui.horizontal(|ui| {
                 let edit = egui::TextEdit::multiline(&mut self.input)
-                    .hint_text(if in_chat {
+                    .hint_text(if ask_pending {
+                        "⚠ 请先在上方系统消息区处理请求"
+                    } else if in_chat {
                         "输入消息，回车发送；Shift+回车换行（可粘贴多行文章）"
                     } else {
                         "登录操作请用上方命令框"
                     })
                     .desired_width(ui.available_width() - 88.0)
                     .desired_rows(3);
-                let resp = ui.add_enabled(in_chat, edit);
+                let resp = ui.add_enabled(in_chat && !ask_pending, edit);
                 if self.first_frame && in_chat {
                     resp.request_focus();
                 }
-                let send = ui.add_enabled(in_chat, egui::Button::new("发送"));
+                let send = ui.add_enabled(in_chat && !ask_pending, egui::Button::new("发送"));
                 // 多行下回车不触发 lost_focus，直接按键判断：回车发送（Shift+回车换行）
                 let send_now = in_chat
+                    && !ask_pending
                     && (send.clicked()
                         || ui
                             .ctx()
@@ -554,6 +583,57 @@ impl eframe::App for GuiApp {
                 ui.weak(self.status_line());
             });
             ui.separator();
+
+            // 系统消息区域（时间线上方固定区）：pending Ask 卡片（操作按钮直接在卡片上）
+            let mut answered: Option<&'static str> = None;
+            if let Some(req) = &self.pending_ask {
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::from_rgb(70, 56, 20))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::symmetric(10, 7))
+                    .show(ui, |ui| {
+                        ui.set_max_width(ui.available_width());
+                        ui.colored_label(
+                            egui::Color32::from_rgb(240, 200, 90),
+                            format!("⚠ 系统消息 #{}", req.id),
+                        );
+                        match &req.kind {
+                            crate::uievent::AskKind::TofuConfirm { peer_id, name, fingerprint } => {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "首次连接：{name} 请求记录为联系人"
+                                    ))
+                                    .strong(),
+                                );
+                                ui.weak(format!("指纹 {fingerprint}"));
+                                ui.weak(format!("节点ID {peer_id}"));
+                                ui.horizontal(|ui| {
+                                    if ui.button("信任并记录").clicked() {
+                                        answered = Some("y");
+                                    }
+                                    if ui.button("仅记录不信任").clicked() {
+                                        answered = Some("n");
+                                    }
+                                });
+                            }
+                        }
+                    });
+                if answered.is_some() {
+                    self.ui_trace(format!(
+                        "event=answer id={} action={}",
+                        req.id,
+                        answered.unwrap()
+                    ));
+                }
+                ui.add_space(2.0);
+            }
+            if let Some(ans) = answered {
+                self.interact
+                    .log(Level::Info, "user", format!("系统消息作答: {ans}"));
+                self.input_sent_at = Some(Instant::now());
+                self.send_input(InputMsg::Line(ans.to_string()));
+                self.pending_ask = None;
+            }
 
             // 滚动输出区（最新自动滚底）：系统行 + 聊天气泡混排
             egui::ScrollArea::vertical()

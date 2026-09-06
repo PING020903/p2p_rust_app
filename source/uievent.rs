@@ -82,6 +82,35 @@ pub struct SidebarState {
     pub groups: Vec<GroupView>,
 }
 
+/// Ask 类型：引擎等待 GUI 系统消息卡片作答的请求（逐步扩充；答案经 InputMsg::Line 回程）
+#[derive(Debug, Clone)]
+pub enum AskKind {
+    /// TOFU 首次接触指纹核对（答案 y=信任并记录 / n=仅记录不信任）
+    TofuConfirm {
+        peer_id: String,
+        name: String,
+        fingerprint: String,
+    },
+}
+
+/// Ask 请求：引擎单飞行（同时最多一个）；id 自增防御错位
+#[derive(Debug, Clone)]
+pub struct AskRequest {
+    pub id: u64,
+    pub kind: AskKind,
+    /// true = 答案为密码类（GUI masked 输入、trace 打码）
+    pub secret: bool,
+}
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static ASK_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Ask 请求自增 id（引擎单飞行，id 仅供防御性配对与 trace）
+pub fn next_ask_id() -> u64 {
+    ASK_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 /// 结构化显示事件（随界面功能扩展；文本行永远走 Line，事件只承载结构化语义）
 #[derive(Debug, Clone)]
 pub enum UiEvent {
@@ -89,6 +118,8 @@ pub enum UiEvent {
     Sidebar(SidebarState),
     /// 本机新增一条可分享监听地址（GUI 去重累积、"我的地址"点击复制）
     ListenAddr(String),
+    /// 引擎等待 GUI 作答（系统消息区域渲染卡片；答案经 InputMsg::Line 回程）
+    Ask(AskRequest),
 }
 
 /// 引擎输出统一项：单通道 FIFO 保证 Line 与 Event 的相对顺序
