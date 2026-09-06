@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
 
-use crate::chat::AsyncOp;
+use crate::p2p_app::chat::ctx::AsyncOp;
+use crate::p2p::identity_service::IdentityService;
 use crate::p2p::{cache_dir, seam};
 use crate::p2p_app::chat::payloads::GroupMemberListPayload;
 
@@ -167,6 +168,21 @@ pub(crate) fn next_creator(members: &[String], creator: &str) -> Option<String> 
         .find(|m| *m != creator)
         .or_else(|| members[..pos].iter().find(|m| *m != creator))
         .cloned()
+}
+
+/// 群主标签：`群主 {昵称} ({peerID})`（昵称用 peer_name 解析；解析失败直接显 raw id）
+pub(crate) fn group_owner_label(
+    g: &Group,
+    conversations: &HashMap<PeerId, crate::p2p_app::chat::ctx::Conversation>,
+    identity: &IdentityService,
+) -> String {
+    match g.creator.parse::<PeerId>() {
+        Ok(owner) => format!(
+            "群主 {} ({owner})",
+            crate::p2p_app::chat::ctx::peer_name(&owner, conversations, identity)
+        ),
+        Err(_) => format!("群主 {}", g.creator),
+    }
 }
 
 #[cfg(test)]

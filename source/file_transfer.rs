@@ -1,4 +1,4 @@
-//! L3 文件传输应用：通过 L1 frame 通道的 `file.*` 语义标签在已信任联系人间传文件。
+﻿//! L3 文件传输应用：通过 L1 frame 通道的 `file.*` 语义标签在已信任联系人间传文件。
 //!
 //! 复用语义注册表机制：注册 `file.offer/accept/reject/chunk/ack/finish/complete/abort`
 //! 标签 + async handler，不动核心。发送侧为**事件驱动推送**（accept/ack 事件触发下一块
@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
-use crate::chat::AppCtx;
+use crate::p2p_app::chat::handlers::AppCtx;
 use crate::p2p::seam;
 use crate::p2p::settings;
 
@@ -494,7 +494,7 @@ async fn send_signal<T: Serialize>(
 /// 后续块由 accept/ack 事件驱动推送（drive_sender），不用后台任务。
 pub fn start_send(
     state: &mut FileTransferState,
-    ops: &mut VecDeque<crate::chat::AsyncOp>,
+    ops: &mut VecDeque<crate::p2p_app::chat::ctx::AsyncOp>,
     peer: PeerId,
     path: &Path,
 ) -> Result<(), String> {
@@ -528,7 +528,7 @@ pub fn start_send(
         size,
     })
     .map_err(|e| format!("序列化失败: {e}"))?;
-    ops.push_back(crate::chat::AsyncOp::Cmd(seam::Cmd::Send {
+    ops.push_back(crate::p2p_app::chat::ctx::AsyncOp::Cmd(seam::Cmd::Send {
         peer,
         tag: TAG_FILE_OFFER.to_string(),
         payload: Some(offer),
