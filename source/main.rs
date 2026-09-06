@@ -122,7 +122,7 @@ struct MainCtx {
     quit: bool,
 }
 
-/// 纯 CLI 模式主菜单：计算器 / 学生信息 / 彩色打印 / P2P 聊天 / 清除会话日志
+/// 纯 CLI 模式主菜单：计算器 / 学生信息 / 彩色打印 / P2P 聊天 / 清除会话日志 / 清除联系人缓存
 fn run_cli() {
     use cmd_tree::{CmdError, CmdTree, ROOT};
     use colored::Colorize;
@@ -142,6 +142,8 @@ fn run_cli() {
     tree.set_help(c4, "P2P 聊天");
     let c5 = tree.register(ROOT, "5", |_, _| clear_logs_menu());
     tree.set_help(c5, "清除会话日志（gui_logs/，保留最近 1 次；不影响身份/联系人/群）");
+    let c6 = tree.register(ROOT, "6", |_, _| clear_contacts_menu());
+    tree.set_help(c6, "清除联系人缓存（contacts_*.json，TOFU 信任态重置；不影响身份/群）");
     let cq = tree.register(ROOT, "q", |ctx, _| ctx.quit = true);
     tree.set_help(cq, "退出");
     let c_q_upper = tree.register(ROOT, "Q", |ctx, _| ctx.quit = true);
@@ -156,6 +158,7 @@ fn run_cli() {
         println!("  3. 彩色打印演示");
         println!("  4. P2P 聊天");
         println!("  5. 清除会话日志");
+        println!("  6. 清除联系人缓存");
         println!("  q. 退出");
         print!("{}", "> ".green());
         io::stdout().flush().unwrap();
@@ -197,6 +200,67 @@ fn simulate_code_execution() {
     // 模拟步骤3
     crate::debug_print!("步骤3: 保存结果");
     color_print::print_success("任务执行完成！");
+}
+
+/// 清除联系人缓存菜单入口：列出 contacts_*.json → 选序号/全清 → y/n 确认 → 删除。
+/// 只删联系人簿（TOFU 信任态/指纹重置），身份 keystore/群缓存/会话日志一律不动。
+fn clear_contacts_menu() {
+    use colored::Colorize;
+    use std::io::{self, Write};
+
+    let files = crate::p2p::contacts::ContactBook::cache_files();
+    if files.is_empty() {
+        println!("{}", "缓存目录无联系人文件（已是干净状态）".dimmed());
+        return;
+    }
+    println!("{}", "=== 清除联系人缓存 ===".cyan());
+    println!("{}", format!("缓存根: {}", crate::p2p::cache_dir().unwrap_or_default().display()).dimmed());
+    for (i, f) in files.iter().enumerate() {
+        // 文件名内嵌节点ID：contacts_<peer_id>.json → 截短展示
+        let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        println!("  {}. {}", i + 1, name);
+    }
+    println!("  0. 全部清除");
+    println!("  q. 取消");
+
+    print!("选择: ");
+    let _ = io::stdout().flush();
+    let mut choice = String::new();
+    if io::stdin().read_line(&mut choice).is_err() {
+        return;
+    }
+    let choice = choice.trim();
+    let targets: Vec<std::path::PathBuf> = match choice {
+        "0" => files.clone(),
+        "q" | "" => return,
+        other => match other.parse::<usize>() {
+            Ok(n) if (1..=files.len()).contains(&n) => vec![files[n - 1].clone()],
+            _ => {
+                println!("{}", "无效选择".yellow());
+                return;
+            }
+        },
+    };
+
+    // 破坏性操作：二次确认
+    print!("将删除 {} 个联系人缓存文件（TOFU 信任态重置，不可恢复），确认？(y/n): ", targets.len());
+    let _ = io::stdout().flush();
+    let mut confirm = String::new();
+    if io::stdin().read_line(&mut confirm).is_err() {
+        return;
+    }
+    if !confirm.trim().eq_ignore_ascii_case("y") {
+        println!("{}", "已取消".dimmed());
+        return;
+    }
+    for f in &targets {
+        let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        if crate::p2p::contacts::ContactBook::clear_cache_file(f) {
+            println!("{}", format!("已删除: {name}").green());
+        } else {
+            eprintln!("{}", format!("删除失败: {name}").red());
+        }
+    }
 }
 
 /// 清除会话日志菜单入口：统计 → 确认 → 保留最近 1 次删除其余。

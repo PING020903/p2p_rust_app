@@ -9,6 +9,13 @@
 
 ### 新增
 
+- **CLI 主菜单"清除联系人缓存"**：
+  - 主菜单新增 6. 清除联系人缓存：列出 cache_dir 下 contacts_*.json → 选序号/全清 →
+    y/n 二次确认 → 删除（TOFU 信任态/指纹重置，hello 重新触发首次接触流程）
+  - contacts.rs 增 `ContactBook::cache_files()`（扫描）/`clear_cache_file()`（删除）+ 单测
+    （只命中 contacts_*.json，群缓存/其它文件不受影响）
+  - 服务 TOFU 卡片等首次接触流程的重复测试（此前默认读缓存无法重测）；仅主菜单入口，
+    不影响身份 keystore/群缓存/会话日志
 - **P2.6 步1：Ask/Answer 基建 + TOFU 试点（系统消息区域）**：
   - **ConfirmMode 三态**替换 interactive bool（lineio.rs）：Interactive（CLI 终端文字提示）/
     **Ask（GUI Channel：发 UiEvent::Ask 系统消息卡片 + 照常读行）**/ Auto（管道 e2e 自动语义，

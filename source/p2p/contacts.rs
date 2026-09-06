@@ -57,6 +57,36 @@ impl ContactBook {
         dir.join(format!("contacts_{my_peer_id}.json"))
     }
 
+    /// 列出缓存目录下的联系人簿文件（contacts_*.json；主菜单"清除联系人缓存"用）。
+    /// 返回按文件名排序的完整路径（文件名内嵌节点ID，即身份）。
+    pub fn cache_files() -> Vec<PathBuf> {
+        let dir = cache_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match std::fs::read_dir(&dir) {
+            Ok(rd) => {
+                let mut out: Vec<PathBuf> = rd
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.is_file()
+                            && p.file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|n| n.starts_with("contacts_") && n.ends_with(".json"))
+                                .unwrap_or(false)
+                    })
+                    .collect();
+                out.sort();
+                out
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// 删除联系人簿文件（TOFU 信任态/指纹缓存重置；删后 hello 重新触发首次接触流程）。
+    /// 返回是否确有文件被删除。
+    pub fn clear_cache_file(path: &PathBuf) -> bool {
+        std::fs::remove_file(path).is_ok()
+    }
+
     pub fn load(my_peer_id: &PeerId) -> ContactBook {
         let path = Self::path_for(my_peer_id);
         let entries = match std::fs::read_to_string(&path) {
@@ -197,6 +227,32 @@ mod tests {
         assert_eq!(fa1, fa2);
         assert_ne!(fa1, fb);
         assert_eq!(fa1.split(':').count(), 16);
+    }
+
+    #[test]
+    fn cache_files_scan_and_clear() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("p2p_contacts_scan_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("P2P_ID_CACHE_DIR", &dir);
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        // 造两个联系人簿 + 一个干扰文件
+        std::fs::write(dir.join("contacts_aa.json"), "[]").unwrap();
+        std::fs::write(dir.join("contacts_bb.json"), "[]").unwrap();
+        std::fs::write(dir.join("groups_aa.json"), "[]").unwrap();
+        std::fs::write(dir.join("other.json"), "{}").unwrap();
+
+        let files = ContactBook::cache_files();
+        assert_eq!(files.len(), 2, "只应命中 contacts_*.json");
+        let first = files[0].clone();
+        assert!(ContactBook::clear_cache_file(&first), "删除应成功");
+        assert!(!first.exists());
+        assert!(!ContactBook::clear_cache_file(&first), "重复删除返回 false");
+        assert_eq!(ContactBook::cache_files().len(), 1);
+        // 群缓存不受影响
+        assert!(dir.join("groups_aa.json").exists());
     }
 
     #[test]
