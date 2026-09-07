@@ -197,12 +197,27 @@ pub fn run() {
 enum PendingConfirm {
     Tofu { peer: PeerId, name: String },
     Backup,
+    /// 文件接收 offer 挂起（at 供接收确认超时判定）
+    FileReceive {
+        from: PeerId,
+        file_id: u64,
+        name: String,
+        size: u64,
+        at: std::time::Instant,
+    },
 }
 
 /// 确认答案（CLI 确认子窗口任务回传；GUI 卡片答案经 input 路由到达同一第二阶段）
 enum ConfirmAnswer {
     Tofu { peer: PeerId, trusted: bool },
     Backup { password: String },
+    FileReceive {
+        from: PeerId,
+        file_id: u64,
+        name: String,
+        size: u64,
+        accepted: bool,
+    },
 }
 
 /// 拉起 CLI TOFU 确认子窗口（CREATE_NEW_CONSOLE；答案以退出码回传：0=信任 / 其它=拒绝）
@@ -270,6 +285,43 @@ fn spawn_secret_window(
         }
     });
 }
+/// 拉起 CLI 文件接收确认子窗口（CREATE_NEW_CONSOLE；答案以退出码回传：0=接收 / 其它=拒绝）
+/// 仅 Windows；非 Windows 退化为主窗口 pending 路由（known boundary）
+#[cfg(windows)]
+fn spawn_file_window(
+    tx: tokio::sync::mpsc::UnboundedSender<ConfirmAnswer>,
+    from: PeerId,
+    file_id: u64,
+    name: String,
+    size: u64,
+) {
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = tokio::spawn(async move {
+        let status = tokio::process::Command::new(exe)
+            .args([
+                "--confirm-file",
+                &from.to_string(),
+                &file_id.to_string(),
+                &name,
+                &size.to_string(),
+            ])
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .status()
+            .await;
+        let accepted = status.map(|s| s.success()).unwrap_or(false);
+        let _ = tx.send(ConfirmAnswer::FileReceive {
+            from,
+            file_id,
+            name,
+            size,
+            accepted,
+        });
+    });
+}
+
 pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Result<(), Box<dyn Error>> {
     // 交互确认三态：Stdin 终端=Interactive（文字提示 + 确认子窗口）；Stdin 管道=Auto（e2e 自动语义）；
     // Channel（GUI）=Ask（系统消息卡片 + InputMsg::Line 回程）
@@ -396,10 +448,23 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
     let mut sendstrings: Option<(String, usize)> = None;
 
     loop {
-        // 定时臂预条件：有等待确认的 offer 时，睡到最早过期时刻（无则该分支禁用）
+        // 定时臂预条件：发送侧有等待确认的 offer，或接收确认挂起中——睡到最早到期时刻
+        // （两者皆无则该分支禁用）
         let offer_expiry = file_state
             .next_offer_expiry()
             .map(tokio::time::Instant::from_std);
+        let confirm_expiry = match &pending_confirm {
+            Some(PendingConfirm::FileReceive { at, .. }) => {
+                Some(tokio::time::Instant::from_std(
+                    *at + crate::p2p_app::file_transfer::OFFER_TIMEOUT,
+                ))
+            }
+            _ => None,
+        };
+        let timer_deadline = match (offer_expiry, confirm_expiry) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         tokio::select! {        // 确认应答臂：CLI 确认子窗口任务回传答案 → 执行第二阶段（不冻结会话循环）
         answer = confirm_rx.recv(), if !confirm_rx.is_closed() => {
             match answer {
@@ -440,11 +505,34 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                     identity.backup_complete(&password, mode);
                     pending_confirm = None;
                 }
+                Some(ConfirmAnswer::FileReceive { from, file_id, name, size, accepted }) => {
+                    // 仅当挂起的正是该 offer 才落账（迟到的子窗口答案忽略）
+                    let matches = matches!(
+                        &pending_confirm,
+                        Some(PendingConfirm::FileReceive { file_id: fid, .. }) if *fid == file_id
+                    );
+                    if matches {
+                        let mut actx = AppCtx {
+                            identity: &mut identity,
+                            conversations: &mut conversations,
+                            groups: &mut groups,
+                            focused: &mut focused,
+                            mode,
+                            hello_pending: None,
+                            file_pending: None,
+                            cmd_tx: &cmd_tx,
+                            file: &mut file_state,
+                        };
+                        ft::complete_file_receive(&mut actx, &from, file_id, name, size, accepted)
+                            .await;
+                        pending_confirm = None;
+                    }
+                }
                 None => {}
             }
         }
-            _ = tokio::time::sleep_until(offer_expiry.unwrap_or_else(tokio::time::Instant::now)), if offer_expiry.is_some() => {
-                // H2：offer 超时——对端不应答（网络突发/对端退出）时中止并清理，防状态悬挂
+            _ = tokio::time::sleep_until(timer_deadline.unwrap_or_else(tokio::time::Instant::now)), if timer_deadline.is_some() => {
+                // H2：发送侧 offer 超时——对端不应答（网络突发/对端退出）时中止并清理，防状态悬挂
                 for (peer, file_id, name) in
                     file_state.expire_stale_offers(crate::p2p_app::file_transfer::OFFER_TIMEOUT)
                 {
@@ -464,6 +552,36 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                     println!(
                         "{}",
                         format!("等待对端确认超时，已中止发送: {name}").yellow()
+                    );
+                }
+                // 接收确认超时：挂起的 offer 未作答 → 自动拒绝并清槽
+                // （防单槽 pending 被未答 offer 永久占位，挡住后续 TOFU/Backup/文件确认）
+                let expired = match &pending_confirm {
+                    Some(PendingConfirm::FileReceive { from, file_id, name, at, .. })
+                        if at.elapsed() >= crate::p2p_app::file_transfer::OFFER_TIMEOUT =>
+                    {
+                        Some((*from, *file_id, name.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some((from, file_id, name)) = expired {
+                    let _ = cmd_tx
+                        .send(seam::Cmd::Send {
+                            peer: from,
+                            tag: ft::TAG_FILE_REJECT.to_string(),
+                            payload: Some(
+                                serde_cbor::to_vec(&ft::FileRejectPayload {
+                                    file_id,
+                                    reason: "对方未及时确认，已自动拒绝".into(),
+                                })
+                                .unwrap_or_default(),
+                            ),
+                        })
+                        .await;
+                    pending_confirm = None;
+                    println!(
+                        "{}",
+                        format!("文件 {name} 确认超时，已自动拒绝").yellow()
                     );
                 }
             }
@@ -511,6 +629,27 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                 }
                                 PendingConfirm::Backup => {
                                     identity.backup_complete(l.trim(), mode);
+                                    continue;
+                                }
+                                PendingConfirm::FileReceive { from, file_id, name, size, .. } => {
+                                    // 主窗口作答路径（Ask 卡片回程 / 非 Windows 退化）
+                                    let accept =
+                                        l.trim_start_matches('\u{feff}').trim().eq_ignore_ascii_case("y");
+                                    let mut actx = AppCtx {
+                                        identity: &mut identity,
+                                        conversations: &mut conversations,
+                                        groups: &mut groups,
+                                        focused: &mut focused,
+                                        mode,
+                                        hello_pending: None,
+                                        file_pending: None,
+                                        cmd_tx: &cmd_tx,
+                                        file: &mut file_state,
+                                    };
+                                    ft::complete_file_receive(
+                                        &mut actx, &from, file_id, name, size, accept,
+                                    )
+                                    .await;
                                     continue;
                                 }
                             }
@@ -775,9 +914,9 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                         conversations: &mut conversations,
                                         groups: &mut groups,
                                         focused: &mut focused,
-                                        input: &mut input,
                                         mode,
                                         hello_pending: None,
+                                        file_pending: None,
                                         cmd_tx: &cmd_tx,
                                         file: &mut file_state,
                                     };
@@ -791,9 +930,9 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                     conversations: &mut conversations,
                                     groups: &mut groups,
                                     focused: &mut focused,
-                                    input: &mut input,
                                     mode,
                                     hello_pending: None,
+                                    file_pending: None,
                                     cmd_tx: &cmd_tx,
                                     file: &mut file_state,
                                 };
@@ -833,6 +972,63 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                                 .yellow()
                                         );
                                         pending_confirm = None;
+                                    }
+                                    continue;
+                                }
+                                // 文件 offer 两段式：phase1 登记 → 登记待决确认
+                                // （Interactive 拉起 --confirm-file 子窗口；Ask 卡片答案经 input 回程）
+                                if let Some(offer) = actx.file_pending.take() {
+                                    if pending_confirm.is_some() {
+                                        // 忙拒：另一确认挂起中——单槽模型不覆盖既有待决
+                                        let _ = cmd_tx
+                                            .send(seam::Cmd::Send {
+                                                peer: offer.from,
+                                                tag: ft::TAG_FILE_REJECT.to_string(),
+                                                payload: Some(serde_cbor::to_vec(
+                                                    &ft::FileRejectPayload {
+                                                        file_id: offer.file_id,
+                                                        reason: "正在等待其他确认，请稍后重发"
+                                                            .into(),
+                                                    },
+                                                )
+                                                .unwrap_or_default()),
+                                            })
+                                            .await;
+                                        eprintln!(
+                                            "{}",
+                                            format!(
+                                                "已拒收文件 {}（另一确认处理中）",
+                                                offer.name
+                                            )
+                                            .yellow()
+                                        );
+                                    } else {
+                                        pending_confirm = Some(PendingConfirm::FileReceive {
+                                            from: offer.from,
+                                            file_id: offer.file_id,
+                                            name: offer.name.clone(),
+                                            size: offer.size,
+                                            at: std::time::Instant::now(),
+                                        });
+                                        #[cfg(windows)]
+                                        if mode == ConfirmMode::Interactive {
+                                            spawn_file_window(
+                                                confirm_tx.clone(),
+                                                offer.from,
+                                                offer.file_id,
+                                                offer.name,
+                                                offer.size,
+                                            );
+                                        }
+                                        #[cfg(not(windows))]
+                                        if mode == ConfirmMode::Interactive {
+                                            println!(
+                                                "{}",
+                                                "非 Windows 暂无确认子窗口：请在主窗口输入 y（接收）/ n（拒绝）"
+                                                    .yellow()
+                                            );
+                                        }
+                                        // Ask：不发窗口——卡片答案经 InputMsg::Line 走 input 待决路由
                                     }
                                     continue;
                                 }

@@ -79,6 +79,15 @@ pub struct FileAbortPayload {
     pub reason: String,
 }
 
+/// offer 待决数据（phase1 登记 → phase2 `complete_file_receive` 所需完整信息；
+/// 会话层据此登记 pending_confirm 并按模式拉起确认子窗口）
+pub struct FilePending {
+    pub from: PeerId,
+    pub file_id: u64,
+    pub name: String,
+    pub size: u64,
+}
+
 /// 接收中的文件（逐块写盘——每块经 CRC32 校验；完成时改名落盘）
 struct ReceivingFile {
     file: tokio::fs::File,
@@ -195,8 +204,12 @@ fn sanitize_file_name(raw: &str) -> String {
 
 // ---- 接收侧 handler（注册到 SignalRegistry）----
 
-/// 收到文件 offer：三态（Interactive 终端 y/n / **Ask 系统消息卡片** / Auto e2e 自动接受），
-/// 接受则建临时文件并回 file.accept
+/// 收到文件 offer（phase1，**不阻塞会话循环**）：三态——
+/// - Interactive：打印提示 → 登记 `ctx.file_pending`（会话层拉起 `--confirm-file` 子窗口；
+///   非 Windows 退化为主窗口 pending 路由）
+/// - Ask：发系统消息卡片 → 登记 `ctx.file_pending`（答案经 InputMsg::Line 回程）
+/// - Auto：直接进入 phase2 接受（e2e/脚本语义不变）
+/// 接受/拒绝落账（建临时文件/回 accept/reject）在 phase2 [`complete_file_receive`]。
 pub async fn on_file_offer(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
     let Some(bytes) = payload else {
         return false;
@@ -205,18 +218,22 @@ pub async fn on_file_offer(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<
         return false;
     };
     let name = sanitize_file_name(&p.name);
-    let accept = match ctx.mode {
+    match ctx.mode {
+        crate::lineio::ConfirmMode::Auto => {
+            complete_file_receive(ctx, from, p.file_id, name, p.size, true).await;
+        }
         crate::lineio::ConfirmMode::Interactive => {
             println!(
                 "{}",
-                format!("收到文件: {name}（{} 字节，来自 {from}），保存到 downloads/ ？(y/n)", p.size)
+                format!("收到文件: {name}（{} 字节，来自 {from}），请在确认窗口选择是否保存", p.size)
                     .yellow()
             );
-            let ans = match ctx.input.next_raw_line().await {
-                Some(l) => l,
-                None => String::new(),
-            };
-            ans.trim().eq_ignore_ascii_case("y")
+            ctx.file_pending = Some(FilePending {
+                from: *from,
+                file_id: p.file_id,
+                name,
+                size: p.size,
+            });
         }
         crate::lineio::ConfirmMode::Ask => {
             // GUI：发系统消息卡片（答案经 InputMsg::Line 回程，同 CLI 交互）
@@ -229,15 +246,28 @@ pub async fn on_file_offer(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<
                 },
                 secret: false,
             });
-            let ans = match ctx.input.next_raw_line().await {
-                Some(l) => l,
-                None => String::new(),
-            };
-            ans.trim().eq_ignore_ascii_case("y")
+            ctx.file_pending = Some(FilePending {
+                from: *from,
+                file_id: p.file_id,
+                name,
+                size: p.size,
+            });
         }
-        crate::lineio::ConfirmMode::Auto => true, // e2e/脚本：自动接受（语义不变）
-    };
-    let file_id = p.file_id;
+    }
+    true
+}
+
+/// offer 确认 phase2：accept=true 建临时文件并回 file.accept（开始接收）；
+/// false 回 file.reject。原 on_file_offer 的接受/拒绝落账路径整体迁出——
+/// 两段式后确认等待不再内联阻塞会话循环，答案到达（子窗口/卡片/主窗口行）时进入本函数。
+pub async fn complete_file_receive(
+    ctx: &mut AppCtx<'_>,
+    from: &PeerId,
+    file_id: u64,
+    name: String,
+    size: u64,
+    accept: bool,
+) {
     if accept {
         let dir = ctx.file.downloads_dir.clone();
         if let Err(e) = tokio::fs::create_dir_all(&dir).await {
@@ -250,7 +280,7 @@ pub async fn on_file_offer(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<
                 reason: format!("本地创建下载目录失败: {e}"),
             })
             .await;
-            return true;
+            return;
         }
         let tmp_path = dir.join(format!(".{name}.part.{file_id}"));
         let file = match tokio::fs::File::create(&tmp_path).await {
@@ -265,7 +295,7 @@ pub async fn on_file_offer(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<
                     reason: format!("本地创建接收文件失败: {e}"),
                 })
                 .await;
-                return true;
+                return;
             }
         };
         ctx.file.receivers.insert(
@@ -278,15 +308,15 @@ pub async fn on_file_offer(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<
             },
         );
         let _ = send_signal(ctx, from, TAG_FILE_ACCEPT, &FileAcceptPayload { file_id }).await;
-        println!("{}", format!("开始接收 {name}（{} 字节）...", p.size).green());
+        println!("{}", format!("开始接收 {name}（{size} 字节）...").green());
     } else {
         let _ = send_signal(ctx, from, TAG_FILE_REJECT, &FileRejectPayload {
             file_id,
             reason: "对方拒绝接收".into(),
         })
         .await;
+        println!("{}", format!("已拒绝接收 {name}").dimmed());
     }
-    true
 }
 
 /// 收到文件分块：先校验 CRC32，通过才写盘并回 file.ack（发送侧逐块推进）

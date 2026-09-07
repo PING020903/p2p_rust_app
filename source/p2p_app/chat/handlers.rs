@@ -6,7 +6,7 @@ use colored::Colorize;
 use libp2p::PeerId;
 
 use crate::p2p::identity_service::{HelloOutcome, IdentityService, TextTag};
-use crate::lineio::{ConfirmMode, LineSource};
+use crate::lineio::ConfirmMode;
 use crate::p2p::seam;
 use crate::p2p_app::chat::ctx::Conversation;
 use crate::p2p_app::chat::display;
@@ -25,10 +25,12 @@ pub(crate) struct AppCtx<'a> {
     pub(crate) conversations: &'a mut HashMap<PeerId, Conversation>,
     pub(crate) groups: &'a mut HashMap<String, Group>,
     pub(crate) focused: &'a mut Option<PeerId>,
-    pub(crate) input: &'a mut LineSource,
     pub(crate) mode: ConfirmMode,
     /// hello 两段式：TOFU 首触挂起（待确认确认后由会话补跑钩子与信任重报）
     pub(crate) hello_pending: Option<(PeerId, String)>,
+    /// 文件 offer 两段式：phase1 登记待决（会话层登记 pending_confirm 并按模式拉起确认子窗口）
+    pub(crate) file_pending:
+        Option<crate::p2p_app::file_transfer::FilePending>,
     pub(crate) cmd_tx: &'a tokio::sync::mpsc::Sender<seam::Cmd>,
     pub(crate) file: &'a mut crate::p2p_app::file_transfer::FileTransferState,
 }

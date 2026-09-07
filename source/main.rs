@@ -55,6 +55,7 @@ fn main() {
     match cargs.first().map(|s| s.as_str()) {
         Some("--confirm-tofu") => confirm_tofu_entry(&cargs[1..]),
         Some("--confirm-secret") => confirm_secret_entry(&cargs[1..]),
+        Some("--confirm-file") => confirm_file_entry(&cargs[1..]),
         _ => {}
     }
     // 2. 管道输入（非终端）→ 纯 CLI（e2e / 脚本喂入）
@@ -188,6 +189,35 @@ fn confirm_secret_entry(args: &[String]) {
         line.trim_start_matches('\u{feff}').trim().to_string()
     };
     if !pw.is_empty() && std::fs::write(result_file, &pw).is_ok() {
+        std::process::exit(0);
+    }
+    std::process::exit(1);
+}
+
+/// 确认子窗口入口③：`--confirm-file <from> <file_id> <name> <size>`（会话层 spawn_file_window 拉起）。
+/// 打印文件接收确认卡片 → y/n 读行；退出码 0=接收 / 1=拒绝或读行失败 / 2=参数错误。
+fn confirm_file_entry(args: &[String]) {
+    use colored::Colorize;
+    use std::io::{self, Write};
+
+    let (from, file_id, name, size) = match args {
+        [f, i, n, s] => (f.as_str(), i.as_str(), n.as_str(), s.as_str()),
+        _ => {
+            eprintln!("用法: --confirm-file <from> <file_id> <name> <size>");
+            std::process::exit(2);
+        }
+    };
+    println!("{}", "=== 文件接收确认 ===".cyan());
+    println!("  文件: {name}（{size} 字节）");
+    println!("  来自: {from}");
+    println!("  文件序号: {file_id}");
+    print!("保存到下载目录？(y/n): ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        std::process::exit(1);
+    }
+    if line.trim_start_matches('\u{feff}').trim().eq_ignore_ascii_case("y") {
         std::process::exit(0);
     }
     std::process::exit(1);
