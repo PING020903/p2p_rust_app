@@ -109,6 +109,8 @@ ui.add(
 | 鼠标坐标点击 egui 不可靠 | **UIA Invoke**（accesskit 按钮支持语义点击） |
 | UIA ValuePattern 对 egui 无效 + 中文 IME 拦截键入 | **剪贴板 Ctrl+V 粘贴**（`pyperclip.copy` + `pyautogui.hotkey("ctrl","v")`） |
 | UIA 树多 Edit 歧义（accesskit 残留 + 新卡片） | 逐个 Edit 点击粘贴（真实卡片最后获焦点生效），随后单次解锁 |
+| **invoke 对禁用控件挂死**（如密码空时"解锁"禁用→COM 请求永不完成） | invoke 放**3s 超时线程**（daemon + join(timeout)），超时回退 click_input（gui_smoke.py `click()` 已实现） |
+| **无交互桌面**（RDP 断开/锁屏）真输入全废：SetCursorPos 报错 2、键盘热键落空 | 冒烟**必须交互桌面**跑；无头会话以 e2e（管道模式）为门禁，语义路径（set_edit_text/invoke）尽力而为 |
 
 ---
 

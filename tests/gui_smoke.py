@@ -138,12 +138,27 @@ def main() -> int:
 
     def click(el):
         """UIA Invoke 优先（egui/accesskit 按钮支持语义点击，实测可靠）；
-        失败回退鼠标点击（静态文本无 Invoke 模式时按元素坐标点）"""
-        try:
-            el.invoke()
-        except Exception:
-            el.click_input()
+        invoke 偶发挂死（禁用控件/COM 请求未被 idle 帧处理）→ 3s 超时线程 + 回退鼠标点击"""
+        import threading
 
+        result = {"done": False}
+
+        def _invoke():
+            try:
+                el.invoke()
+                result["done"] = True
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_invoke, daemon=True)
+        t.start()
+        t.join(timeout=3.0)
+        if result["done"]:
+            return
+        try:
+            el.click_input()
+        except Exception:
+            pass
     # 3) 登录（附加模式跳过——假定已登录）
     if not args.attach and args.password:
         btn = find(f"1. {SMOKE_NAME}")
@@ -160,27 +175,36 @@ def main() -> int:
             win.print_control_identifiers(depth=6)
             return 4
         try:
+            # UIA ValuePattern 对 egui 无效（accesskit 不支持 SetValue）——先试语义写入，
+            # 未登录成功再回退真输入（需交互桌面：RDP 断开/锁屏时真输入 API 不可用）
             edit.set_edit_text(args.password)
         except Exception:
             pass
-        # UIA ValuePattern 对 egui 无效（accesskit 不支持 SetValue）→
-        # 真点击聚焦 + 剪贴板粘贴（绕开中文输入法：pyautogui 逐字符键入会被 IME 拦截）
         import pyautogui
         import pyperclip
 
         pyautogui.FAILSAFE = False  # 自动化脚本：UIA 元素坐标可能落在屏幕角落，禁用防呆
-        edit.click_input()
-        time.sleep(0.5)
-        pyperclip.copy(args.password)
-        pyautogui.hotkey("ctrl", "v")
-        time.sleep(0.5)
         unlock = find("解锁")
         if unlock:
             click(unlock)
-        else:
-            edit.type_keys("{ENTER}")
+        # 语义路径未登录成功 → 回退真输入：点击聚焦 + 清空 + 剪贴板粘贴（绕 IME）+ 再点解锁
+        if not wait_log_contains(log, "登录成功", timeout=8.0):
+            try:
+                edit.click_input()
+                time.sleep(0.5)
+                pyautogui.hotkey("ctrl", "a")
+                pyautogui.press("delete")
+                pyperclip.copy(args.password)
+                pyautogui.hotkey("ctrl", "v")
+                time.sleep(0.5)
+                if unlock:
+                    click(unlock)
+            except Exception as e:
+                print(f"WARN：真输入不可用（{type(e).__name__}，无交互桌面？），依赖语义路径结果")
         if not wait_log_contains(log, "登录成功"):
             print("FAIL：interact.log 未见 登录成功")
+            print("提示：真输入路径需要交互桌面（RDP 已连接且未锁屏）；"
+                  "无头会话请改在有桌面的环境运行冒烟，并以 e2e（管道模式）作为引擎回归门禁")
             return 5
         print("[3/4] 登录成功（日志断言通过）")
 
