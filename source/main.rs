@@ -48,6 +48,15 @@ fn main() {
         }
         return;
     }
+    // 1.5 确认子窗口子模式：会话层拉起的独立控制台确认子进程（见 session.rs spawn_*_window）。
+    //     必须先于 is_terminal 判定——子进程有自己的终端，否则会落入规则 4 误拉起 GUI。
+    //     答案以退出码（0=确认）/结果文件回传父进程后立即退出，不进入任何主流程。
+    let cargs: Vec<String> = std::env::args().skip(1).collect();
+    match cargs.first().map(|s| s.as_str()) {
+        Some("--confirm-tofu") => confirm_tofu_entry(&cargs[1..]),
+        Some("--confirm-secret") => confirm_secret_entry(&cargs[1..]),
+        _ => {}
+    }
     // 2. 管道输入（非终端）→ 纯 CLI（e2e / 脚本喂入）
     // 3. 显式 --cli 参数 → 纯 CLI
     if !std::io::stdin().is_terminal() || std::env::args().any(|a| a == "--cli") {
@@ -119,6 +128,69 @@ fn spawn_detached() -> Result<(), String> {
 
 struct MainCtx {
     quit: bool,
+}
+
+/// 确认子窗口入口①：`--confirm-tofu <name> <fingerprint> <peer>`（会话层 spawn_tofu_window 拉起）。
+/// 打印 TOFU 指纹确认卡片 → y/n 读行；退出码 0=信任 / 1=拒绝或读行失败 / 2=参数错误。
+fn confirm_tofu_entry(args: &[String]) {
+    use colored::Colorize;
+    use std::io::{self, Write};
+
+    let (name, fingerprint, peer) = match args {
+        [n, f, p] => (n.as_str(), f.as_str(), p.as_str()),
+        _ => {
+            eprintln!("用法: --confirm-tofu <name> <fingerprint> <peer>");
+            std::process::exit(2);
+        }
+    };
+    println!("{}", "=== 新联系人信任确认（TOFU）===".cyan());
+    println!("  名称: {name}");
+    println!("  节点: {peer}");
+    println!("{}", format!("  指纹: {fingerprint}").yellow());
+    println!("{}", "请与对方当面核对指纹一致后再选择信任。".dimmed());
+    print!("信任该联系人？(y/n): ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        std::process::exit(1);
+    }
+    // 防御：剥 BOM（脚本/管道喂入可能带 U+FEFF 前缀）+ 首尾空白
+    if line.trim_start_matches('\u{feff}').trim().eq_ignore_ascii_case("y") {
+        std::process::exit(0);
+    }
+    std::process::exit(1);
+}
+
+/// 确认子窗口入口②：`--confirm-secret <title> <result_file>`（会话层 spawn_secret_window 拉起）。
+/// 交互终端 rpassword 不回显；管道/脚本退化普通读行（同 lineio::prompt_secret 退化语义）。
+/// 密码写结果文件；退出码 0=已写入 / 1=取消或失败 / 2=参数错误。
+fn confirm_secret_entry(args: &[String]) {
+    use std::io::IsTerminal;
+
+    let (title, result_file) = match args {
+        [t, r] => (t.as_str(), r.as_str()),
+        _ => {
+            eprintln!("用法: --confirm-secret <title> <result_file>");
+            std::process::exit(2);
+        }
+    };
+    print!("{title}: ");
+    let pw = if std::io::stdin().is_terminal() {
+        match rpassword::prompt_password("") {
+            Ok(p) => p,
+            Err(_) => std::process::exit(1),
+        }
+    } else {
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            std::process::exit(1);
+        }
+        line.trim_start_matches('\u{feff}').trim().to_string()
+    };
+    if !pw.is_empty() && std::fs::write(result_file, &pw).is_ok() {
+        std::process::exit(0);
+    }
+    std::process::exit(1);
 }
 
 /// 纯 CLI 模式主菜单：计算器 / 学生信息 / 彩色打印 / P2P 聊天 / 清除会话日志 / 清除联系人缓存
