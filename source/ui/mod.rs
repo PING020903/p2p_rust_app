@@ -701,6 +701,24 @@ impl eframe::App for GuiApp {
                                     }
                                 });
                             }
+                            crate::uievent::AskKind::FileReceive { from, filename, size } => {
+                                ui.label(
+                                    egui::RichText::new(format!("收到文件：{filename}"))
+                                        .strong(),
+                                );
+                                ui.weak(format!(
+                                    "{} 来自 {from}，保存到下载目录",
+                                    format_size(*size)
+                                ));
+                                ui.horizontal(|ui| {
+                                    if ui.button("接收保存").clicked() {
+                                        answered = Some("y");
+                                    }
+                                    if ui.button("拒绝").clicked() {
+                                        answered = Some("n");
+                                    }
+                                });
+                            }
                         }
                     });
                 if answered.is_some() {
@@ -876,6 +894,22 @@ fn login_state_name(s: &login::LoginState) -> &'static str {
         login::LoginState::MnemonicConfirm { .. } => "MnemonicConfirm",
         login::LoginState::NewPassword { .. } => "NewPassword",
         login::LoginState::RestorePhrase { .. } => "RestorePhrase",
+    }
+}
+
+/// 字节数人读格式（B/KB/MB/GB，一位小数）
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = bytes as f64;
+    let mut unit = 0;
+    while v >= 1024.0 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[unit])
     }
 }
 

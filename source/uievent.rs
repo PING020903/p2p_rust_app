@@ -97,6 +97,12 @@ pub enum AskKind {
     BackupPassword,
     /// 未互信发送确认（答案 y=仍要发送并记忆 / n=取消；Ask 卡片文案注明对端可能忽略）
     UntrustedSend { name: String },
+    /// 文件接收确认（答案 y=接收保存 / n=拒绝）
+    FileReceive {
+        from: String,
+        filename: String,
+        size: u64,
+    },
 }
 
 /// Ask 请求：引擎单飞行（同时最多一个）；id 自增防御错位

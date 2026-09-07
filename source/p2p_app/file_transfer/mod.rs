@@ -79,13 +79,16 @@ pub struct FileAbortPayload {
     pub reason: String,
 }
 
-/// 接收中的文件（逐块写盘，完成时校验 sha256 并改名）
+/// 接收中的文件（逐块写盘——每块经 CRC32 校验；完成时改名落盘）
 struct ReceivingFile {
     file: tokio::fs::File,
     tmp_path: PathBuf,
     written: u64,
     name: String,
 }
+
+/// offer 等待确认超时：超时未收到 file.accept 则中止发送并清理状态（防双方悬挂）
+pub(crate) const OFFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 发送中的文件（事件驱动推送：accept/ack 事件触发下一块发送，不用后台任务）
 struct SendingFile {
@@ -95,6 +98,8 @@ struct SendingFile {
     name: String,
     next_seq: u64,
     sent: u64,
+    /// offer 发出时刻（sent==0 期间超时未确认 → 中止；accept 后首块推送即离开等待期）
+    offer_at: std::time::Instant,
 }
 
 /// 文件传输应用状态（应用任务内）：发送状态表 + 接收文件表 + 文件 id 计数器
@@ -122,6 +127,37 @@ impl FileTransferState {
     /// 当前下载目录（解析后的绝对/相对路径）
     pub fn downloads_dir(&self) -> &Path {
         &self.downloads_dir
+    }
+
+    /// 最近的未确认 offer 过期时刻（sent==0；无等待中的 offer 返回 None）
+    /// —— 会话主循环定时臂据此 sleep_until
+    pub fn next_offer_expiry(&self) -> Option<std::time::Instant> {
+        self.senders
+            .values()
+            .filter(|s| s.sent == 0)
+            .map(|s| s.offer_at + OFFER_TIMEOUT)
+            .min()
+    }
+
+    /// 清理过期的未确认 offer（sent==0 且超时）：移除发送态并返回待通知的 (peer, file_id, name)。
+    /// 由会话主循环定时臂调用——对端不应答（网络突发/对端退出）时防止状态悬挂。
+    pub fn expire_stale_offers(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Vec<(PeerId, u64, String)> {
+        let stale: Vec<u64> = self
+            .senders
+            .iter()
+            .filter(|(_, s)| s.sent == 0 && s.offer_at.elapsed() >= timeout)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut out = Vec::new();
+        for id in stale {
+            if let Some(s) = self.senders.remove(&id) {
+                out.push((s.peer, id, s.name));
+            }
+        }
+        out
     }
 }
 
@@ -159,7 +195,8 @@ fn sanitize_file_name(raw: &str) -> String {
 
 // ---- 接收侧 handler（注册到 SignalRegistry）----
 
-/// 收到文件 offer：交互确认（y/n）/ 管道自动接受，接受则建临时文件并回 file.accept
+/// 收到文件 offer：三态（Interactive 终端 y/n / **Ask 系统消息卡片** / Auto e2e 自动接受），
+/// 接受则建临时文件并回 file.accept
 pub async fn on_file_offer(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<&[u8]>) -> bool {
     let Some(bytes) = payload else {
         return false;
@@ -168,19 +205,37 @@ pub async fn on_file_offer(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<
         return false;
     };
     let name = sanitize_file_name(&p.name);
-    let accept = if ctx.mode.is_interactive() {
-        println!(
-            "{}",
-            format!("收到文件: {name}（{} 字节，来自 {from}），保存到 downloads/ ？(y/n)", p.size)
-                .yellow()
-        );
-        let ans = match ctx.input.next_raw_line().await {
-            Some(l) => l,
-            None => String::new(),
-        };
-        ans.trim().eq_ignore_ascii_case("y")
-    } else {
-        true
+    let accept = match ctx.mode {
+        crate::lineio::ConfirmMode::Interactive => {
+            println!(
+                "{}",
+                format!("收到文件: {name}（{} 字节，来自 {from}），保存到 downloads/ ？(y/n)", p.size)
+                    .yellow()
+            );
+            let ans = match ctx.input.next_raw_line().await {
+                Some(l) => l,
+                None => String::new(),
+            };
+            ans.trim().eq_ignore_ascii_case("y")
+        }
+        crate::lineio::ConfirmMode::Ask => {
+            // GUI：发系统消息卡片（答案经 InputMsg::Line 回程，同 CLI 交互）
+            crate::sink::ask(crate::uievent::AskRequest {
+                id: crate::uievent::next_ask_id(),
+                kind: crate::uievent::AskKind::FileReceive {
+                    from: from.to_string(),
+                    filename: name.clone(),
+                    size: p.size,
+                },
+                secret: false,
+            });
+            let ans = match ctx.input.next_raw_line().await {
+                Some(l) => l,
+                None => String::new(),
+            };
+            ans.trim().eq_ignore_ascii_case("y")
+        }
+        crate::lineio::ConfirmMode::Auto => true, // e2e/脚本：自动接受（语义不变）
     };
     let file_id = p.file_id;
     if accept {
@@ -345,6 +400,20 @@ pub async fn on_file_accept(ctx: &mut AppCtx<'_>, _from: &PeerId, payload: Optio
     let Ok(p) = serde_cbor::from_slice::<FileAcceptPayload>(bytes) else {
         return false;
     };
+    if !ctx.file.senders.contains_key(&p.file_id) {
+        // 迟到的 accept（发送侧 offer 已超时清理）：回 abort 让对端清理悬挂的接收态
+        let _ = send_signal(
+            ctx,
+            _from,
+            TAG_FILE_ABORT,
+            &FileAbortPayload {
+                file_id: p.file_id,
+                reason: "offer 已超时失效".into(),
+            },
+        )
+        .await;
+        return true;
+    }
     drive_sender(ctx, p.file_id).await;
     true
 }
@@ -520,6 +589,7 @@ pub fn start_send(
             name: name.clone(),
             next_seq: 0,
             sent: 0,
+            offer_at: std::time::Instant::now(),
         },
     );
     let offer = serde_cbor::to_vec(&FileOfferPayload {
@@ -560,5 +630,70 @@ mod tests {
         assert_eq!(crc32fast::hash(b"123456789"), 0xCBF43926);
         // 不同数据 CRC 不同（校验能区分损坏块）
         assert_ne!(crc32fast::hash(b"hello"), crc32fast::hash(b"hellp"));
+    }
+
+    #[test]
+    fn expire_stale_offers_only_unconfirmed_and_expired() {
+        use std::time::{Duration, Instant};
+        let peer: PeerId = "12D3KooWGpERtoeJ1M482Kkx7p9czC9yKYuXGsvUvDBG3589iPKq"
+            .parse()
+            .unwrap();
+        let mut st = FileTransferState::new(&peer);
+        let path = std::env::temp_dir().join("p2p_ft_expire_test.txt");
+        std::fs::write(&path, b"hello").unwrap();
+
+        // 已确认（sent>0）：不清理
+        st.next_id += 1;
+        st.senders.insert(
+            1,
+            SendingFile {
+                peer,
+                file: std::fs::File::open(&path).unwrap(),
+                size: 5,
+                name: "a.txt".into(),
+                next_seq: 1,
+                sent: 3,
+                offer_at: Instant::now() - Duration::from_secs(3600),
+            },
+        );
+        // 过期未确认：清理
+        st.senders.insert(
+            2,
+            SendingFile {
+                peer,
+                file: std::fs::File::open(&path).unwrap(),
+                size: 5,
+                name: "b.txt".into(),
+                next_seq: 0,
+                sent: 0,
+                offer_at: Instant::now() - Duration::from_secs(120),
+            },
+        );
+        // 新鲜未确认：不清理
+        st.senders.insert(
+            3,
+            SendingFile {
+                peer,
+                file: std::fs::File::open(&path).unwrap(),
+                size: 5,
+                name: "c.txt".into(),
+                next_seq: 0,
+                sent: 0,
+                offer_at: Instant::now(),
+            },
+        );
+
+        // 最近的过期时刻 = 过期条目的 offer_at + 60s
+        assert!(st.next_offer_expiry().is_some());
+
+        let expired = st.expire_stale_offers(Duration::from_secs(60));
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, peer);
+        assert_eq!(expired[0].1, 2);
+        assert_eq!(expired[0].2, "b.txt");
+        assert!(st.senders.contains_key(&1), "已确认的不清理");
+        assert!(st.senders.contains_key(&3), "新鲜的 不清理");
+        assert!(!st.senders.contains_key(&2));
+        std::fs::remove_file(&path).ok();
     }
 }

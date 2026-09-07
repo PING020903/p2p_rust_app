@@ -314,7 +314,35 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
     let mut sendstrings: Option<(String, usize)> = None;
 
     loop {
+        // 定时臂预条件：有等待确认的 offer 时，睡到最早过期时刻（无则该分支禁用）
+        let offer_expiry = file_state
+            .next_offer_expiry()
+            .map(tokio::time::Instant::from_std);
         tokio::select! {
+            _ = tokio::time::sleep_until(offer_expiry.unwrap_or_else(tokio::time::Instant::now)), if offer_expiry.is_some() => {
+                // H2：offer 超时——对端不应答（网络突发/对端退出）时中止并清理，防状态悬挂
+                for (peer, file_id, name) in
+                    file_state.expire_stale_offers(crate::p2p_app::file_transfer::OFFER_TIMEOUT)
+                {
+                    let _ = cmd_tx
+                        .send(seam::Cmd::Send {
+                            peer,
+                            tag: ft::TAG_FILE_ABORT.to_string(),
+                            payload: Some(
+                                serde_cbor::to_vec(&crate::p2p_app::file_transfer::FileAbortPayload {
+                                    file_id,
+                                    reason: "等待对端确认超时".into(),
+                                })
+                                .unwrap_or_default(),
+                            ),
+                        })
+                        .await;
+                    println!(
+                        "{}",
+                        format!("等待对端确认超时，已中止发送: {name}").yellow()
+                    );
+                }
+            }
             msg = input.next_input() => {
                 // None = 输入结束（EOF/通道关闭）：多行收集中则报未闭合丢弃
                 let line = match msg {
