@@ -1,4 +1,4 @@
-//! P2P 聊天：单 exe 双模式。
+﻿//! P2P 聊天：单 exe 双模式。
 //! - 无参数启动（双击 / `cargo run`）→ **GUI**：以分离进程拉起自身（`P2P_GUI_CHILD` 标记），
 //!   窗口 + 引擎线程（P2.0 起聊天核心进程内运行，不再 spawn CLI 子进程）
 //! - `--cli` 参数 / 管道输入（非终端）→ **纯 CLI**：主菜单模式（终端/e2e/脚本）
@@ -23,7 +23,6 @@ macro_rules! print {
 mod calculator;
 mod cmd_tree;
 mod color_print;
-mod file_transfer;
 mod lineio;
 mod p2p;
 mod p2p_app;

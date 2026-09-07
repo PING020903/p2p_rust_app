@@ -1,4 +1,4 @@
-﻿//! chat 命令树：/dial /chat /list /trust /group /send /backup /q 等全部注册（CLI 文本层）。
+//! chat 命令树：/dial /chat /list /trust /group /send /backup /q 等全部注册（CLI 文本层）。
 //! 框架在 crate 根 cmd_tree.rs（全局组件）；本模块是 chat 域的注册内容——
 //! 对应固件惯例：CommandParse/（框架）与 userTasks_cmds.c（域内注册）分离。
 
@@ -333,7 +333,7 @@ pub(crate) fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                     return;
                 }
                 if let Err(e) =
-                    crate::file_transfer::start_send(ctx.file, &mut ctx.ops, peer, &path)
+                    crate::p2p_app::file_transfer::start_send(ctx.file, &mut ctx.ops, peer, &path)
                 {
                     eprintln!("{}", format!("发送启动失败: {e}").yellow());
                 }

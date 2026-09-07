@@ -1,4 +1,4 @@
-﻿//! 会话上下文：命令树/Control/发送路径共用的可变状态束 + 异步动作队列。
+//! 会话上下文：命令树/Control/发送路径共用的可变状态束 + 异步动作队列。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -36,7 +36,7 @@ pub(crate) struct ChatCtx<'a> {
     /// 待消费的异步动作队列（VecDeque 即可增长的环状缓冲）
     pub(crate) ops: VecDeque<AsyncOp>,
     pub(crate) quit: bool,
-    pub(crate) file: &'a mut crate::file_transfer::FileTransferState,
+    pub(crate) file: &'a mut crate::p2p_app::file_transfer::FileTransferState,
 }
 
 impl<'a> ChatCtx<'a> {
@@ -72,7 +72,7 @@ pub(crate) fn make_chat_ctx<'a>(
     focused_group: &'a mut Option<String>,
     connected: &'a HashSet<PeerId>,
     registered: &'a mut HashMap<PeerId, Vec<Multiaddr>>,
-    file: &'a mut crate::file_transfer::FileTransferState,
+    file: &'a mut crate::p2p_app::file_transfer::FileTransferState,
 ) -> ChatCtx<'a> {
     ChatCtx {
         identity,

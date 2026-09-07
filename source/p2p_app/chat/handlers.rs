@@ -1,4 +1,4 @@
-﻿//! chat 业务语义 handler（注册到 SignalRegistry）：hello/bye/chat.text/trust/群事件。
+//! chat 业务语义 handler（注册到 SignalRegistry）：hello/bye/chat.text/trust/群事件。
 
 use std::collections::HashMap;
 
@@ -28,7 +28,7 @@ pub(crate) struct AppCtx<'a> {
     pub(crate) input: &'a mut LineSource,
     pub(crate) mode: ConfirmMode,
     pub(crate) cmd_tx: &'a tokio::sync::mpsc::Sender<seam::Cmd>,
-    pub(crate) file: &'a mut crate::file_transfer::FileTransferState,
+    pub(crate) file: &'a mut crate::p2p_app::file_transfer::FileTransferState,
 }
 
 /// 让 `AppCtx<'a>` 作为 L2 `SignalRegistry` 的上下文：GAT 暴露其带生命周期的类型

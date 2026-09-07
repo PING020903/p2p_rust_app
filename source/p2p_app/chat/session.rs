@@ -1,4 +1,4 @@
-﻿//! 会话主循环：run/run_engine/run_node——引擎入口与 select 事件循环（CLI/GUI 共用）。
+//! 会话主循环：run/run_engine/run_node——引擎入口与 select 事件循环（CLI/GUI 共用）。
 //! 输入抽象 LineSource 已屏蔽模式差异；命令树来自 commands::build_tree。
 
 use std::collections::{HashMap, HashSet};
@@ -209,7 +209,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
         format!("发现模式: {}", discovery_mode.name()).dimmed()
     );
     // 文件传输应用状态（下载目录在构造时解析，见 FileTransferState::new）
-    let mut file_state = crate::file_transfer::FileTransferState::new(identity.my_id());
+    let mut file_state = crate::p2p_app::file_transfer::FileTransferState::new(identity.my_id());
     println!(
         "{}",
         format!("下载目录: {}", file_state.downloads_dir().display()).dimmed()
@@ -279,7 +279,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
         Box::pin(on_group_owner_transfer(ctx, from, payload))
     });
     // 文件传输应用（L3 应用②）注册 file.* 语义
-    use crate::file_transfer as ft;
+    use crate::p2p_app::file_transfer as ft;
     registry.register(ft::TAG_FILE_OFFER, |ctx, from, payload| {
         Box::pin(ft::on_file_offer(ctx, from, payload))
     });
