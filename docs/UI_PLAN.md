@@ -173,7 +173,7 @@ GUI：tokio 后台线程跑核心，UI 主线程每帧 drain 事件通道
 - [x] **左栏**：联系人（信任徽标/在线点/信任按钮）+ 已发现节点（未握手分段）+ 添加联系人表单 + 我的地址（点击复制）+ 群列表（✅ P2.2c/P2.3b/c）
 - [x] **中区**：会话气泡（手工测量手绘，对侧左/我侧右，未信任黄）+ 系统行混排时间线；消息结构化（`ChatMessage` 事件经 sink 单通道保序，CLI 文本格式与 GUI 渲染分流）（✅ P2.2a/b/b2）
 - [x] **底部**：输入框（ChatText 直发）+ 命令框（guard 拦穿透）+ `/list` `/q` 快捷按钮（登录期隐藏）（✅ P2.1/P2.2）
-- [ ] **弹窗**：TOFU 指纹确认、`/backup` 助记词、未信任发送确认、文件接收、下载目录选择
+- [ ] **弹窗**：TOFU 指纹确认、`/backup` 助记词、未信任发送确认、文件接收均已由 **Ask 系统消息卡片**实现（✅ P2.6）；剩下载目录选择（随步 5 设置页）
 - [ ] **状态栏**：发现模式、下载目录、本机节点 ID
 
 ### P2.5 应用层结构（chat.rs 2483 行 → p2p_app/chat/ 12 模块，✅ 纯搬家）
@@ -189,6 +189,17 @@ p2p_app/chat/
 ```
 - 框架 cmd_tree.rs 留 crate 根（全局组件）；build_tree 随域——对应固件惯例 CommandParse/ 与 userTasks_cmds.c 分离
 - 三步纯搬家（叶子→中间层→大块），每步 e2e 全量门禁，CLI 行为逐字节不变
+
+### P2.6 — Ask 确认协议与两段式（✅ 已完成）
+
+交互确认统一两跳状态机：**phase1 登记 pending → 立即返回（禁 handler 内 await 答案——单任务 select 冻结根源）→ phase2 答案到达执行**。
+
+- [x] Ask/Answer 基建：`sink::ask(AskRequest)` + `AskKind`×4（TofuConfirm/BackupPassword/UntrustedSend/FileReceive）系统消息卡片；GUI 卡片按钮答案经 `InputMsg::Line` 回程（✅ 步 1-3）
+- [x] L2 两段化：`on_peer_hello_begin/complete_tofu`、`backup_begin/backup_complete`；`HelloOutcome{Done,PendingTofu}`/`BackupProgress`（✅ 步 4）
+- [x] CLI 确认子窗口：`--confirm-tofu`（指纹卡片，退出码 0/1）/`--confirm-secret`（rpassword，结果文件）/`--confirm-file`（文件接收 y/n）三个子模式入口（✅ 步 4；**分发缺失缺陷修复**——spawn 侧早已存在但 main() 从未解析，此前 Interactive TOFU 实际恒自动信任+误拉 GUI）
+- [x] FileReceive 两段化（✅ 步 4-2 后续）：`on_file_offer` phase1（提示/卡片/登记 `AppCtx.file_pending`）+ `complete_file_receive` phase2；**CLI 接收 offer 不再阻塞 chat**（等待 y/n 期间聊天收发畅通）；confirm 臂（file_id 匹配防迟到答案）+ input 待决路由双路驱动
+- [x] 接收确认 60s 超时：并入定时臂 `deadline=min(offer 过期,pending 过期)`，未答自动 reject 清槽（防单槽被永久占位）；忙拒：pending 被占时新 offer 直接 reject
+- 已知边界：非 Windows Interactive 退化主窗口 pending 路由（TOFU 退化自动拒绝）；`/backup`/TOFU 登记仍直接覆盖 pending_confirm（信号侧 offer 已忙拒，命令侧未拦截）；UntrustedSend（session.rs D3）仍内联 await 待同模式两段化；AppCtx.input 字段随内联 await 消失退役
 
 ### 应用层结构（P2.1 起生效，架构纪律）
 
