@@ -92,7 +92,9 @@ pub(crate) fn make_chat_ctx<'a>(
 }
 
 /// 消费 ctx 排队的异步动作（同步生产者 → 异步消费者；命令与 Control 分支共用）
-pub(crate) async fn consume_ops(ctx: &mut ChatCtx<'_>) {
+/// 消费 ctx 排队的异步动作（同步生产者 → 异步消费者；命令与 Control 分支共用）。
+/// 返回 `Some(())` = Backup 进入等待密码挂起（会话层需登记 pending_confirm）。
+pub(crate) async fn consume_ops(ctx: &mut ChatCtx<'_>) -> Option<()> {
     while let Some(op) = ctx.ops.pop_front() {
         match op {
             AsyncOp::Cmd(c) => {
@@ -101,8 +103,16 @@ pub(crate) async fn consume_ops(ctx: &mut ChatCtx<'_>) {
                 }
             }
             AsyncOp::Backup => {
-                if let Err(e) = ctx.identity.backup(ctx.input, ctx.mode).await {
-                    eprintln!("{}", format!("备份失败: {e}").red());
+                use crate::p2p::identity_service::BackupProgress;
+                match ctx.identity.backup_begin(ctx.mode) {
+                    BackupProgress::NoKeystore => {
+                        eprintln!(
+                            "{}",
+                            "未找到本身份的 keystore（身份未在本机加密保存过）".yellow()
+                        );
+                    }
+                    // Pending：等待密码卡片/子窗口作答（会话层登记 pending_confirm）
+                    BackupProgress::Pending => return Some(()),
                 }
             }
             AsyncOp::Listen => {
@@ -122,6 +132,7 @@ pub(crate) async fn consume_ops(ctx: &mut ChatCtx<'_>) {
             }
         }
     }
+    None
 }
 
 /// 向命令队列排入"发命令"动作（字段级借用，可在 handler 持有其它字段借用时调用）

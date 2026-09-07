@@ -1,12 +1,12 @@
-//! chat 业务语义 handler（注册到 SignalRegistry）：hello/bye/chat.text/trust/群事件。
+﻿//! chat 业务语义 handler（注册到 SignalRegistry）：hello/bye/chat.text/trust/群事件。
 
 use std::collections::HashMap;
 
 use colored::Colorize;
 use libp2p::PeerId;
 
+use crate::p2p::identity_service::{HelloOutcome, IdentityService, TextTag};
 use crate::lineio::{ConfirmMode, LineSource};
-use crate::p2p::identity_service::{IdentityService, TextTag};
 use crate::p2p::seam;
 use crate::p2p_app::chat::ctx::Conversation;
 use crate::p2p_app::chat::display;
@@ -27,6 +27,8 @@ pub(crate) struct AppCtx<'a> {
     pub(crate) focused: &'a mut Option<PeerId>,
     pub(crate) input: &'a mut LineSource,
     pub(crate) mode: ConfirmMode,
+    /// hello 两段式：TOFU 首触挂起（待确认确认后由会话补跑钩子与信任重报）
+    pub(crate) hello_pending: Option<(PeerId, String)>,
     pub(crate) cmd_tx: &'a tokio::sync::mpsc::Sender<seam::Cmd>,
     pub(crate) file: &'a mut crate::p2p_app::file_transfer::FileTransferState,
 }
@@ -36,7 +38,8 @@ impl seam::SignalCtx for AppCtx<'_> {
     type Ctx<'a> = AppCtx<'a>;
 }
 
-/// hello（对方上线）：L2 处理存在 + 触发 L3 钩子（解析名字，分析谁上线）
+/// hello（对方上线）：L2 两段式 phase 1——存在处理（TOFU 提示/卡片或直接落账）；
+/// PendingTofu 时"上线钩子 + 信任重报"由会话在确认后补跑
 pub(crate) async fn on_peer_hello_signal(
     ctx: &mut AppCtx<'_>,
     from: &PeerId,
@@ -50,15 +53,18 @@ pub(crate) async fn on_peer_hello_signal(
     };
     // 分离字段借用，让钩子闭包能访问 conversations 而不与 handle_peer_hello 冲突
     let conversations = &mut *ctx.conversations;
-    let ok = ctx
+    let outcome = ctx
         .identity
-        .handle_peer_hello(ctx.input, ctx.mode, from, &name, |peer, name| {
+        .handle_peer_hello_begin(ctx.mode, from, &name, |peer, name| {
             let conv = conversations.entry(*peer).or_insert_with(Conversation::new);
             conv.name = name.to_string();
             println!("{}", format!("对方已上线: {name}").green());
-        })
-        .await
-        .is_ok();
+        });
+
+    if outcome == HelloOutcome::PendingTofu {
+        ctx.hello_pending = Some((*from, name));
+        return true;
+    }
     // 对称信任自愈：hello 处理完（verified 已定型）后，向对方重报当前信任态，重连后重新同步
     let my_name = ctx.identity.my_name().to_string();
     let my_name_bin = serde_cbor::to_vec(&my_name).unwrap_or_default();
@@ -75,7 +81,7 @@ pub(crate) async fn on_peer_hello_signal(
             payload: Some(my_name_bin),
         })
         .await;
-    ok
+    true
 }
 
 /// bye（对方下线）：L2 处理存在 + 触发 L3 钩子（标记会话 + 打印），再发 MarkBye

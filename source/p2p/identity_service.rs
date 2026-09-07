@@ -1,4 +1,4 @@
-﻿//! L2 身份基础服务：身份会话（登录/影子探测/keystore）、联系人簿（TOFU）、
+//! L2 身份基础服务：身份会话（登录/影子探测/keystore）、联系人簿（TOFU）、
 //! 信任判定、Hello/Bye 存在处理。供 L3 业务与文件传输等多协议复用。
 //!
 //! 与聊天协议无关——`IdentityService` 不感知 Frame/群/会话，只回答
@@ -12,7 +12,7 @@ use super::contacts::{fingerprint_of, ContactBook, ContactEntry};
 use super::identity::{
     decrypt_mnemonic, load_keystores, probe_duplicate_id, probe_window, IdentityInfo, LoginOutcome,
 };
-use crate::lineio::{ConfirmMode, LineSource};
+use crate::lineio::ConfirmMode;
 use crate::uievent::AskRequest;
 
 /// L2 内化信号枚举：hello/bye/trust 同一组，仅 L2 认识，L3 业务不触碰。
@@ -70,6 +70,25 @@ pub enum LoginError {
     IdInUse(libp2p::Multiaddr),
     /// 其他错误（IO / 加解密等，透传原错误）
     Other(Box<dyn Error>),
+}
+
+/// hello 处理进度（两段式）：PendingTofu = 等待确认挂起
+/// （落账与 L3 钩子待 phase 2 `complete_tofu` 后由调用方补跑）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelloOutcome {
+    /// 已完整处理（已知联系人 / Auto 自动信任；钩子已执行）
+    Done,
+    /// 首触等待确认（TOFU 提示已打印/卡片已发）
+    PendingTofu,
+}
+
+/// /backup 进度（两段式；Auto 管道不触发 /backup，无需 ReadLine 变体）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupProgress {
+    /// 无本身份 keystore（调用方打印提示，流程结束）
+    NoKeystore,
+    /// 等待密码（确认子窗口 / GUI 卡片）
+    Pending,
 }
 
 impl std::fmt::Display for LoginError {
@@ -185,56 +204,57 @@ impl IdentityService {
             .unwrap_or_else(|| fingerprint_of(peer))
     }
 
-    /// 对方上线（Hello）的存在处理：首次接触做 TOFU 指纹核对（三态：
-    /// Interactive=终端人工确认 / **Ask=发 UiEvent::Ask 弹系统消息卡片 + 读行** /
-    /// Auto=管道按 SSH accept-new 语义自动信任），更新联系人名字与最近见时间；
+    /// 对方上线（Hello）的存在处理 phase 1：TOFU 首触确认（三态——
+    /// Interactive=主窗口打印核对信息，**答案经确认子窗口回传**；
+    /// Ask=发 UiEvent::Ask 系统消息卡片，答案经 InputMsg::Line 回程；
+    /// Auto=管道按 SSH accept-new 语义自动信任）。更新联系人名字与最近见时间。
     /// 已存在联系人保持既有信任状态（OR 合并，不会降级）。
-    pub async fn on_peer_hello(
+    /// 返回 `true` = 等待确认挂起（落账与钩子待 phase 2 `complete_tofu`）；
+    /// 返回 `false` = 已完整落账（可直接跑钩子）。
+    pub fn on_peer_hello_begin(
         &mut self,
-        src: &mut LineSource,
         mode: ConfirmMode,
         peer: &PeerId,
         name: &str,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> bool {
         let pid = peer.to_string();
-        if self.contacts.get(&pid).is_none() {
-            match mode {
-                ConfirmMode::Interactive => {
-                    println!("{}", "首次连接，请核对对方身份指纹:".yellow());
-                    println!("  指纹: {}", fingerprint_of(peer).dimmed());
-                    println!("  节点ID: {pid}");
-                    let ans = src.prompt("是否信任该节点（记录为联系人）? (y/n): ").await?;
-                    self.tofu_apply(peer, name, &ans);
-                }
-                ConfirmMode::Ask => {
-                    // GUI：发系统消息卡片（答案经 InputMsg::Line 回程，与 CLI 同构）
-                    let req = AskRequest {
-                        id: crate::uievent::next_ask_id(),
-                        kind: crate::uievent::AskKind::TofuConfirm {
-                            peer_id: pid.clone(),
-                            name: name.to_string(),
-                            fingerprint: fingerprint_of(peer),
-                        },
-                        secret: false,
-                    };
-                    crate::sink::ask(req);
-                    let ans = src.next_raw_line().await.unwrap_or_default();
-                    self.tofu_apply(peer, name, &ans);
-                }
-                ConfirmMode::Auto => {
-                    // SSH accept-new：管道/e2e 自动信任（自愈补发机制兜底对称同步）
-                    self.contacts.ensure_contact(peer, name, true);
-                }
-            }
-        } else {
+        if self.contacts.get(&pid).is_some() {
             self.contacts.ensure_contact(peer, name, false);
+            return false;
         }
-        Ok(())
+        match mode {
+            ConfirmMode::Interactive => {
+                println!("{}", "首次连接，请核对对方身份指纹:".yellow());
+                println!("  指纹: {}", fingerprint_of(peer).dimmed());
+                println!("  节点ID: {pid}");
+                println!("{}", "（请在弹出的确认窗口中选择是否信任）".dimmed());
+                true
+            }
+            ConfirmMode::Ask => {
+                // GUI：发系统消息卡片（答案经 InputMsg::Line 回程，与 CLI 同构）
+                let req = AskRequest {
+                    id: crate::uievent::next_ask_id(),
+                    kind: crate::uievent::AskKind::TofuConfirm {
+                        peer_id: pid.clone(),
+                        name: name.to_string(),
+                        fingerprint: fingerprint_of(peer),
+                    },
+                    secret: false,
+                };
+                crate::sink::ask(req);
+                true
+            }
+            ConfirmMode::Auto => {
+                // SSH accept-new：管道/e2e 自动信任（自愈补发机制兜底对称同步）
+                self.contacts.ensure_contact(peer, name, true);
+                false
+            }
+        }
     }
 
-    /// TOFU 答案落地：y=信任并记录 / 其余=记录但未信任（后续可经侧栏信任按钮升级）
-    fn tofu_apply(&mut self, peer: &PeerId, name: &str, ans: &str) {
-        let trusted = ans.trim().eq_ignore_ascii_case("y");
+    /// 对方上线（Hello）的存在处理 phase 2：TOFU 答案落地。
+    /// y=信任并记录 / 其余=记录但未信任（后续可经侧栏信任按钮升级）。
+    pub fn complete_tofu(&mut self, peer: &PeerId, name: &str, trusted: bool) {
         self.contacts.ensure_contact(peer, name, trusted);
         if trusted {
             println!("{}", format!("已记录并信任: {name}").green());
@@ -243,6 +263,7 @@ impl IdentityService {
         }
     }
 
+    /// TOFU 答案落地（文本形式，兼容保留）：委托 complete_tofu
     /// 对方主动下线（Bye）的存在处理：记录最近见时间；返回是否已知联系人
     pub fn on_peer_bye(&mut self, peer: &PeerId) -> bool {
         let known = self.contacts.get(&peer.to_string()).is_some();
@@ -252,22 +273,26 @@ impl IdentityService {
         known
     }
 
-    /// L2 处理对方上线（Hello）：先做存在层处理（TOFU/联系人簿），
+    /// L2 处理对方上线（Hello）两段式 phase 1：存在层处理（TOFU/联系人簿），
     /// 再触发 L3 注册的钩子（参数回调，可在运行时替换）。L3 不直接处理原始帧。
-    pub async fn handle_peer_hello<H>(
+    /// 返回 `PendingTofu` = 首触等待确认（**钩子不执行**，待 phase 2
+    /// `complete_tofu` 后由调用方补跑钩子与信任重报）。
+    pub fn handle_peer_hello_begin<H>(
         &mut self,
-        src: &mut LineSource,
         mode: ConfirmMode,
         peer: &PeerId,
         name: &str,
         mut on_hello: H,
-    ) -> Result<(), Box<dyn Error>>
+    ) -> HelloOutcome
     where
         H: FnMut(&PeerId, &str),
     {
-        self.on_peer_hello(src, mode, peer, name).await?;
+        let pending = self.on_peer_hello_begin(mode, peer, name);
+        if pending {
+            return HelloOutcome::PendingTofu;
+        }
         on_hello(peer, name);
-        Ok(())
+        HelloOutcome::Done
     }
 
     /// L2 处理对方下线（Bye）：先做存在层处理（记录最近见），
@@ -280,56 +305,65 @@ impl IdentityService {
         on_bye(peer);
     }
 
-    /// /backup：重新查看本身份助记词（需再输密码解锁 keystore）。
-    /// 三态：Interactive=终端不回显输入；**Ask=发 BackupPassword 卡片（masked）+ 读行**；
-    /// Auto=管道行读取（e2e）。解锁成功后 CLI 打印照旧，Ask 模式附加 MnemonicShow 卡片。
-    pub async fn backup(
-        &mut self,
-        src: &mut LineSource,
-        mode: ConfirmMode,
-    ) -> Result<(), Box<dyn Error>> {
+    /// /backup：重新查看本身份助记词（需再输密码解锁 keystore）——两段式。
+    /// phase 1 `backup_begin`：keystore 检查 + 提示（Interactive 提示"在弹出的确认窗口
+    /// 输入"/ Ask 发 BackupPassword 卡片）/ Auto=管道行读取（e2e，不触发）。
+    /// phase 2 `backup_complete`：解密 + 打印 + Ask 模式附加 MnemonicShow 卡片。
+    pub fn backup_begin(&mut self, mode: ConfirmMode) -> BackupProgress {
         let stored = load_keystores();
-        if let Some((ks, _)) = stored
+        if stored
             .iter()
             .find(|(k, _)| k.peer_id == self.my_id.to_string())
+            .is_none()
         {
-            if mode == ConfirmMode::Ask {
+            return BackupProgress::NoKeystore;
+        }
+        match mode {
+            ConfirmMode::Interactive => {
+                println!("{}", "请输入密码以解锁本身份（在弹出的确认窗口中输入）".yellow());
+            }
+            ConfirmMode::Ask => {
                 crate::sink::ask(AskRequest {
                     id: crate::uievent::next_ask_id(),
                     kind: crate::uievent::AskKind::BackupPassword,
                     secret: true,
                 });
-            } else if mode.is_interactive() {
-                println!("{}", "请输入密码以解锁本身份".yellow());
             }
-            let password = src.prompt_secret(mode, "密码: ").await?;
-            match decrypt_mnemonic(
-                &password,
-                &ks.salt,
-                &ks.nonce,
-                &ks.enc,
-                ks.kdf_m,
-                ks.kdf_t,
-                ks.kdf_p,
-            ) {
-                Ok(phrase) => {
-                    print_mnemonic_guide(&phrase);
-                    println!("{}", "助记词是唯一备份，请妥善保管".dimmed());
-                    if mode == ConfirmMode::Ask {
-                        crate::sink::event(crate::uievent::UiEvent::MnemonicShow {
-                            phrase,
-                        });
-                    }
-                }
-                Err(reason) => eprintln!("{}", reason.red()),
-            }
-        } else {
-            eprintln!(
-                "{}",
-                "未找到本身份的 keystore（身份未在本机加密保存过）".yellow()
-            );
+            ConfirmMode::Auto => {}
         }
-        Ok(())
+        BackupProgress::Pending
+    }
+
+    /// /backup phase 2：解密 + 打印 + Ask 模式附加 MnemonicShow 卡片。
+    /// keystore 缺失或密码错误以打印提示（Ask 模式可重按侧栏按钮重试）。
+    pub fn backup_complete(&mut self, password: &str, mode: ConfirmMode) {
+        let stored = load_keystores();
+        let Some((ks, _)) = stored
+            .iter()
+            .find(|(k, _)| k.peer_id == self.my_id.to_string())
+        else {
+            eprintln!("{}",
+                "未找到本身份的 keystore（身份未在本机加密保存过）".yellow());
+            return;
+        };
+        match decrypt_mnemonic(
+            password,
+            &ks.salt,
+            &ks.nonce,
+            &ks.enc,
+            ks.kdf_m,
+            ks.kdf_t,
+            ks.kdf_p,
+        ) {
+            Ok(phrase) => {
+                print_mnemonic_guide(&phrase);
+                println!("{}", "助记词是唯一备份，请妥善保管".dimmed());
+                if mode == ConfirmMode::Ask {
+                    crate::sink::event(crate::uievent::UiEvent::MnemonicShow { phrase });
+                }
+            }
+            Err(reason) => eprintln!("{}", reason.red()),
+        }
     }
 }
 
@@ -508,18 +542,16 @@ mod tests {
             },
             contacts: ContactBook::load(&my_id),
         };
-        // 管道模式（interactive=false）下 hello 不读 input，可直接喂未使用的 input
-        use tokio::io::AsyncBufReadExt;
-        let mut input =
-            LineSource::Stdin(tokio::io::BufReader::new(tokio::io::stdin()).lines());
-        // hello 钩子触发 + 收到名字
+        // 管道模式（Auto）下 hello 不读 input；phase1 同步完成（落账/挂起）+ 钩子
         let mut hello_calls: Vec<(String, String)> = Vec::new();
-        svc.handle_peer_hello(&mut input, ConfirmMode::Auto, &peer, "bob", |p, n| {
+        svc.handle_peer_hello_begin(ConfirmMode::Auto, &peer, "bob", |p, n| {
             hello_calls.push((p.to_string(), n.to_string()));
-        })
-        .await
-        .unwrap();
-        assert_eq!(hello_calls, vec![(peer.to_string(), "bob".into())]);
+        });
+        assert_eq!(
+            hello_calls,
+            vec![(peer.to_string(), "bob".into())],
+            "Auto 模式 hello 立即完成（钩子同步触发）"
+        );
         // bye 钩子触发
         let mut bye_calls: Vec<String> = Vec::new();
         svc.handle_peer_bye(&peer, |p| bye_calls.push(p.to_string()));

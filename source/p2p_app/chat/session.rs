@@ -192,10 +192,92 @@ pub fn run() {
     });
 }
 
+
+/// 会话内待决确认（两跳状态机：phase1 登记 → 答案到达 → phase2 执行）
+enum PendingConfirm {
+    Tofu { peer: PeerId, name: String },
+    Backup,
+}
+
+/// 确认答案（CLI 确认子窗口任务回传；GUI 卡片答案经 input 路由到达同一第二阶段）
+enum ConfirmAnswer {
+    Tofu { peer: PeerId, trusted: bool },
+    Backup { password: String },
+}
+
+/// 拉起 CLI TOFU 确认子窗口（CREATE_NEW_CONSOLE；答案以退出码回传：0=信任 / 其它=拒绝）
+/// 仅 Windows；非 Windows 退化为主窗口阻塞确认（known boundary）
+#[cfg(windows)]
+fn spawn_tofu_window(
+    tx: tokio::sync::mpsc::UnboundedSender<ConfirmAnswer>,
+    name: String,
+    fingerprint: String,
+    peer: PeerId,
+) {
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = tokio::spawn(async move {
+        let status = tokio::process::Command::new(exe)
+            .args([
+                "--confirm-tofu",
+                &name,
+                &fingerprint,
+                &peer.to_string(),
+            ])
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .status()
+            .await;
+        let trusted = status.map(|s| s.success()).unwrap_or(false);
+        let _ = tx.send(ConfirmAnswer::Tofu { peer, trusted });
+    });
+}
+
+/// 拉起 CLI 密码确认子窗口（rpassword 不回显；答案写入结果文件由父进程读取）
+/// 仅 Windows；非 Windows 退化为主窗口阻塞确认（known boundary）
+#[cfg(windows)]
+fn spawn_secret_window(
+    tx: tokio::sync::mpsc::UnboundedSender<ConfirmAnswer>,
+    title: String,
+) {
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let result_file = std::env::temp_dir().join(format!(
+        "p2p_confirm_secret_{}_{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0),
+    ));
+    let _ = tokio::spawn(async move {
+        let status = tokio::process::Command::new(exe)
+            .args(["--confirm-secret", &title, &result_file.display().to_string()])
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .status()
+            .await;
+        let password = if status.map(|s| s.success()).unwrap_or(false) {
+            std::fs::read_to_string(&result_file).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let _ = std::fs::remove_file(&result_file);
+        if !password.is_empty() {
+            let _ = tx.send(ConfirmAnswer::Backup { password });
+        }
+    });
+}
 pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Result<(), Box<dyn Error>> {
-    // 交互确认三态：Stdin 终端=Interactive（文字提示）；Stdin 管道=Auto（e2e 自动语义）；
+    // 交互确认三态：Stdin 终端=Interactive（文字提示 + 确认子窗口）；Stdin 管道=Auto（e2e 自动语义）；
     // Channel（GUI）=Ask（系统消息卡片 + InputMsg::Line 回程）
     let mode = ConfirmMode::of(&input, std::io::stdin().is_terminal());
+    // 确认应答通道：CLI 确认子窗口任务经此回传答案（GUI 卡片答案走 input 路由）
+    let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::unbounded_channel::<ConfirmAnswer>();
+    // 待决确认状态机：登记后由 input 行（CLI/GUI 答案）或 confirm 臂（CLI 子窗口）驱动第二阶段
+    let mut pending_confirm: Option<PendingConfirm> = None;
 
     // L2 身份基础：GUI 表单凭据直建会话（影子探测防同 ID 双在线），
     // 或 CLI 文本登录菜单产出凭据 → login_pre + 联系人簿（TOFU）
@@ -318,7 +400,49 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
         let offer_expiry = file_state
             .next_offer_expiry()
             .map(tokio::time::Instant::from_std);
-        tokio::select! {
+        tokio::select! {        // 确认应答臂：CLI 确认子窗口任务回传答案 → 执行第二阶段（不冻结会话循环）
+        answer = confirm_rx.recv(), if !confirm_rx.is_closed() => {
+            match answer {
+                Some(ConfirmAnswer::Tofu { peer, trusted }) => {
+                    let name = match &pending_confirm {
+                        Some(PendingConfirm::Tofu { name, .. }) => name.clone(),
+                        _ => String::new(),
+                    };
+                    identity.complete_tofu(&peer, &name, trusted);
+                    // 补跑 hello 钩子：会话名更新 + 上线提示
+                    if let Some(conv) = conversations.get_mut(&peer) {
+                        if conv.name.is_empty() {
+                            conv.name = name.clone();
+                        }
+                    }
+                    println!("{}", format!("对方已上线: {name}").green());
+                    // 信任重报（自愈）：落账后向对方重报当前信任态
+                    let my_name = identity.my_name().to_string();
+                    let trust_tag = if identity.is_verified(&peer) {
+                        TextTag::TrustConfirm.as_str()
+                    } else {
+                        TextTag::TrustRevoke.as_str()
+                    };
+                    let _ = cmd_tx
+                        .send(seam::Cmd::Send {
+                            peer,
+                            tag: trust_tag.to_string(),
+                            payload: Some(serde_cbor::to_vec(&my_name).unwrap_or_default()),
+                        })
+                        .await;
+                    push_sidebar(
+                        &identity, &groups, &connected, &focused, &focused_group,
+                        &registered,
+                    );
+                    pending_confirm = None;
+                }
+                Some(ConfirmAnswer::Backup { password }) => {
+                    identity.backup_complete(&password, mode);
+                    pending_confirm = None;
+                }
+                None => {}
+            }
+        }
             _ = tokio::time::sleep_until(offer_expiry.unwrap_or_else(tokio::time::Instant::now)), if offer_expiry.is_some() => {
                 // H2：offer 超时——对端不应答（网络突发/对端退出）时中止并清理，防状态悬挂
                 for (peer, file_id, name) in
@@ -346,6 +470,53 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
             msg = input.next_input() => {
                 // None = 输入结束（EOF/通道关闭）：多行收集中则报未闭合丢弃
                 let line = match msg {
+                    // 待决确认路由：登记期间到达的文本行 = 该确认的答案（终端串行语义）
+                    Some(InputMsg::Line(l)) => {
+                        if let Some(pc) = pending_confirm.take() {
+                            match pc {
+                                PendingConfirm::Tofu { peer, name } => {
+                                    let trusted = l.trim().eq_ignore_ascii_case("y");
+                                    identity.complete_tofu(&peer, &name, trusted);
+                                    // 补跑 hello 钩子：会话名更新 + 上线提示
+                                    if let Some(conv) = conversations.get_mut(&peer) {
+                                        if conv.name.is_empty() {
+                                            conv.name = name.clone();
+                                        }
+                                    }
+                                    println!(
+                                        "{}",
+                                        format!("对方已上线: {name}").green()
+                                    );
+                                    // 信任重报（自愈）：落账后向对方重报当前信任态
+                                    let my_name = identity.my_name().to_string();
+                                    let trust_tag = if identity.is_verified(&peer) {
+                                        TextTag::TrustConfirm.as_str()
+                                    } else {
+                                        TextTag::TrustRevoke.as_str()
+                                    };
+                                    let _ = cmd_tx
+                                        .send(seam::Cmd::Send {
+                                            peer,
+                                            tag: trust_tag.to_string(),
+                                            payload: Some(
+                                                serde_cbor::to_vec(&my_name).unwrap_or_default(),
+                                            ),
+                                        })
+                                        .await;
+                                    push_sidebar(
+                                        &identity, &groups, &connected, &focused,
+                                        &focused_group, &registered,
+                                    );
+                                    continue;
+                                }
+                                PendingConfirm::Backup => {
+                                    identity.backup_complete(l.trim(), mode);
+                                    continue;
+                                }
+                            }
+                        }
+                        l
+                    }
                     // 结构化控制动作（GUI 点击/按钮）：不经命令文本解析，复刻对应命令逻辑
                     Some(InputMsg::Control(c)) => {
                         let mut ctx = make_chat_ctx(
@@ -354,7 +525,16 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                             &connected, &mut registered, &mut file_state,
                         );
                         handle_control(&mut ctx, c).await;
-                        consume_ops(&mut ctx).await;
+                        if consume_ops(&mut ctx).await.is_some() {
+                            // Backup 进入等待密码挂起：登记待决确认
+                            pending_confirm = Some(PendingConfirm::Backup);
+                            if mode == ConfirmMode::Interactive {
+                                spawn_secret_window(
+                                    confirm_tx.clone(),
+                                    "备份助记词：输入解锁密码".to_string(),
+                                );
+                            }
+                        }
                         push_sidebar(ctx.identity, ctx.groups, ctx.connected, ctx.focused, &ctx.focused_group, ctx.registered);
                         continue;
                     }
@@ -371,7 +551,6 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                         }
                         continue;
                     }
-                    Some(InputMsg::Line(l)) => l,
                     None => {
                         if let Some((_, remaining)) = &sendstrings {
                             eprintln!(
@@ -447,7 +626,16 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                         eprintln!("{}", format!("未知命令: {cmd}").yellow());
                     }
                     // 异步消费 handler 排队的动作（同步生产者 → 异步消费者）
-                    consume_ops(&mut ctx).await;
+                    if consume_ops(&mut ctx).await.is_some() {
+                        // Backup 进入等待密码挂起：登记待决确认
+                        pending_confirm = Some(PendingConfirm::Backup);
+                        if mode == ConfirmMode::Interactive {
+                            spawn_secret_window(
+                                confirm_tx.clone(),
+                                "备份助记词：输入解锁密码".to_string(),
+                            );
+                        }
+                    }
                     if ctx.quit {
                         // 等 Bye 帧送达（传输任务独立处理），再关闭传输任务
                         tokio::time::sleep(BYE_HANDSHAKE_TIMEOUT).await;
@@ -574,11 +762,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                 if !is_l2_signal(&tag) && !identity.effective_trusted(&from) {
                                     // 拦截可见性：未互信来源的业务信号被丢弃时明确提示
                                     // （每条都提示——单方面信任的"不通"必须可诊断）
-                                    let who = peer_name(
-                                        &from,
-                                        &conversations,
-                                        &identity,
-                                    );
+                                    let who = peer_name(&from, &conversations, &identity);
                                     println!(
                                         "{}",
                                         format!(
@@ -593,6 +777,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                         focused: &mut focused,
                                         input: &mut input,
                                         mode,
+                                        hello_pending: None,
                                         cmd_tx: &cmd_tx,
                                         file: &mut file_state,
                                     };
@@ -608,6 +793,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                     focused: &mut focused,
                                     input: &mut input,
                                     mode,
+                                    hello_pending: None,
                                     cmd_tx: &cmd_tx,
                                     file: &mut file_state,
                                 };
@@ -619,6 +805,36 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                         "{}",
                                         format!("未处理的自定义语义: {tag}").yellow()
                                     );
+                                }
+                                // hello 两段式：TOFU 首触挂起 → 登记待决确认
+                                // （Interactive 同时拉起确认子窗口；Ask 卡片已由 L2 发出）
+                                if let Some((peer, name)) = actx.hello_pending.take() {
+                                    pending_confirm = Some(PendingConfirm::Tofu {
+                                        peer,
+                                        name: name.clone(),
+                                    });
+                                    #[cfg(windows)]
+                                    if mode == ConfirmMode::Interactive {
+                                        let fp = identity.fingerprint(&peer);
+                                        spawn_tofu_window(
+                                            confirm_tx.clone(),
+                                            name.clone(),
+                                            fp,
+                                            peer,
+                                        );
+                                    }
+                                    #[cfg(not(windows))]
+                                    if mode == ConfirmMode::Interactive {
+                                        // 非 Windows 退化：记录为未信任（known boundary）
+                                        identity.complete_tofu(&peer, &name, false);
+                                        println!(
+                                            "{}",
+                                            "非 Windows 暂不支持交互确认，已记录为未信任（可稍后 /trust 升级）"
+                                                .yellow()
+                                        );
+                                        pending_confirm = None;
+                                    }
+                                    continue;
                                 }
                             }
                             Event::Gossip { source, data } => {
