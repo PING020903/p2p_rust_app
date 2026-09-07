@@ -684,6 +684,23 @@ impl eframe::App for GuiApp {
                                     }
                                 });
                             }
+                            crate::uievent::AskKind::UntrustedSend { name } => {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "对方 {name} 未互信，消息可能被对端忽略"
+                                    ))
+                                    .strong(),
+                                );
+                                ui.weak("仍要发送？（互信后不再询问）");
+                                ui.horizontal(|ui| {
+                                    if ui.button("仍要发送").clicked() {
+                                        answered = Some("y");
+                                    }
+                                    if ui.button("取消发送").clicked() {
+                                        answered = Some("n");
+                                    }
+                                });
+                            }
                         }
                     });
                 if answered.is_some() {

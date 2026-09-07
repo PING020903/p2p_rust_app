@@ -95,6 +95,8 @@ pub enum AskKind {
     },
     /// /backup 解锁密码（secret=true；答案即密码行）
     BackupPassword,
+    /// 未互信发送确认（答案 y=仍要发送并记忆 / n=取消；Ask 卡片文案注明对端可能忽略）
+    UntrustedSend { name: String },
 }
 
 /// Ask 请求：引擎单飞行（同时最多一个）；id 自增防御错位

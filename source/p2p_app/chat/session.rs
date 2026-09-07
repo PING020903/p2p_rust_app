@@ -98,24 +98,52 @@ async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
             } else {
                 name
             };
-            // D3：未互信联系人首次发消息确认（仅交互终端；管道/e2e 自动放行）
+            // D3：未互信联系人发送确认（三态：Interactive 终端 y/n / **Ask 系统消息卡片** /
+            // Auto 管道放行但文案如实——发出≠送达，对端未互信时会静默丢弃）
             if !ctx.identity.effective_trusted(&p) {
-                if ctx.mode == ConfirmMode::Interactive && !ctx.conversations[&p].send_confirmed {
-                    println!(
-                        "{}",
-                        format!("对方 {who} 未互信（需双方 /trust），确认发送？(y/n)").yellow()
-                    );
-                    let ans = match ctx.input.next_raw_line().await {
-                        Some(l) => l.trim().to_string(),
-                        None => String::new(),
-                    };
-                    if !ans.eq_ignore_ascii_case("y") {
-                        println!("{}", "已取消发送".dimmed());
-                        return;
+                match ctx.mode {
+                    ConfirmMode::Interactive if !ctx.conversations[&p].send_confirmed => {
+                        println!(
+                            "{}",
+                            format!("对方 {who} 未互信（需双方 /trust），确认发送？(y/n)").yellow()
+                        );
+                        let ans = match ctx.input.next_raw_line().await {
+                            Some(l) => l.trim().to_string(),
+                            None => String::new(),
+                        };
+                        if !ans.eq_ignore_ascii_case("y") {
+                            println!("{}", "已取消发送".dimmed());
+                            return;
+                        }
+                        ctx.conversations.get_mut(&p).unwrap().send_confirmed = true;
                     }
-                    ctx.conversations.get_mut(&p).unwrap().send_confirmed = true;
-                } else if ctx.mode != ConfirmMode::Interactive {
-                    println!("{}", format!("对方 {who} 未信任，消息仍已发送").yellow());
+                    ConfirmMode::Ask if !ctx.conversations[&p].send_confirmed => {
+                        // GUI：发系统消息卡片（答案经 InputMsg::Line 回程，同 CLI 交互）
+                        crate::sink::ask(crate::uievent::AskRequest {
+                            id: crate::uievent::next_ask_id(),
+                            kind: crate::uievent::AskKind::UntrustedSend {
+                                name: who.clone(),
+                            },
+                            secret: false,
+                        });
+                        let ans = match ctx.input.next_raw_line().await {
+                            Some(l) => l.trim().to_string(),
+                            None => String::new(),
+                        };
+                        if !ans.eq_ignore_ascii_case("y") {
+                            println!("{}", "已取消发送".dimmed());
+                            return;
+                        }
+                        ctx.conversations.get_mut(&p).unwrap().send_confirmed = true;
+                    }
+                    ConfirmMode::Auto => {
+                        println!(
+                            "{}",
+                            format!("对方 {who} 未互信：消息已发出（对端未互信时可能被忽略）")
+                                .yellow()
+                        );
+                    }
+                    ConfirmMode::Interactive | ConfirmMode::Ask => {}
                 }
             }
             let payload = serde_cbor::to_vec(&ChatTextPayload {
@@ -516,6 +544,20 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                 // 业务信号（chat.*/file.*）须互信，否则走该 tag 的未互信钩子
                                 // （L2 API `register_untrusted`；未注册 = 空函数 = 丢弃）
                                 if !is_l2_signal(&tag) && !identity.effective_trusted(&from) {
+                                    // 拦截可见性：未互信来源的业务信号被丢弃时明确提示
+                                    // （每条都提示——单方面信任的"不通"必须可诊断）
+                                    let who = peer_name(
+                                        &from,
+                                        &conversations,
+                                        &identity,
+                                    );
+                                    println!(
+                                        "{}",
+                                        format!(
+                                            "收到未信任方 {who} 的业务消息已拦截（互信后可见）: {tag}"
+                                        )
+                                        .yellow()
+                                    );
                                     let mut actx = AppCtx {
                                         identity: &mut identity,
                                         conversations: &mut conversations,
