@@ -64,12 +64,13 @@ pub(crate) fn push_sidebar(
                 e.name
             };
             Some(ContactView {
-                peer_id: e.peer_id,
+                peer_id: e.peer_id.clone(),
                 name,
                 online: connected.contains(&peer),
                 focused: *focused == Some(peer),
                 effective_trusted: e.verified && e.their_trust,
                 i_trust: e.verified,
+                fingerprint: e.fingerprint,
             })
         })
         .collect();

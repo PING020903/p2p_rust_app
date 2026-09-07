@@ -57,6 +57,8 @@ pub struct ContactView {
     pub effective_trusted: bool,
     /// 我已信任（对方未确认）
     pub i_trust: bool,
+    /// TOFU 指纹（信任确认卡片展示用——D4：信任前人工核对）
+    pub fingerprint: String,
 }
 
 /// 侧栏群条目

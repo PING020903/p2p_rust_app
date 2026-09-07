@@ -48,6 +48,24 @@ struct AddForm {
     open: bool,
 }
 
+/// 信任操作确认卡片数据（纯 GUI 两段式：按钮先出卡片，确认后才发 Control::Trust）
+#[derive(Debug, Clone)]
+struct TrustCard {
+    peer: libp2p::PeerId,
+    peer_id: String,
+    name: String,
+    fingerprint: String,
+    /// true = 升级信任 / false = 取消信任
+    trusted: bool,
+}
+
+/// render_sidebar 的产出（动作 + trace 行 + 信任确认卡片请求）
+struct SidebarOut {
+    action: Option<InputMsg>,
+    traces: Vec<String>,
+    trust_card: Option<TrustCard>,
+}
+
 impl TimelineItem {
     fn line(s: impl Into<String>) -> Self {
         TimelineItem::Line(s.into())
@@ -119,6 +137,8 @@ pub struct GuiApp {
     ask_input: String,
     /// 助记词展示卡片（MnemonicShow 事件；[我已保存] 关闭）
     mnemonic_show: Option<String>,
+    /// 信任操作确认卡片（两段式：按钮先出卡片，确认后才发 Control::Trust）
+    pending_trust: Option<TrustCard>,
     /// 首帧标记：自动聚焦输入框
     first_frame: bool,
     /// 耗时统计
@@ -193,6 +213,7 @@ impl GuiApp {
             pending_ask: None,
             ask_input: String::new(),
             mnemonic_show: None,
+            pending_trust: None,
             first_frame: true,
             stats: timing::TimingStats::default(),
             runtime,
@@ -441,6 +462,7 @@ impl eframe::App for GuiApp {
         // 左栏：联系人（信任徽标/在线/焦点）+ 已发现节点 + 添加表单 + 我的地址；
         // 点击发结构化 Control 动作（不经命令文本）
         let mut sidebar_action: Option<InputMsg> = None;
+        let mut sidebar_trust_card: Option<TrustCard> = None;
         let mut sidebar_traces: Vec<String> = Vec::new();
         {
             let sidebar = &self.sidebar;
@@ -451,14 +473,23 @@ impl eframe::App for GuiApp {
                     .default_size(230.0)
                     .resizable(true)
                     .show(ui, |ui| {
-                        let (a, t) = render_sidebar(ui, sidebar.as_ref(), my_addrs, add_form);
-                        sidebar_action = a;
-                        sidebar_traces = t;
+                        let out = render_sidebar(ui, sidebar.as_ref(), my_addrs, add_form);
+                        sidebar_action = out.action;
+                        sidebar_traces = out.traces;
+                        sidebar_trust_card = out.trust_card;
                     });
             }
         }
         for t in sidebar_traces {
             self.ui_trace(t);
+        }
+        // 信任两段式：按钮请求出确认卡片（D4 指纹核对先于信任落账）
+        if let Some(card) = sidebar_trust_card {
+            self.ui_trace(format!(
+                "event=trust_card open trusted={} peer={}",
+                card.trusted, card.peer_id
+            ));
+            self.pending_trust = Some(card);
         }
         if let Some(msg) = sidebar_action {
             let note = match &msg {
@@ -690,6 +721,68 @@ impl eframe::App for GuiApp {
                 self.pending_ask = None;
             }
 
+            // 信任操作确认卡片（两段式：确认后才发 Control::Trust；D4 指纹核对）
+            let mut trust_confirmed: Option<TrustCard> = None;
+            let mut trust_cancelled = false;
+            if let Some(card) = &self.pending_trust {
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::from_rgb(70, 56, 20))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::symmetric(10, 7))
+                    .show(ui, |ui| {
+                        ui.set_max_width(ui.available_width());
+                        let title = if card.trusted {
+                            format!("⚠ 确认信任：{}", card.name)
+                        } else {
+                            format!("⚠ 确认取消信任：{}", card.name)
+                        };
+                        ui.label(egui::RichText::new(title).strong());
+                        ui.weak(format!("指纹 {}", card.fingerprint));
+                        ui.weak(format!("节点ID {}", card.peer_id));
+                        if !card.trusted {
+                            ui.weak("对方将收到撤销信任信号（对称信任降级）");
+                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(if card.trusted { "确认信任" } else { "确认取消" })
+                                .clicked()
+                            {
+                                trust_confirmed = Some(card.clone());
+                            }
+                            if ui.button("取消操作").clicked() {
+                                trust_cancelled = true;
+                            }
+                        });
+                    });
+                if trust_confirmed.is_some() || trust_cancelled {
+                    self.ui_trace(format!(
+                        "event=trust_card close trusted={} action={}",
+                        card.trusted,
+                        if trust_cancelled { "cancel" } else { "confirm" }
+                    ));
+                }
+                ui.add_space(2.0);
+            }
+            if let Some(card) = trust_confirmed {
+                self.interact.log(
+                    Level::Info,
+                    "user",
+                    format!(
+                        "确认{}: {}",
+                        if card.trusted { "信任" } else { "取消信任" },
+                        card.name
+                    ),
+                );
+                self.input_sent_at = Some(Instant::now());
+                self.send_input(InputMsg::Control(Control::Trust {
+                    peer: card.peer,
+                    trusted: card.trusted,
+                }));
+                self.pending_trust = None;
+            } else if trust_cancelled {
+                self.pending_trust = None;
+            }
+
             // 助记词展示卡片（/backup 解锁成功；大字 + 复制 + 显式关闭）
             if let Some(phrase) = &self.mnemonic_show {
                 let mut close = false;
@@ -776,9 +869,10 @@ fn render_sidebar(
     sb: Option<&crate::uievent::SidebarState>,
     my_addrs: &[String],
     add_form: &mut AddForm,
-) -> (Option<InputMsg>, Vec<String>) {
+) -> SidebarOut {
     let mut action: Option<InputMsg> = None;
     let mut traces: Vec<String> = Vec::new();
+    let mut trust_card: Option<TrustCard> = None;
 
     ui.heading("联系人");
     let empty_c: Vec<crate::uievent::ContactView> = Vec::new();
@@ -821,7 +915,7 @@ fn render_sidebar(
                 }
             }
             resp.on_hover_text(&c.peer_id);
-            // 信任按钮：已方已信任 → 取消信任；否则 → 信任
+            // 信任按钮：已方已信任 → 取消信任；否则 → 信任（两段式：先出确认卡片，D4 指纹核对）
             let (label, btn_color) = if c.i_trust {
                 ("取消信任", egui::Color32::from_rgb(230, 180, 0))
             } else {
@@ -832,10 +926,13 @@ fn render_sidebar(
                 .clicked()
             {
                 if let Ok(peer) = c.peer_id.parse::<libp2p::PeerId>() {
-                    action = Some(InputMsg::Control(Control::Trust {
+                    trust_card = Some(TrustCard {
                         peer,
+                        peer_id: c.peer_id.clone(),
+                        name: c.name.clone(),
+                        fingerprint: c.fingerprint.clone(),
                         trusted: !c.i_trust,
-                    }));
+                    });
                 }
             }
             let (badge, color) = if c.effective_trusted {
@@ -989,7 +1086,11 @@ fn render_sidebar(
             }
         }
     }
-    (action, traces)
+    SidebarOut {
+        action,
+        traces,
+        trust_card,
+    }
 }
 
 /// 聊天气泡：对侧左对齐、我侧右对齐；头部小字（名字/群前缀 + 时刻），正文自动换行。

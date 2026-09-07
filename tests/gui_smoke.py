@@ -168,6 +168,7 @@ def main() -> int:
         import pyautogui
         import pyperclip
 
+        pyautogui.FAILSAFE = False  # 自动化脚本：UIA 元素坐标可能落在屏幕角落，禁用防呆
         edit.click_input()
         time.sleep(0.5)
         pyperclip.copy(args.password)
@@ -249,15 +250,35 @@ def main() -> int:
             return 7
         print(f"[4/4] 联系人点击断言通过（{args.contact}）")
 
-    # 5) 信任按钮冒烟（需 --contact 同时给出；联系人未互信时按钮文案为"信任"）
+    # 5) 信任链路两段式冒烟（需 --contact；按钮→确认卡片→确认→引擎执行）
     if args.contact:
-        trust = find("信任")
-        if trust:
-            click(trust)
-            if not wait_log_contains(log, "点击: 信任联系人"):
-                print("FAIL：信任点击未落日志")
-                return 8
-            print("[5/5] 信任按钮断言通过")
+        el = find(args.contact, types=("Text", "ListItem", "Button"))
+        if el is None:
+            print(f"FAIL：未找到联系人 {args.contact}")
+            return 7
+        click(el)
+        if not wait_log_contains(log, f"点击: 切换会话: {args.contact}"):
+            print("FAIL：联系人点击未落日志")
+            return 7
+        print(f"[4/4] 联系人点击断言通过（{args.contact}）")
+        # 信任按钮 → 确认卡片出现 → 确认信任 → 引擎执行
+        trust_btn = find("信任")
+        if trust_btn is None:
+            print("FAIL：未找到 信任 按钮")
+            return 8
+        click(trust_btn)
+        if not wait_log_contains(runtime_log, "event=trust_card open"):
+            print("FAIL：确认卡片未弹出（runtime.log 无 event=trust_card）")
+            return 8
+        confirm_btn = find("确认信任")
+        if confirm_btn is None:
+            print("FAIL：未找到 确认信任 按钮（卡片未渲染？）")
+            return 8
+        click(confirm_btn)
+        if not wait_log_contains(log, "已信任:"):
+            print("FAIL：确认后引擎未执行信任")
+            return 8
+        print("[5/5] 信任两段式断言通过（按钮→卡片→确认→已信任）")
 
     print("SMOKE PASS")
     # 收尾：关闭自启的 GUI（残留实例会干扰后续 e2e——mDNS/端口）；

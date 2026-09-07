@@ -16,6 +16,14 @@
     （只命中 contacts_*.json，群缓存/其它文件不受影响）
   - 服务 TOFU 卡片等首次接触流程的重复测试（此前默认读缓存无法重测）；仅主菜单入口，
     不影响身份 keystore/群缓存/会话日志
+- **P2.6 步2.5：信任操作两段式确认卡片**：
+  - 侧栏信任按钮（升级信任/取消信任）不再直接执行——先出**确认卡片**（名字+指纹+节点ID+
+    [确认]/[取消]），确认后才发 `Control::Trust`——D4 闭环：指纹人工核对先于信任落账
+  - 纯 GUI 两段式（不走 Ask 协议：信任升级引擎无感知，无需阻塞等待）；取消语义显式化
+    （提示对端将收到 revoke 信号）；TOFU 拒绝后重复 hello 不重新弹卡（升级走此卡片）
+  - `ContactView` 增 `fingerprint`（TOFU 已存指纹推送到侧栏——补 GUI 拿不到指纹的缺口）；
+    render_sidebar 产出结构化 `SidebarOut{action, traces, trust_card}`
+  - trace：`event=trust_card open/close trusted=... action=confirm/cancel`
 - **P2.6 步2：BackupPassword Ask + MnemonicShow 卡片**：
   - /backup 三态：Ask 模式发 BackupPassword 卡片（masked 密码框 + 解锁按钮，回车提交），
     解锁成功后 CLI 打印照旧 + 附加 `UiEvent::MnemonicShow` 卡片（大字助记词 + 复制 +
