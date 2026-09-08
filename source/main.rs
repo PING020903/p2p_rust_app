@@ -53,9 +53,19 @@ fn main() {
     //     答案以退出码（0=确认）/结果文件回传父进程后立即退出，不进入任何主流程。
     let cargs: Vec<String> = std::env::args().skip(1).collect();
     match cargs.first().map(|s| s.as_str()) {
-        Some("--confirm-tofu") => confirm_tofu_entry(&cargs[1..]),
-        Some("--confirm-secret") => confirm_secret_entry(&cargs[1..]),
-        Some("--confirm-file") => confirm_file_entry(&cargs[1..]),
+        Some(m @ ("--confirm-tofu" | "--confirm-secret" | "--confirm-file")) => {
+            // 确认子进程：spawn 侧以 Stdio::null() 隔离了 stdio（防继承主窗口控制台句柄
+            // 扣住主窗口键盘输入）——先把 std 句柄接回自己的新控制台，再关 QuickEdit
+            #[cfg(windows)]
+            attach_console_stdio();
+            #[cfg(windows)]
+            disable_quick_edit();
+            match m {
+                "--confirm-tofu" => confirm_tofu_entry(&cargs[1..]),
+                "--confirm-secret" => confirm_secret_entry(&cargs[1..]),
+                _ => confirm_file_entry(&cargs[1..]),
+            }
+        }
         _ => {}
     }
     // 2. 管道输入（非终端）→ 纯 CLI（e2e / 脚本喂入）
@@ -129,6 +139,93 @@ fn spawn_detached() -> Result<(), String> {
 
 struct MainCtx {
     quit: bool,
+}
+
+/// 禁用当前控制台的快速编辑模式（QuickEdit）。根因（实测）：确认子窗口抢焦点 →
+/// 用户点击主窗口聚焦时拖选文本 → conhost 进入选择模式，该控制台输入/输出整体冻结。
+/// 清 QUICK_EDIT 位 + 置 EXTENDED_FLAGS（变更生效前提）；非控制台/失败返回 false（静默）。
+#[cfg(windows)]
+pub(crate) fn disable_quick_edit() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> isize;
+        fn GetConsoleMode(h_console: isize, lp_mode: *mut u32) -> i32;
+        fn SetConsoleMode(h_console: isize, dw_mode: u32) -> i32;
+    }
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode = 0u32;
+        GetConsoleMode(h, &mut mode) != 0
+            && SetConsoleMode(h, (mode & !ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS) != 0
+    }
+}
+
+/// 确认子进程 stdio 自挂控制台：spawn 侧以 `Stdio::null()` 隔离父子 stdio（实测继承
+/// 主窗口控制台句柄会扣住主窗口键盘输入，子窗口退出才涌出），本函数把 std 句柄接回
+/// 子进程自己的新控制台——C 等价 `freopen("CONIN$","r",stdin); freopen("CONOUT$","w",stdout)`。
+/// 判定：有真实控制台（GetConsoleWindow≠0）且 stdin 不是控制台（被 null）才接回；
+/// 管道/脚本（无控制台）与真终端直敲（stdin 已是控制台）均不触发——行为不变。
+#[cfg(windows)]
+fn attach_console_stdio() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> isize;
+        fn SetStdHandle(n_std_handle: u32, h_handle: isize) -> i32;
+        fn GetConsoleMode(h_console: isize, lp_mode: *mut u32) -> i32;
+        fn GetConsoleWindow() -> isize;
+        fn CreateFileW(
+            lp_filename: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *const core::ffi::c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: isize,
+        ) -> isize;
+    }
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const OPEN_EXISTING: u32 = 3;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    unsafe {
+        if GetConsoleWindow() == 0 || GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mut 0) != 0 {
+            return;
+        }
+        let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+        let conin = CreateFileW(
+            wide("CONIN$").as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            core::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            0,
+        );
+        if conin != INVALID_HANDLE_VALUE {
+            SetStdHandle(STD_INPUT_HANDLE, conin);
+        }
+        let conout = CreateFileW(
+            wide("CONOUT$").as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            core::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            0,
+        );
+        if conout != INVALID_HANDLE_VALUE {
+            SetStdHandle(STD_OUTPUT_HANDLE, conout);
+            SetStdHandle(STD_ERROR_HANDLE, conout);
+        }
+    }
 }
 
 /// 确认子窗口入口①：`--confirm-tofu <name> <fingerprint> <peer>`（会话层 spawn_tofu_window 拉起）。

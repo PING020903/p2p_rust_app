@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io::IsTerminal;
+use std::process::Stdio;
 use tokio::io::AsyncBufReadExt;
 
 use colored::Colorize;
@@ -263,6 +264,11 @@ fn spawn_tofu_window(
                 &fingerprint,
                 &peer.to_string(),
             ])
+            // stdio 全 null：不继承主窗口控制台句柄（实测继承会扣住主窗口键盘输入，
+            // 子窗口退出才涌出）；子入口 attach_console_stdio 自挂 CONIN$/CONOUT$
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .creation_flags(CREATE_NEW_CONSOLE)
             .status()
             .await;
@@ -293,6 +299,10 @@ fn spawn_secret_window(
     let _ = tokio::spawn(async move {
         let status = tokio::process::Command::new(exe)
             .args(["--confirm-secret", &title, &result_file.display().to_string()])
+            // stdio 全 null：同 spawn_tofu_window——不继承主窗口控制台句柄
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .creation_flags(CREATE_NEW_CONSOLE)
             .status()
             .await;
@@ -330,6 +340,11 @@ fn spawn_file_window(
                 &name,
                 &size.to_string(),
             ])
+            // stdio 全 null：不继承主窗口控制台句柄（实测继承会扣住主窗口键盘输入，
+            // 子窗口退出才涌出）；子入口 attach_console_stdio 自挂 CONIN$/CONOUT$
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .creation_flags(CREATE_NEW_CONSOLE)
             .status()
             .await;
@@ -342,32 +357,6 @@ fn spawn_file_window(
             accepted,
         });
     });
-}
-
-/// CLI Interactive 启动时禁用控制台快速编辑模式（QuickEdit）。
-/// 根因（实测）：确认子窗口抢焦点 → 用户点击主窗口聚焦时拖选文本 → conhost 进入选择模式，
-/// 该控制台输入/输出整体冻结（打字无回显、程序读不到输入、收到的消息不上屏）。
-/// 清 QUICK_EDIT 位 + 置 EXTENDED_FLAGS（变更生效前提）即关闭鼠标拖选；失败静默（非致命）。
-#[cfg(windows)]
-fn disable_quick_edit() {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetStdHandle(n_std_handle: u32) -> isize;
-        fn GetConsoleMode(h_console: isize, lp_mode: *mut u32) -> i32;
-        fn SetConsoleMode(h_console: isize, dw_mode: u32) -> i32;
-    }
-    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
-    const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
-    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
-    unsafe {
-        let h = GetStdHandle(STD_INPUT_HANDLE);
-        let mut mode = 0u32;
-        if GetConsoleMode(h, &mut mode) != 0
-            && SetConsoleMode(h, (mode & !ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS) != 0
-        {
-            println!("{}", "已禁用控制台快速编辑（防点击拖选冻结输入）".dimmed());
-        }
-    }
 }
 
 /// 会话循环调试跟踪（`P2P_DEBUG_SESSION=1` 开启）：每个 select 臂触发追加一行到
@@ -395,6 +384,11 @@ impl SessionTrace {
         SessionTrace { file }
     }
 
+    /// tick 臂预条件：仅 trace 开启时存在（每秒一行"tick"——空窗期判循环死活的证据）
+    fn enabled(&self) -> bool {
+        self.file.is_some()
+    }
+
     fn log(&mut self, msg: &str) {
         if let Some(f) = &mut self.file {
             use std::io::Write;
@@ -407,13 +401,14 @@ impl SessionTrace {
     }
 }
 
-pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Result<(), Box<dyn Error>> {    // 交互确认三态：Stdin 终端=Interactive（文字提示 + 确认子窗口）；Stdin 管道=Auto（e2e 自动语义）；
+pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Result<(), Box<dyn Error>> {
+    // 交互确认三态：Stdin 终端=Interactive（文字提示 + 确认子窗口）；Stdin 管道=Auto（e2e 自动语义）；
     // Channel（GUI）=Ask（系统消息卡片 + InputMsg::Line 回程）
     let mode = ConfirmMode::of(&input, std::io::stdin().is_terminal());
     // CLI 交互终端：禁用 QuickEdit——确认子窗口抢焦点后用户点击拖选会冻结控制台输入
     #[cfg(windows)]
-    if mode == ConfirmMode::Interactive {
-        disable_quick_edit();
+    if mode == ConfirmMode::Interactive && crate::disable_quick_edit() {
+        println!("{}", "已禁用控制台快速编辑（防点击拖选冻结输入）".dimmed());
     }
     // 确认应答通道：CLI 确认子窗口任务经此回传答案（GUI 卡片答案走 input 路由）
     let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::unbounded_channel::<ConfirmAnswer>();
@@ -466,6 +461,13 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
     let mut focused: Option<PeerId> = None;
     let mut connected: HashSet<PeerId> = HashSet::new();
     let mut registered: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+
+    // trace tick 定时器（仅 trace 开启时的 select 臂）：每秒一行 tick——
+    // 输入空窗期循环死活的直接证据（tick 连续=循环活、输入管道问题；tick 停=循环卡死）
+    let mut trace_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+    );
 
     // 语义注册表（L2 seam 提供）：L2 存在语义（hello/bye/trust 内化 text）+ L3 chat 业务 handler。
     // 收到信号 tag 即查表分发（无 match）。L2 内化信号用 TextTag 常量注册（L3 不触碰）。
@@ -561,8 +563,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
         tokio::select! {        // 确认应答臂：CLI 确认子窗口任务回传答案 → 执行第二阶段（不冻结会话循环）
         answer = confirm_rx.recv(), if !confirm_rx.is_closed() => {
             trace.log("confirm: answer");
-            match answer {
-                Some(ConfirmAnswer::Tofu { peer, trusted }) => {
+            match answer {                Some(ConfirmAnswer::Tofu { peer, trusted }) => {
                     let name = match &pending_confirm {
                         Some(PendingConfirm::Tofu { name, .. }) => name.clone(),
                         _ => String::new(),
@@ -916,6 +917,10 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                 trace.log("chat begin");
                 send_focused_text(&mut ctx, line).await;
                 trace.log("chat done");
+            }
+            // trace tick 臂（仅 trace 开启时启用）：每秒一行，判循环死活
+            _ = trace_tick.tick(), if trace.enabled() => {
+                trace.log("tick");
             }
             event = ev_rx.recv() => {
                 match event {
