@@ -592,6 +592,53 @@ impl eframe::App for GuiApp {
                         self.send_input(InputMsg::Line(cmd.to_string()));
                     }
                 }
+                // 发送文件：对当前焦点 1v1 互信联系人（rfd 原生对话框；群焦点/未信任/非聊天态置灰）
+                let focused_trusted = self.sidebar.as_ref().and_then(|sb| {
+                    sb.contacts.iter().find(|c| c.focused && c.effective_trusted)
+                });
+                let group_focused = self
+                    .sidebar
+                    .as_ref()
+                    .map(|sb| sb.groups.iter().any(|g| g.focused))
+                    .unwrap_or(false);
+                let send_file_enabled =
+                    in_chat && !ask_pending && !group_focused && focused_trusted.is_some();
+                let send_file = ui
+                    .add_enabled(send_file_enabled, egui::Button::new("发送文件"))
+                    .on_disabled_hover_text("文件发送：需 1v1 互信联系人会话焦点");
+                if send_file.clicked() {
+                    if let Some(c) = focused_trusted {
+                        match c.peer_id.parse::<libp2p::PeerId>() {
+                            Ok(peer) => {
+                                self.ui_trace("action=send_file dialog=open");
+                                match rfd::FileDialog::new().pick_file() {
+                                    Some(path) => {
+                                        let path = path.display().to_string();
+                                        self.interact.log(
+                                            Level::Info,
+                                            "user",
+                                            format!("发送文件: {path}"),
+                                        );
+                                        self.input_sent_at = Some(Instant::now());
+                                        self.send_input(InputMsg::Control(Control::SendFile {
+                                            peer,
+                                            path,
+                                        }));
+                                    }
+                                    None => {
+                                        self.ui_trace("action=send_file dialog=cancel");
+                                        self.timeline.push(TimelineItem::line(
+                                            "未选择文件（Linux 无对话框时需 xdg-desktop-portal 或 zenity）",
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                self.ui_trace("action=send_file peer_parse_fail");
+                            }
+                        }
+                    }
+                }
             });
 
             // 文本框 = 纯聊天文本：ChatText 直进引擎（多行原样、/ 开头也不解析为命令、无协议包装）

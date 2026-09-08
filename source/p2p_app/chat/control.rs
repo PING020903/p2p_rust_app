@@ -111,6 +111,30 @@ pub(crate) async fn handle_control(ctx: &mut ChatCtx<'_>, c: Control) {
             // 复刻 /backup：Ask 模式弹 BackupPassword 卡片（masked），解锁后 MnemonicShow 展示
             ctx.ops.push_back(AsyncOp::Backup);
         }
+        Control::SendFile { peer, path } => {
+            // 复刻 /send 非文本逻辑：信任复查（GUI 按钮已置灰，引擎侧防御）→ 路径校验 → start_send
+            if !ctx.identity.effective_trusted(&peer) {
+                eprintln!(
+                    "{}",
+                    "对方尚未互信（需双方 /trust），文件传输被拒绝".yellow()
+                );
+                return;
+            }
+            let path = std::path::PathBuf::from(&path);
+            if !path.exists() {
+                eprintln!("{}", format!("文件不存在: {}", path.display()).yellow());
+                return;
+            }
+            if let Err(e) = crate::p2p_app::file_transfer::start_send(
+                ctx.file,
+                &mut ctx.ops,
+                peer,
+                &path,
+                &peer_name(&peer, ctx.conversations, ctx.identity),
+            ) {
+                eprintln!("{}", format!("发送启动失败: {e}").yellow());
+            }
+        }
         Control::Trust { peer, trusted } => {
             let name = peer_name(&peer, ctx.conversations, ctx.identity);
             if trusted {

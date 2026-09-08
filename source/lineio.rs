@@ -64,6 +64,9 @@ pub enum Control {
     Dial { addr: String, name: String },
     /// 备份助记词（复刻 /backup：Ask 模式弹 BackupPassword 卡片，解锁后 MnemonicShow 展示）
     Backup,
+    /// 发送文件（复刻 /send：信任校验 + start_send；path 由 GUI 原生文件选择器产出，
+    /// 结构化直传——不经命令文本解析，文件名带空格无引号问题）
+    SendFile { peer: PeerId, path: String },
 }
 
 impl Control {
@@ -87,6 +90,7 @@ impl Control {
                 }
             }
             Control::Backup => "备份助记词".to_string(),
+            Control::SendFile { path, .. } => format!("发送文件: {path}"),
         }
     }
 
@@ -105,6 +109,9 @@ impl Control {
                 if name.is_empty() { "-" } else { name }
             ),
             Control::Backup => "action=backup".to_string(),
+            Control::SendFile { peer, path } => {
+                format!("action=send_file peer={peer} path={path}")
+            }
         }
     }
 }
