@@ -194,9 +194,19 @@ pub fn run() {
 
 
 /// 会话内待决确认（两跳状态机：phase1 登记 → 答案到达 → phase2 执行）
+///
+/// `via_window` 标记答案面：true=CLI 确认子窗口作答（confirm 通道回传），主窗口行**照常流转**
+/// （聊天/命令不被劫持——子窗口作答期间 B 可正常给 A 发消息）；false=答案走主窗口行
+/// （Ask 卡片回程 / 非 Windows 退化 / Auto e2e 密码行，终端串行劫持语义）。
 enum PendingConfirm {
-    Tofu { peer: PeerId, name: String },
-    Backup,
+    Tofu {
+        peer: PeerId,
+        name: String,
+        via_window: bool,
+    },
+    Backup {
+        via_window: bool,
+    },
     /// 文件接收 offer 挂起（at 供接收确认超时判定）
     FileReceive {
         from: PeerId,
@@ -204,7 +214,19 @@ enum PendingConfirm {
         name: String,
         size: u64,
         at: std::time::Instant,
+        via_window: bool,
     },
+}
+
+impl PendingConfirm {
+    /// 答案面是否为确认子窗口（true 时主窗口行不劫持）
+    fn via_window(&self) -> bool {
+        match self {
+            PendingConfirm::Tofu { via_window, .. }
+            | PendingConfirm::Backup { via_window, .. }
+            | PendingConfirm::FileReceive { via_window, .. } => *via_window,
+        }
+    }
 }
 
 /// 确认答案（CLI 确认子窗口任务回传；GUI 卡片答案经 input 路由到达同一第二阶段）
@@ -588,11 +610,14 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
             msg = input.next_input() => {
                 // None = 输入结束（EOF/通道关闭）：多行收集中则报未闭合丢弃
                 let line = match msg {
-                    // 待决确认路由：登记期间到达的文本行 = 该确认的答案（终端串行语义）
+                    // 待决确认路由：登记期间到达的文本行 = 该确认的答案（终端串行语义）。
+                    // 仅当答案面是主窗口行（Ask 卡片回程/非 Windows 退化/Auto e2e）才劫持；
+                    // via_window（CLI 确认子窗口作答中）时主窗口行照常流转——聊天/命令畅通
                     Some(InputMsg::Line(l)) => {
-                        if let Some(pc) = pending_confirm.take() {
-                            match pc {
-                                PendingConfirm::Tofu { peer, name } => {
+                        if matches!(&pending_confirm, Some(pc) if !pc.via_window()) {
+                            if let Some(pc) = pending_confirm.take() {
+                                match pc {
+                                    PendingConfirm::Tofu { peer, name, .. } => {
                                     let trusted = l.trim().eq_ignore_ascii_case("y");
                                     identity.complete_tofu(&peer, &name, trusted);
                                     // 补跑 hello 钩子：会话名更新 + 上线提示
@@ -627,7 +652,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                     );
                                     continue;
                                 }
-                                PendingConfirm::Backup => {
+                                PendingConfirm::Backup { .. } => {
                                     identity.backup_complete(l.trim(), mode);
                                     continue;
                                 }
@@ -654,8 +679,9 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                 }
                             }
                         }
-                        l
                     }
+                    l
+                }
                     // 结构化控制动作（GUI 点击/按钮）：不经命令文本解析，复刻对应命令逻辑
                     Some(InputMsg::Control(c)) => {
                         let mut ctx = make_chat_ctx(
@@ -666,7 +692,9 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                         handle_control(&mut ctx, c).await;
                         if consume_ops(&mut ctx).await.is_some() {
                             // Backup 进入等待密码挂起：登记待决确认
-                            pending_confirm = Some(PendingConfirm::Backup);
+                            pending_confirm = Some(PendingConfirm::Backup {
+                                via_window: cfg!(windows) && mode == ConfirmMode::Interactive,
+                            });
                             if mode == ConfirmMode::Interactive {
                                 spawn_secret_window(
                                     confirm_tx.clone(),
@@ -767,7 +795,9 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                     // 异步消费 handler 排队的动作（同步生产者 → 异步消费者）
                     if consume_ops(&mut ctx).await.is_some() {
                         // Backup 进入等待密码挂起：登记待决确认
-                        pending_confirm = Some(PendingConfirm::Backup);
+                        pending_confirm = Some(PendingConfirm::Backup {
+                            via_window: cfg!(windows) && mode == ConfirmMode::Interactive,
+                        });
                         if mode == ConfirmMode::Interactive {
                             spawn_secret_window(
                                 confirm_tx.clone(),
@@ -951,6 +981,8 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                     pending_confirm = Some(PendingConfirm::Tofu {
                                         peer,
                                         name: name.clone(),
+                                        via_window: cfg!(windows)
+                                            && mode == ConfirmMode::Interactive,
                                     });
                                     #[cfg(windows)]
                                     if mode == ConfirmMode::Interactive {
@@ -1009,6 +1041,8 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                             name: offer.name.clone(),
                                             size: offer.size,
                                             at: std::time::Instant::now(),
+                                            via_window: cfg!(windows)
+                                                && mode == ConfirmMode::Interactive,
                                         });
                                         #[cfg(windows)]
                                         if mode == ConfirmMode::Interactive {

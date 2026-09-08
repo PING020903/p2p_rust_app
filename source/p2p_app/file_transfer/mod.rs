@@ -225,7 +225,11 @@ pub async fn on_file_offer(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<
         crate::lineio::ConfirmMode::Interactive => {
             println!(
                 "{}",
-                format!("收到文件: {name}（{} 字节，来自 {from}），请在确认窗口选择是否保存", p.size)
+                format!(
+                    "收到文件: {name}（{} 字节，来自 {from}），请在确认子窗口选择是否保存\
+                     （任务栏可见；主窗口聊天不受影响）",
+                    p.size
+                )
                     .yellow()
             );
             ctx.file_pending = Some(FilePending {

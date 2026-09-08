@@ -149,6 +149,7 @@ fn confirm_tofu_entry(args: &[String]) {
     println!("  节点: {peer}");
     println!("{}", format!("  指纹: {fingerprint}").yellow());
     println!("{}", "请与对方当面核对指纹一致后再选择信任。".dimmed());
+    println!("{}", "（本窗口仅用于本次确认；聊天请切回主窗口）".dimmed());
     print!("信任该联系人？(y/n): ");
     let _ = io::stdout().flush();
     let mut line = String::new();
@@ -211,6 +212,7 @@ fn confirm_file_entry(args: &[String]) {
     println!("  文件: {name}（{size} 字节）");
     println!("  来自: {from}");
     println!("  文件序号: {file_id}");
+    println!("{}", "（本窗口仅用于本次确认；聊天请切回主窗口）".dimmed());
     print!("保存到下载目录？(y/n): ");
     let _ = io::stdout().flush();
     let mut line = String::new();
