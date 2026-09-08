@@ -201,6 +201,7 @@ p2p_app/chat/
 - [x] 接收确认 60s 超时：并入定时臂 `deadline=min(offer 过期,pending 过期)`，未答自动 reject 清槽（防单槽被永久占位）；忙拒：pending 被占时新 offer 直接 reject
 - 已知边界：非 Windows Interactive 退化主窗口 pending 路由（TOFU 退化自动拒绝）；`/backup`/TOFU 登记仍直接覆盖 pending_confirm（信号侧 offer 已忙拒，命令侧未拦截）；UntrustedSend（session.rs D3）仍内联 await 待同模式两段化；AppCtx.input 字段随内联 await 消失退役
 - 答案面分流（✅ 实测修正）：`PendingConfirm.via_window` 区分答案面——CLI 确认子窗口作答（true，confirm 通道回传，**主窗口行照常流转**，挂起期间聊天双向畅通）vs 主窗口行作答（false：Ask 卡片回程/非 Windows 退化/Auto e2e，保留串行劫持）；焦点抢占为 CREATE_NEW_CONSOLE 固有行为，子窗口/主窗口文案缓解
+- QuickEdit 禁用（✅ 实测修正）：CLI Interactive 启动即关控制台快速编辑——子窗口抢焦点后用户点击拖选会冻结 conhost 输入（无回显/读不到输入/消息不上屏，Enter 清选中恢复）；kernel32 extern 零依赖实现，仅 Interactive（e2e 零影响）
 - 后续项：GUI 命令框在 Ask 卡片挂起期间仍会被当答案（卡片答案伪装 Line）——`InputMsg::AskAnswer` 类型层分流待做
 
 ### 应用层结构（P2.1 起生效，架构纪律）
