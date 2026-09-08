@@ -370,8 +370,44 @@ fn disable_quick_edit() {
     }
 }
 
-pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Result<(), Box<dyn Error>> {
-    // 交互确认三态：Stdin 终端=Interactive（文字提示 + 确认子窗口）；Stdin 管道=Auto（e2e 自动语义）；
+/// 会话循环调试跟踪（`P2P_DEBUG_SESSION=1` 开启）：每个 select 臂触发追加一行到
+/// `<cache_dir>/debug/session_<pid>.log`（毫秒时间戳 + 摘要）。
+/// 定位"输入吞噬/循环卡死/事件丢失"类问题的运行时证据；默认关闭（file: None，log 零成本），
+/// 不改动任何业务逻辑——e2e/正常路径逐字节不受影响。
+struct SessionTrace {
+    file: Option<std::fs::File>,
+}
+
+impl SessionTrace {
+    fn enable() -> Self {
+        let file = std::env::var("P2P_DEBUG_SESSION")
+            .ok()
+            .and_then(|_| crate::p2p::cache_dir().ok())
+            .and_then(|dir| {
+                let d = dir.join("debug");
+                std::fs::create_dir_all(&d).ok()?;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(d.join(format!("session_{}.log", std::process::id())))
+                    .ok()
+            });
+        SessionTrace { file }
+    }
+
+    fn log(&mut self, msg: &str) {
+        if let Some(f) = &mut self.file {
+            use std::io::Write;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let _ = writeln!(f, "{ts} {msg}");
+        }
+    }
+}
+
+pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Result<(), Box<dyn Error>> {    // 交互确认三态：Stdin 终端=Interactive（文字提示 + 确认子窗口）；Stdin 管道=Auto（e2e 自动语义）；
     // Channel（GUI）=Ask（系统消息卡片 + InputMsg::Line 回程）
     let mode = ConfirmMode::of(&input, std::io::stdin().is_terminal());
     // CLI 交互终端：禁用 QuickEdit——确认子窗口抢焦点后用户点击拖选会冻结控制台输入
@@ -405,6 +441,10 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
     // L3 群注册表（登录后先读本地持久化）
     let mut groups: HashMap<String, Group> = load_groups(identity.my_id());
     let mut focused_group: Option<String> = None;
+
+    // 会话循环调试跟踪（P2P_DEBUG_SESSION=1 开启，见 SessionTrace）
+    let mut trace = SessionTrace::enable();
+    trace.log("session start");
 
     // L1 传输任务经 L2 适配层（seam）：L3 只见 Cmd/Event（tag+payload），
     // 不接触 Frame/control。事件用无界通道——传输任务永不因应用阻塞
@@ -520,6 +560,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
         };
         tokio::select! {        // 确认应答臂：CLI 确认子窗口任务回传答案 → 执行第二阶段（不冻结会话循环）
         answer = confirm_rx.recv(), if !confirm_rx.is_closed() => {
+            trace.log("confirm: answer");
             match answer {
                 Some(ConfirmAnswer::Tofu { peer, trusted }) => {
                     let name = match &pending_confirm {
@@ -559,6 +600,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                     pending_confirm = None;
                 }
                 Some(ConfirmAnswer::FileReceive { from, file_id, name, size, accepted }) => {
+                    trace.log(&format!("confirm: file id={file_id} ok={accepted}"));
                     // 仅当挂起的正是该 offer 才落账（迟到的子窗口答案忽略）
                     let matches = matches!(
                         &pending_confirm,
@@ -585,6 +627,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
             }
         }
             _ = tokio::time::sleep_until(timer_deadline.unwrap_or_else(tokio::time::Instant::now)), if timer_deadline.is_some() => {
+                trace.log("timer: fired");
                 // H2：发送侧 offer 超时——对端不应答（网络突发/对端退出）时中止并清理，防状态悬挂
                 for (peer, file_id, name) in
                     file_state.expire_stale_offers(crate::p2p_app::file_transfer::OFFER_TIMEOUT)
@@ -645,6 +688,10 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                     // 仅当答案面是主窗口行（Ask 卡片回程/非 Windows 退化/Auto e2e）才劫持；
                     // via_window（CLI 确认子窗口作答中）时主窗口行照常流转——聊天/命令畅通
                     Some(InputMsg::Line(l)) => {
+                        trace.log(&format!(
+                            "in: {}",
+                            l.trim().chars().take(40).collect::<String>()
+                        ));
                         if matches!(&pending_confirm, Some(pc) if !pc.via_window()) {
                             if let Some(pc) = pending_confirm.take() {
                                 match pc {
@@ -715,6 +762,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                 }
                     // 结构化控制动作（GUI 点击/按钮）：不经命令文本解析，复刻对应命令逻辑
                     Some(InputMsg::Control(c)) => {
+                        trace.log(&format!("ctl: {}", c.describe()));
                         let mut ctx = make_chat_ctx(
                             &mut identity, &cmd_tx, &mut input, mode,
                             &mut conversations, &mut groups, &mut focused, &mut focused_group,
@@ -738,6 +786,10 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                     }
                     Some(InputMsg::ChatText(text)) => {
                         // GUI 文本框：纯聊天文本直发当前焦点（多行原样；以 / 开头也不解析为命令）
+                        trace.log(&format!(
+                            "txt: {}",
+                            text.trim().chars().take(40).collect::<String>()
+                        ));
                         let text = text.trim();
                         if !text.is_empty() {
                             let mut ctx = make_chat_ctx(
@@ -756,6 +808,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                 format!("多行消息未闭合（还差 {remaining} 行时输入结束），已丢弃").yellow()
                             );
                         }
+                        trace.log("exit: input eof");
                         break;
                     }
                 };
@@ -811,6 +864,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                     }
                 }
                 if let Some(cmd) = line.strip_prefix('/') {
+                    trace.log(&format!("cmd: {}", cmd.chars().take(40).collect::<String>()));
                     // 命令上下文：一次性借用全部状态，handler 同步改状态 + 排异步动作队列。
                     // 指令树每行重建（无状态 builder，开销可忽略）：其 `ChatCtx<'a>` 生命周期
                     // 随本次处理结束释放，借用不跨 select 迭代存活。
@@ -840,6 +894,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                         // 等 Bye 帧送达（传输任务独立处理），再关闭传输任务
                         tokio::time::sleep(BYE_HANDSHAKE_TIMEOUT).await;
                         let _ = ctx.cmd_tx.send(seam::Cmd::Shutdown).await;
+                        trace.log("exit: quit");
                         break;
                     }
                     push_sidebar(
@@ -858,13 +913,16 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                     &mut conversations, &mut groups, &mut focused, &mut focused_group,
                     &connected, &mut registered, &mut file_state,
                 );
+                trace.log("chat begin");
                 send_focused_text(&mut ctx, line).await;
+                trace.log("chat done");
             }
             event = ev_rx.recv() => {
                 match event {
                     Some(ev) => {
                         match ev {
                             Event::Connected(peer) => {
+                                trace.log(&format!("ev: connected {peer}"));
                                 connected.insert(peer);
                                 if let Some(conv) = conversations.get_mut(&peer) {
                                     conv.pending_dial = false;
@@ -952,6 +1010,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                 }
                             }
                             Event::Signal { from, tag, payload } => {
+                                trace.log(&format!("sig: {tag} from {from}"));
                                 // 通道路由：control（L1 心跳）已被 seam 过滤，L3 只见信号帧。
                                 // 无 match：构造应用上下文，按 tag 标签查 SignalRegistry 分发，
                                 // await 注册的 handler（hello/bye/trust 由 L2 内化语义映射 + L3 钩子；
@@ -1141,6 +1200,7 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                 crate::p2p_app::chat::display::listen_addr(addr.to_string());
                             }
                             Event::SendFailure { peer, error } => {
+                                trace.log(&format!("ev: send-fail {peer} {error}"));
                                 let bye = conversations
                                     .get(&peer)
                                     .map(|c| c.bye)
@@ -1163,7 +1223,10 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                             &identity, &groups, &connected, &focused, &focused_group, &registered,
                         );
                     }
-                    None => break,
+                    None => {
+                        trace.log("ev: closed");
+                        break;
+                    }
                 }
             }
         }
