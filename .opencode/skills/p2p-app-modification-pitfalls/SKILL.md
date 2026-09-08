@@ -171,9 +171,34 @@ wait_log_contains(runtime_log, "event=trust_card") # ui trace
 
 ---
 
+## 5.5 spawn 子进程 stdio 纪律（实战三层 BUG 教训）
+
+**规则：spawn 子进程要么显式三件套 `Stdio::null()`，要么显式 pipe——禁裸 inherit。**
+
+```rust
+// ✅ 正确（spawn_detached / 三个确认子窗口先例）
+tokio::process::Command::new(exe)
+    .args([...])
+    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+    .creation_flags(CREATE_NEW_CONSOLE)
+    .status().await;
+```
+
+三层 BUG 实证链（每修一层暴露下一层，现象"修一次变一个样"）：
+1. **输入路由劫持**：挂起期间主窗口行被无条件当确认答案（修：`PendingConfirm.via_window` 答案面分流）
+2. **conhost QuickEdit 冻结**：子窗口抢焦点→用户点击拖选→控制台 IO 整体冻结（修：启动禁 QuickEdit）
+3. **spawn inherit 扣输入**：tokio/std Command 缺省把父进程三个 std 句柄传给子进程（含主窗口控制台输入队列句柄）→ 子进程存活期间主窗口键盘输入被扣，子进程退出才一次性涌出（trace 实证 7.6s 空窗后 4 行同毫秒涌入）（修：Stdio::null 三件套 + 子入口 `attach_console_stdio` 自挂 CONIN$/CONOUT$，C 等价 freopen 惯用法）
+
+C 类比：`fork/exec` 前忘 `dup2` 重定向 fd 0/1/2——Rust 的 Command 缺省反而是裸继承。
+
+**测试盲区教训：Auto e2e 掩盖 Interactive 交互路径**——e2e 管道自动放行，确认子窗口在 e2e 里从未 spawn；只有 CLI Interactive 手测才触发。子窗口类功能（spawn 子进程/抢焦点/控制台模式）**必须 Interactive 手测**，管线日志用 `P2P_DEBUG_SESSION=1`（每秒 tick 判循环死活 + 各臂触发记录）。
+
+---
+
 ## 6. 已知边界（显式记录不遗忘）
 
 - CLI 确认提示期间输入 = 答案（终端串行固有；提示已引导 y/n）
 - TOFU 拒绝后重复 hello 不重复弹卡（升级走侧栏信任按钮两段式）
 - 非 Windows 确认子窗口退化为阻塞式（known boundary）
+- 确认子窗口 spawn 必带 Stdio::null 三件套 + 子入口 attach_console_stdio（缺失会复现"主窗口输入被扣"——见 5.5）
 - 确认子窗口密码经结果临时文件回传（父读后删；v1 简化）
