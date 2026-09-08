@@ -344,10 +344,41 @@ fn spawn_file_window(
     });
 }
 
+/// CLI Interactive 启动时禁用控制台快速编辑模式（QuickEdit）。
+/// 根因（实测）：确认子窗口抢焦点 → 用户点击主窗口聚焦时拖选文本 → conhost 进入选择模式，
+/// 该控制台输入/输出整体冻结（打字无回显、程序读不到输入、收到的消息不上屏）。
+/// 清 QUICK_EDIT 位 + 置 EXTENDED_FLAGS（变更生效前提）即关闭鼠标拖选；失败静默（非致命）。
+#[cfg(windows)]
+fn disable_quick_edit() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> isize;
+        fn GetConsoleMode(h_console: isize, lp_mode: *mut u32) -> i32;
+        fn SetConsoleMode(h_console: isize, dw_mode: u32) -> i32;
+    }
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode = 0u32;
+        if GetConsoleMode(h, &mut mode) != 0
+            && SetConsoleMode(h, (mode & !ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS) != 0
+        {
+            println!("{}", "已禁用控制台快速编辑（防点击拖选冻结输入）".dimmed());
+        }
+    }
+}
+
 pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Result<(), Box<dyn Error>> {
     // 交互确认三态：Stdin 终端=Interactive（文字提示 + 确认子窗口）；Stdin 管道=Auto（e2e 自动语义）；
     // Channel（GUI）=Ask（系统消息卡片 + InputMsg::Line 回程）
     let mode = ConfirmMode::of(&input, std::io::stdin().is_terminal());
+    // CLI 交互终端：禁用 QuickEdit——确认子窗口抢焦点后用户点击拖选会冻结控制台输入
+    #[cfg(windows)]
+    if mode == ConfirmMode::Interactive {
+        disable_quick_edit();
+    }
     // 确认应答通道：CLI 确认子窗口任务经此回传答案（GUI 卡片答案走 input 路由）
     let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::unbounded_channel::<ConfirmAnswer>();
     // 待决确认状态机：登记后由 input 行（CLI/GUI 答案）或 confirm 臂（CLI 子窗口）驱动第二阶段
