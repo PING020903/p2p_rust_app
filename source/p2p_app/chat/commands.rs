@@ -332,9 +332,13 @@ pub(crate) fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
                     eprintln!("{}", format!("文件不存在: {path_str}").yellow());
                     return;
                 }
-                if let Err(e) =
-                    crate::p2p_app::file_transfer::start_send(ctx.file, &mut ctx.ops, peer, &path)
-                {
+                if let Err(e) = crate::p2p_app::file_transfer::start_send(
+                    ctx.file,
+                    &mut ctx.ops,
+                    peer,
+                    &path,
+                    &crate::p2p_app::chat::ctx::peer_name(&peer, ctx.conversations, ctx.identity),
+                ) {
                     eprintln!("{}", format!("发送启动失败: {e}").yellow());
                 }
             }

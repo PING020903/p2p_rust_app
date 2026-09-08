@@ -94,6 +94,10 @@ struct ReceivingFile {
     tmp_path: PathBuf,
     written: u64,
     name: String,
+    /// offer 声明的总字节（接收进度百分比）
+    size: u64,
+    /// 已收块数（GUI 进度节流：每 8 块/尾块发一次事件）
+    chunks_received: u64,
 }
 
 /// offer 等待确认超时：超时未收到 file.accept 则中止发送并清理状态（防双方悬挂）
@@ -204,6 +208,39 @@ fn sanitize_file_name(raw: &str) -> String {
 
 // ---- 接收侧 handler（注册到 SignalRegistry）----
 
+/// 构造传输视图并经显示路由发出（GUI 传输卡片数据源）。
+/// CLI 文案由调用方以 `cli_text` 预构造传入（逐字节保持 e2e 契约）；None = CLI 静默
+/// （纯 GUI 事件，如接收进度/失败终态——历史 CLI 无此输出）。
+fn emit_view(
+    ctx: &AppCtx<'_>,
+    peer: &PeerId,
+    file_id: u64,
+    name: String,
+    outgoing: bool,
+    total: u64,
+    sent: u64,
+    done: bool,
+    ok: bool,
+    saved_path: Option<String>,
+    error: Option<String>,
+    cli_text: Option<String>,
+) {
+    let view = crate::uievent::FileTransferView {
+        peer: peer.to_string(),
+        file_id,
+        peer_name: crate::p2p_app::chat::ctx::peer_name(peer, ctx.conversations, ctx.identity),
+        name,
+        outgoing,
+        total,
+        sent,
+        done,
+        ok,
+        saved_path,
+        error,
+    };
+    crate::p2p_app::chat::display::file_transfer(view, cli_text);
+}
+
 /// 收到文件 offer（phase1，**不阻塞会话循环**）：三态——
 /// - Interactive：打印提示 → 登记 `ctx.file_pending`（会话层拉起 `--confirm-file` 子窗口；
 ///   非 Windows 退化为主窗口 pending 路由）
@@ -309,10 +346,25 @@ pub async fn complete_file_receive(
                 tmp_path,
                 written: 0,
                 name: name.clone(),
+                size,
+                chunks_received: 0,
             },
         );
         let _ = send_signal(ctx, from, TAG_FILE_ACCEPT, &FileAcceptPayload { file_id }).await;
-        println!("{}", format!("开始接收 {name}（{size} 字节）...").green());
+        emit_view(
+            ctx,
+            from,
+            file_id,
+            name.clone(),
+            false,
+            size,
+            0,
+            false,
+            false,
+            None,
+            None,
+            Some(format!("开始接收 {name}（{size} 字节）...").green().to_string()),
+        );
     } else {
         let _ = send_signal(ctx, from, TAG_FILE_REJECT, &FileRejectPayload {
             file_id,
@@ -336,33 +388,49 @@ pub async fn on_file_chunk(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<
         return false;
     };
     if crc32fast::hash(&p.data) != p.crc {
-        // 分块校验失败：删临时文件、移除接收状态、通知对端中止
-        if let Some(r) = ctx.file.receivers.remove(&key) {
-            let _ = tokio::fs::remove_file(&r.tmp_path).await;
-        }
+        // 分块校验失败：删临时文件、移除接收状态、通知对端中止（卡片终态；CLI 历史无输出）
+        let (name, size, written, tmp_path) =
+            (r.name.clone(), r.size, r.written, r.tmp_path.clone());
+        ctx.file.receivers.remove(&key);
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        let reason = format!("分块校验失败 seq={}", p.seq);
         let _ = send_signal(ctx, from, TAG_FILE_ABORT, &FileAbortPayload {
             file_id: p.file_id,
-            reason: format!("分块校验失败 seq={}", p.seq),
+            reason: reason.clone(),
         })
         .await;
+        emit_view(
+            ctx, from, p.file_id, name, false, size, written, true, false, None, Some(reason), None,
+        );
         return true;
     }
     if let Err(e) = r.file.write_all(&p.data).await {
         let reason = format!("写盘失败: {e}");
+        let (name, size, written) = (r.name.clone(), r.size, r.written);
         let _ = send_signal(ctx, from, TAG_FILE_ABORT, &FileAbortPayload {
             file_id: p.file_id,
             reason: reason.clone(),
         })
         .await;
         ctx.file.receivers.remove(&key);
+        emit_view(
+            ctx, from, p.file_id, name, false, size, written, true, false, None, Some(reason), None,
+        );
         return true;
     }
     r.written += p.data.len() as u64;
+    r.chunks_received += 1;
+    let throttle = r.chunks_received % 8 == 0 || r.written >= r.size;
+    let (written, size, name) = (r.written, r.size, r.name.clone());
     let _ = send_signal(ctx, from, TAG_FILE_ACK, &FileAckPayload {
         file_id: p.file_id,
         seq: p.seq,
     })
     .await;
+    // 接收进度（历史 CLI 无此输出——纯 GUI 事件，cli_text=None）
+    if throttle {
+        emit_view(ctx, from, p.file_id, name, false, size, written, false, false, None, None, None);
+    }
     true
 }
 
@@ -378,6 +446,7 @@ pub async fn on_file_finish(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option
     let Some(r) = ctx.file.receivers.remove(&key) else {
         return false;
     };
+    let (name, size, written) = (r.name.clone(), r.size, r.written);
     // flush + 改名
     let mut file = r.file;
     let _ = file.flush().await;
@@ -385,12 +454,16 @@ pub async fn on_file_finish(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option
     let final_path = ctx.file.downloads_dir.join(&r.name);
     if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
         let _ = tokio::fs::remove_file(&tmp_path).await;
+        let reason = format!("接收文件改名失败: {e}");
         let _ = send_signal(ctx, from, TAG_FILE_COMPLETE, &FileCompletePayload {
             file_id: p.file_id,
             ok: false,
-            error: Some(format!("接收文件改名失败: {e}")),
+            error: Some(reason.clone()),
         })
         .await;
+        emit_view(
+            ctx, from, p.file_id, name, false, size, written, true, false, None, Some(reason), None,
+        );
         return true;
     }
     let _ = send_signal(ctx, from, TAG_FILE_COMPLETE, &FileCompletePayload {
@@ -399,9 +472,19 @@ pub async fn on_file_finish(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option
         error: None,
     })
     .await;
-    println!(
-        "{}",
-        format!("文件接收完成: {}", final_path.display()).green()
+    emit_view(
+        ctx,
+        from,
+        p.file_id,
+        name,
+        false,
+        size,
+        written.max(size),
+        true,
+        true,
+        Some(final_path.display().to_string()),
+        None,
+        Some(format!("文件接收完成: {}", final_path.display()).green().to_string()),
     );
     let _ = file;
     true
@@ -415,12 +498,38 @@ pub async fn on_file_abort(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<
     let Ok(p) = serde_cbor::from_slice::<FileAbortPayload>(bytes) else {
         return false;
     };
-    if ctx.file.senders.remove(&p.file_id).is_some() {
-        println!("{}", format!("文件发送中止: {}", p.reason).yellow());
+    if let Some(s) = ctx.file.senders.remove(&p.file_id) {
+        emit_view(
+            ctx,
+            &s.peer,
+            p.file_id,
+            s.name.clone(),
+            true,
+            s.size,
+            s.sent,
+            true,
+            false,
+            None,
+            Some(p.reason.clone()),
+            Some(format!("文件发送中止: {}", p.reason).yellow().to_string()),
+        );
     }
     if let Some(r) = ctx.file.receivers.remove(&(*from, p.file_id)) {
         let _ = tokio::fs::remove_file(&r.tmp_path).await;
-        println!("{}", format!("文件接收中止: {}", p.reason).yellow());
+        emit_view(
+            ctx,
+            from,
+            p.file_id,
+            r.name.clone(),
+            false,
+            r.size,
+            r.written,
+            true,
+            false,
+            None,
+            Some(p.reason.clone()),
+            Some(format!("文件接收中止: {}", p.reason).yellow().to_string()),
+        );
     }
     true
 }
@@ -460,8 +569,20 @@ pub async fn on_file_reject(ctx: &mut AppCtx<'_>, _from: &PeerId, payload: Optio
         return false;
     };
     if let Some(s) = ctx.file.senders.remove(&p.file_id) {
-        println!("{}", format!("对方拒绝接收: {}", p.reason).yellow());
-        let _ = s;
+        emit_view(
+            ctx,
+            &s.peer,
+            p.file_id,
+            s.name.clone(),
+            true,
+            s.size,
+            s.sent,
+            true,
+            false,
+            None,
+            Some(p.reason.clone()),
+            Some(format!("对方拒绝接收: {}", p.reason).yellow().to_string()),
+        );
     }
     true
 }
@@ -490,11 +611,35 @@ pub async fn on_file_complete(
     };
     if let Some(s) = ctx.file.senders.remove(&p.file_id) {
         if p.ok {
-            println!("{}", format!("文件发送完成: {}", s.name).green());
+            emit_view(
+                ctx,
+                &s.peer,
+                p.file_id,
+                s.name.clone(),
+                true,
+                s.size,
+                s.size,
+                true,
+                true,
+                None,
+                None,
+                Some(format!("文件发送完成: {}", s.name).green().to_string()),
+            );
         } else {
-            println!(
-                "{}",
-                format!("接收方校验失败: {}", p.error.unwrap_or_default()).yellow()
+            let reason = p.error.unwrap_or_default();
+            emit_view(
+                ctx,
+                &s.peer,
+                p.file_id,
+                s.name.clone(),
+                true,
+                s.size,
+                s.sent,
+                true,
+                false,
+                None,
+                Some(reason.clone()),
+                Some(format!("接收方校验失败: {reason}").yellow().to_string()),
             );
         }
     }
@@ -506,8 +651,12 @@ async fn drive_sender(ctx: &mut AppCtx<'_>, file_id: u64) {
     let Some(peer) = ctx.file.senders.get(&file_id).map(|s| s.peer) else {
         return;
     };
+    let (s_name, s_size) = match ctx.file.senders.get(&file_id) {
+        Some(s) => (s.name.clone(), s.size),
+        None => return,
+    };
     // 读下一块（或读完发 finish；读失败发 abort 并移除发送状态）
-    let result: Option<(String, Option<Vec<u8>>, Option<(u64, u64, u64)>)> = {
+    let result: Option<(String, Option<Vec<u8>>, Option<(u64, u64, u64)>, Option<String>)> = {
         let Some(s) = ctx.file.senders.get_mut(&file_id) else {
             return;
         };
@@ -516,6 +665,7 @@ async fn drive_sender(ctx: &mut AppCtx<'_>, file_id: u64) {
             Ok(0) => Some((
                 TAG_FILE_FINISH.to_string(),
                 Some(serde_cbor::to_vec(&FileFinishPayload { file_id }).unwrap_or_default()),
+                None,
                 None,
             )),
             Ok(n) => {
@@ -534,20 +684,24 @@ async fn drive_sender(ctx: &mut AppCtx<'_>, file_id: u64) {
                 let progress = Some((s.sent + n as u64, s.size, s.next_seq));
                 s.sent += n as u64;
                 s.next_seq += 1;
-                Some((chunk.0, chunk.1, progress))
+                Some((chunk.0, chunk.1, progress, None))
             }
             Err(e) => {
                 let reason = format!("读文件失败: {e}");
                 ctx.file.senders.remove(&file_id);
                 Some((
                     TAG_FILE_ABORT.to_string(),
-                    Some(serde_cbor::to_vec(&FileAbortPayload { file_id, reason }).unwrap_or_default()),
+                    Some(
+                        serde_cbor::to_vec(&FileAbortPayload { file_id, reason: reason.clone() })
+                            .unwrap_or_default(),
+                    ),
                     None,
+                    Some(reason),
                 ))
             }
         }
     };
-    let Some((tag, payload, progress)) = result else {
+    let Some((tag, payload, progress, error)) = result else {
         return;
     };
     let _ = ctx
@@ -566,8 +720,38 @@ async fn drive_sender(ctx: &mut AppCtx<'_>, file_id: u64) {
         };
         if seq % 8 == 0 || seq == total {
             let pct = if size == 0 { 100 } else { (sent * 100 / size) as u8 };
-            println!("{}", format!("已发送 {sent}/{size} 字节（{pct}%）").dimmed());
+            emit_view(
+                ctx,
+                &peer,
+                file_id,
+                s_name.clone(),
+                true,
+                size,
+                sent,
+                false,
+                false,
+                None,
+                None,
+                Some(format!("已发送 {sent}/{size} 字节（{pct}%）").dimmed().to_string()),
+            );
         }
+    }
+    // 读失败：发送卡片终态（CLI 历史无此输出——纯 GUI 事件）
+    if let Some(reason) = error {
+        emit_view(
+            ctx,
+            &peer,
+            file_id,
+            s_name,
+            true,
+            s_size,
+            0,
+            true,
+            false,
+            None,
+            Some(reason),
+            None,
+        );
     }
 }
 
@@ -593,13 +777,15 @@ async fn send_signal<T: Serialize>(
     true
 }
 
-/// 发送文件：/send 命令调用（同步）。登记发送状态、把 offer 排入命令队列；
-/// 后续块由 accept/ack 事件驱动推送（drive_sender），不用后台任务。
+/// 发送文件：/send 命令与 GUI Control::SendFile 调用（同步）。登记发送状态、把 offer
+/// 排入命令队列；后续块由 accept/ack 事件驱动推送（drive_sender），不用后台任务。
+/// `peer_name` 为对端显示名（GUI 传输卡片展示；CLI 文案仍为节点 ID，逐字节保持）。
 pub fn start_send(
     state: &mut FileTransferState,
     ops: &mut VecDeque<crate::p2p_app::chat::ctx::AsyncOp>,
     peer: PeerId,
     path: &Path,
+    peer_name: &str,
 ) -> Result<(), String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("读取文件失败: {e}"))?;
     if !meta.is_file() {
@@ -637,9 +823,26 @@ pub fn start_send(
         tag: TAG_FILE_OFFER.to_string(),
         payload: Some(offer),
     }));
-    println!(
-        "{}",
-        format!("开始发送 {name}（{size} 字节）给 {peer}（等待对方确认）...").green()
+    let view = crate::uievent::FileTransferView {
+        peer: peer.to_string(),
+        file_id,
+        peer_name: peer_name.to_string(),
+        name: name.clone(),
+        outgoing: true,
+        total: size,
+        sent: 0,
+        done: false,
+        ok: false,
+        saved_path: None,
+        error: None,
+    };
+    crate::p2p_app::chat::display::file_transfer(
+        view,
+        Some(
+            format!("开始发送 {name}（{size} 字节）给 {peer}（等待对方确认）...")
+                .green()
+                .to_string(),
+        ),
     );
     Ok(())
 }

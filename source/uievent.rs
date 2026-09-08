@@ -123,6 +123,32 @@ pub fn next_ask_id() -> u64 {
     ASK_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+/// 文件传输进度/终态载荷（GUI 传输卡片数据源；GUI 侧按 (peer, file_id) 聚合）
+#[derive(Debug, Clone)]
+pub struct FileTransferView {
+    /// 对端节点 ID 字符串（与 file_id 组成卡片唯一键——file_id 是发送侧本地计数，跨对端可撞）
+    pub peer: String,
+    pub file_id: u64,
+    /// 净化后文件名
+    pub name: String,
+    /// 对端显示名（联系人名/节点 ID）
+    pub peer_name: String,
+    /// true = 我方发送
+    pub outgoing: bool,
+    /// 总字节（offer 声明）
+    pub total: u64,
+    /// 已传字节
+    pub sent: u64,
+    /// 终态标记（true 后 ok/error/saved_path 有效；进度更新为 false）
+    pub done: bool,
+    /// 终态结果：true=完成
+    pub ok: bool,
+    /// 接收完成落盘路径（完成卡片"打开所在目录"用）
+    pub saved_path: Option<String>,
+    /// 失败/中止原因
+    pub error: Option<String>,
+}
+
 /// 结构化显示事件（随界面功能扩展；文本行永远走 Line，事件只承载结构化语义）
 #[derive(Debug, Clone)]
 pub enum UiEvent {
@@ -134,6 +160,8 @@ pub enum UiEvent {
     Ask(AskRequest),
     /// 助记词展示（/backup 解锁成功后；系统消息区域大字卡片 + 复制按钮）
     MnemonicShow { phrase: String },
+    /// 文件传输进度/终态（GUI 传输卡片；CLI 静默——文本照旧由调用方按需打印）
+    FileTransfer(FileTransferView),
 }
 
 /// 引擎输出统一项：单通道 FIFO 保证 Line 与 Event 的相对顺序

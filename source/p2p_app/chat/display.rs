@@ -9,7 +9,7 @@ use colored::Colorize;
 
 use crate::sink;
 use crate::uievent::{
-    ChatMessage, ContactView, DiscoveredView, GroupView, SidebarState, UiEvent,
+    ChatMessage, ContactView, DiscoveredView, FileTransferView, GroupView, SidebarState, UiEvent,
 };
 
 /// 收到聊天消息（1v1 与群共用）
@@ -87,5 +87,18 @@ pub fn sidebar(
 pub fn listen_addr(addr: String) {
     if sink::event_mode() {
         sink::event(UiEvent::ListenAddr(addr));
+    }
+}
+
+/// 文件传输进度/终态路由（GUI 传输卡片数据源）。
+/// - CLI：打印 `cli_text`（调用方预构造的历史文案，含颜色——逐字节保持 e2e 契约）；None = CLI 静默
+/// - GUI：发 [`UiEvent::FileTransfer`] 结构化事件（不进滚动区，避免与卡片重复展示）
+pub fn file_transfer(view: FileTransferView, cli_text: Option<String>) {
+    if sink::event_mode() {
+        sink::event(UiEvent::FileTransfer(view));
+        return;
+    }
+    if let Some(text) = cli_text {
+        sink::line(text);
     }
 }

@@ -8,6 +8,7 @@ pub mod input_guard;
 pub mod logging;
 pub mod timing;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,6 +35,13 @@ enum TimelineItem {
     Line(String),
     Chat {
         msg: crate::uievent::ChatMessage,
+        /// 到达时刻（HH:MM，本地时区）
+        at: String,
+    },
+    /// 文件传输卡片（占位一次；内容自 transfers 拉最新态——进度刷新不重复堆条目）
+    Transfer {
+        peer: String,
+        file_id: u64,
         /// 到达时刻（HH:MM，本地时区）
         at: String,
     },
@@ -74,6 +82,14 @@ impl TimelineItem {
     fn chat(msg: crate::uievent::ChatMessage) -> Self {
         TimelineItem::Chat {
             msg,
+            at: chrono::Local::now().format("%H:%M").to_string(),
+        }
+    }
+
+    fn transfer(peer: String, file_id: u64) -> Self {
+        TimelineItem::Transfer {
+            peer,
+            file_id,
             at: chrono::Local::now().format("%H:%M").to_string(),
         }
     }
@@ -135,6 +151,8 @@ pub struct GuiApp {
     pending_ask: Option<crate::uievent::AskRequest>,
     /// 系统消息卡片上的行内输入（BackupPassword 密码框等；提交后清空）
     ask_input: String,
+    /// 文件传输卡片状态（键 (对端, 文件id)；FileTransfer 事件整体替换——进度/终态同键覆盖）
+    transfers: HashMap<(String, u64), crate::uievent::FileTransferView>,
     /// 助记词展示卡片（MnemonicShow 事件；[我已保存] 关闭）
     mnemonic_show: Option<String>,
     /// 信任操作确认卡片（两段式：按钮先出卡片，确认后才发 Control::Trust）
@@ -212,6 +230,7 @@ impl GuiApp {
             add_form: AddForm::default(),
             pending_ask: None,
             ask_input: String::new(),
+            transfers: HashMap::new(),
             mnemonic_show: None,
             pending_trust: None,
             first_frame: true,
@@ -392,6 +411,19 @@ impl eframe::App for GuiApp {
                     }) => {
                         self.ui_trace("event=mnemonic_show");
                         self.mnemonic_show = Some(phrase);
+                    }
+                    // 文件传输进度/终态：按 (对端, 文件id) 键覆盖（卡片渲染自最新态）；
+                    // 首次见到该键 → 时间线插入占位卡片（保时序，内容自 transfers 拉最新）
+                    crate::uievent::EngineOut::Event(crate::uievent::UiEvent::FileTransfer(v)) => {
+                        self.ui_trace(format!(
+                            "event=file_transfer file={} sent={} done={}",
+                            v.file_id, v.sent, v.done
+                        ));
+                        let key = (v.peer.clone(), v.file_id);
+                        if !self.transfers.contains_key(&key) {
+                            self.timeline.push(TimelineItem::transfer(v.peer.clone(), v.file_id));
+                        }
+                        self.transfers.insert(key, v);
                     }
                 }
                 ctx.request_repaint();
@@ -874,6 +906,9 @@ impl eframe::App for GuiApp {
                                 TimelineItem::Chat { msg, at } => {
                                     render_bubble(ui, msg, at);
                                 }
+                                TimelineItem::Transfer { peer, file_id, at } => {
+                                    render_transfer_card(ui, self, peer, *file_id, at);
+                                }
                             }
                         }
                     }
@@ -911,6 +946,75 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{v:.1} {}", UNITS[unit])
     }
+}
+
+/// 文件传输卡片：方向/对端/文件名 + 实时进度条；完成态显示保存路径（打开目录）或失败原因。
+/// 内容自 transfers 拉最新态（FileTransfer 事件持续覆盖同键）——占位条目只插入一次。
+fn render_transfer_card(ui: &mut egui::Ui, app: &GuiApp, peer: &str, file_id: u64, at: &str) {
+    let Some(v) = app.transfers.get(&(peer.to_string(), file_id)) else {
+        ui.weak(format!("[文件传输 #{file_id}]"));
+        return;
+    };
+    let arrow = if v.outgoing { "→" } else { "←" };
+    ui.horizontal(|ui| {
+        ui.weak(at);
+        ui.strong(&v.name);
+        ui.weak(format!("{arrow} {}", v.peer_name));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if v.done {
+                if v.ok {
+                    ui.colored_label(egui::Color32::from_rgb(130, 200, 130), "已完成");
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(240, 160, 90), "失败");
+                }
+            } else {
+                let frac = if v.total == 0 {
+                    0.0
+                } else {
+                    (v.sent as f32 / v.total as f32).clamp(0.0, 1.0)
+                };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .show_percentage()
+                        .desired_width(160.0),
+                );
+            }
+        });
+    });
+    if !v.done && v.total > 0 {
+        ui.weak(format!(
+            "   {}/{}",
+            format_size(v.sent),
+            format_size(v.total)
+        ));
+    }
+    if v.done {
+        if v.ok {
+            if let Some(path) = &v.saved_path {
+                ui.horizontal(|ui| {
+                    ui.weak(format!("已保存: {path}"));
+                    if ui.small_button("打开所在目录").clicked() {
+                        open_containing_dir(path);
+                    }
+                });
+            }
+        } else if let Some(err) = &v.error {
+            if !err.is_empty() {
+                ui.colored_label(egui::Color32::from_rgb(240, 160, 90), format!("原因: {err}"));
+            }
+        }
+    }
+    ui.add_space(2.0);
+}
+
+/// 打开文件所在目录（Windows explorer / Unix xdg-open；子进程 spawn，失败静默）
+fn open_containing_dir(path: &str) {
+    let p = std::path::Path::new(path);
+    let dir = p.parent().unwrap_or(p).to_path_buf();
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
 }
 
 /// 侧栏视图：联系人（信任徽标/在线/焦点/信任按钮）+ 已发现节点（未握手）+

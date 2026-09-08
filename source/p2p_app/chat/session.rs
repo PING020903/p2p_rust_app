@@ -646,9 +646,23 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                             ),
                         })
                         .await;
-                    println!(
-                        "{}",
-                        format!("等待对端确认超时，已中止发送: {name}").yellow()
+                    // 发送卡片终态（GUI）；CLI 文案逐字节保持
+                    let view = crate::uievent::FileTransferView {
+                        peer: peer.to_string(),
+                        file_id,
+                        peer_name: peer_name(&peer, &conversations, &identity),
+                        name: name.clone(),
+                        outgoing: true,
+                        total: 0,
+                        sent: 0,
+                        done: true,
+                        ok: false,
+                        saved_path: None,
+                        error: Some("等待对端确认超时".into()),
+                    };
+                    crate::p2p_app::chat::display::file_transfer(
+                        view,
+                        Some(format!("等待对端确认超时，已中止发送: {name}").yellow().to_string()),
                     );
                 }
                 // 接收确认超时：挂起的 offer 未作答 → 自动拒绝并清槽
