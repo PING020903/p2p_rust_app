@@ -222,7 +222,7 @@ source/
   `normalize_birthday/normalize_gender` 开放、`LineSource::prompt/prompt_secret`（带提示符读行/密码）
 
 ## P3 — 打磨
-- [ ] 命令按钮化（`/trust`、`/group`、`/send` 原生文件选择器）
+- [ ] 命令按钮化（`/trust`、`/group`；~~`/send` 原生文件选择器~~ ✅ P2.6：底部「发送文件」按钮 rfd + Control::SendFile + 传输进度卡片 ProgressBar/打开目录）
 - [ ] 主题、窗口状态持久化（`eframe::App::save`）
 - [ ] 可选：`/` 命令右键菜单 / 快捷键
 

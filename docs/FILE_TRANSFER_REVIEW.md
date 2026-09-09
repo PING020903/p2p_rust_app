@@ -82,6 +82,13 @@ abort：双侧状态清理（发送态移除/临时文件删除）
 
 - **M3 已实施并升级**：on_file_offer 拆两段——phase1 提示/卡片/登记 `AppCtx.file_pending`（**不再内联 await**），phase2 `complete_file_receive` 落账（接受/拒绝路径整体迁出）；CLI Interactive 拉起 `--confirm-file` 子窗口、Ask 卡片 Line 回程、Auto 自动接受（e2e 语义零变化）
 - **H2 已实施并双侧补齐**：发送侧 offer 60s 超时（原有）；接收侧确认 60s 超时自动 reject（新增，并入定时臂 deadline=min(offer 过期,pending 过期)，防单槽 pending 被永久占位）
-- **H1 仍未实施**（逐块 CRC32 够用，sha256 端到端校验待定）；**M1/M2 未实施**（GUI 发送入口/接收进度，随 P3）；L2 随步 5 设置页
+- **H1 仍未实施**（逐块 CRC32 够用，sha256 端到端校验待定）；L2 随步 5 设置页
 - **新边界**：pending 被占时新 offer 忙拒（"正在等待其他确认"）；`/backup` 命令路径仍直接覆盖 pending_confirm（信号侧已忙拒，命令侧未拦截——已知边界）
 - **顺带修复**：CLI 确认子窗口分发缺失缺陷（spawn 侧 `--confirm-tofu/--confirm-secret` 从未被 main() 解析——此前 Interactive TOFU 恒自动信任+误拉无关 GUI 窗口）
+
+## 七、后记 2（GUI 文件传输实施后，2026-09-08）
+
+- **M1 已实施**：GUI 发送入口——底部命令行区「发送文件」按钮（rfd 0.17 原生对话框；启用条件=1v1 互信焦点，群/未信任置灰+tooltip）→ `Control::SendFile{peer,path}` 结构化直传 → control.rs 复刻 /send（信任复查+start_send）；Linux 侧 XDG Portal→zenity 兜底，取消/无 portal 返回 None 提示行
+- **M2 已实施**：结构化进度事件——`UiEvent::FileTransfer(FileTransferView)` + display.rs `file_transfer` 漏斗（CLI 文案逐字节保持/GUI 事件不进滚动区）；接收侧节流进度新增（每 8 块/尾块）；GUI 传输卡片（时间线占位一次 + ProgressBar 实时进度 + 终态：已保存路径+「打开所在目录」/ 失败原因）；CLI 文本零变化（e2e 逐字节）
+- **顺带**：WSL cargo check 抓出并修复既有 Linux 编译破坏（ed43c6f 起 spawn_secret_window 调用点未 cfg 门）；双平台 check 零告警
+- **遗留**：H1 sha256（待定）；下载目录/自动接收开关 → P2.6 步 5 设置页；SHA-256 撤销维持
