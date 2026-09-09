@@ -343,6 +343,18 @@ impl GuiApp {
                 format!("kind=chat_text chars={}", t.chars().count()),
             ),
             InputMsg::Control(c) => ("event=click", c.trace_detail()),
+            // 卡片答案：secret（密码类）打码；其余明文（y/n 等）
+            InputMsg::AskAnswer { text } => (
+                "event=answer",
+                if masking_secret {
+                    "kind=ask_answer detail=***".to_string()
+                } else {
+                    format!(
+                        "kind=ask_answer detail={}",
+                        text.chars().take(20).collect::<String>()
+                    )
+                },
+            ),
         };
         self.ui_trace(format!("{event} {detail}"));
         match &self.ui_tx {
@@ -538,10 +550,10 @@ impl eframe::App for GuiApp {
         }
 
         // 底部输入面板先声明 → 先占位，CentralPanel 只拿剩余高度（ScrollArea 不会挤掉输入行）
+        // pending Ask 期间输入区**保持可用**：卡片答案走 AskAnswer 专道（类型层分流），
+        // 命令框 Line 与文本框 ChatText 在 Ask 模式下都不会被引擎当作答案（P2.6 实测修正）
         egui::Panel::bottom("input").show(ui, |ui| {
             let in_chat = self.child_state == ChildState::Chat;
-            // pending Ask 期间禁用输入——防聊天文本被引擎当作确认答案吞掉
-            let ask_pending = self.pending_ask.is_some();
             ui.add_space(4.0);
 
             // 命令输入行（与文本框分离；guard 拦截穿透命令；提示随状态变化）
@@ -553,9 +565,9 @@ impl eframe::App for GuiApp {
                 };
                 let edit = egui::TextEdit::singleline(&mut self.cmd_input)
                     .hint_text(hint)
-                    .desired_width(ui.available_width() - 260.0)
+                    .desired_width(ui.available_width() - 320.0)
                     .font(egui::TextStyle::Monospace);
-                let resp = ui.add_enabled(!ask_pending, edit);
+                let resp = ui.add(edit);
                 if self.first_frame && !in_chat {
                     resp.request_focus();
                 }
@@ -580,10 +592,10 @@ impl eframe::App for GuiApp {
                         }
                     }
                 }
-                // 快捷命令（固定白名单，直接透传；仅聊天态有意义；pending Ask 期间禁用）
+                // 快捷命令（固定白名单，直接透传；仅聊天态有意义）
                 for cmd in ["/list", "/q"] {
                     if ui
-                        .add_enabled(in_chat && !ask_pending, egui::Button::new(cmd))
+                        .add_enabled(in_chat, egui::Button::new(cmd))
                         .clicked()
                     {
                         self.interact
@@ -602,7 +614,7 @@ impl eframe::App for GuiApp {
                     .map(|sb| sb.groups.iter().any(|g| g.focused))
                     .unwrap_or(false);
                 let send_file_enabled =
-                    in_chat && !ask_pending && !group_focused && focused_trusted.is_some();
+                    in_chat && !group_focused && focused_trusted.is_some();
                 let send_file = ui
                     .add_enabled(send_file_enabled, egui::Button::new("发送文件"))
                     .on_disabled_hover_text("文件发送：需 1v1 互信联系人会话焦点");
@@ -644,23 +656,20 @@ impl eframe::App for GuiApp {
             // 文本框 = 纯聊天文本：ChatText 直进引擎（多行原样、/ 开头也不解析为命令、无协议包装）
             ui.horizontal(|ui| {
                 let edit = egui::TextEdit::multiline(&mut self.input)
-                    .hint_text(if ask_pending {
-                        "⚠ 请先在上方系统消息区处理请求"
-                    } else if in_chat {
+                    .hint_text(if in_chat {
                         "输入消息，回车发送；Shift+回车换行（可粘贴多行文章）"
                     } else {
                         "登录操作请用上方命令框"
                     })
                     .desired_width(ui.available_width() - 88.0)
                     .desired_rows(3);
-                let resp = ui.add_enabled(in_chat && !ask_pending, edit);
+                let resp = ui.add_enabled(in_chat, edit);
                 if self.first_frame && in_chat {
                     resp.request_focus();
                 }
-                let send = ui.add_enabled(in_chat && !ask_pending, egui::Button::new("发送"));
+                let send = ui.add_enabled(in_chat, egui::Button::new("发送"));
                 // 多行下回车不触发 lost_focus，直接按键判断：回车发送（Shift+回车换行）
                 let send_now = in_chat
-                    && !ask_pending
                     && (send.clicked()
                         || ui
                             .ctx()
@@ -831,7 +840,9 @@ impl eframe::App for GuiApp {
                 } else {
                     ans.to_string()
                 };
-                self.send_input(InputMsg::Line(line));
+                // 卡片答案专道（类型层分流）：不与命令框/聊天文本混用，
+                // 引擎侧直驱待决确认 phase2——Ask 挂起期间输入区保持可用
+                self.send_input(InputMsg::AskAnswer { text: line });
                 self.pending_ask = None;
             }
 

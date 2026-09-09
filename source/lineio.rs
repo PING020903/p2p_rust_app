@@ -39,14 +39,18 @@ impl ConfirmMode {
 }
 
 /// 统一输入消息：
-/// - `Line`：CLI 语义行——按 `/` 前缀分流（命令树 vs 文本消息），终端/管道逐行产出
+/// - `Line`：CLI 语义行——按 `/` 前缀分流（命令树 vs 文本消息），终端/管道逐行产出；
+///   GUI 命令框同为此变体（Ask 卡片挂起时不作答案——答案走 AskAnswer 专道）
 /// - `ChatText`：GUI 文本框的纯聊天文本——**绕过命令解析**直接发送到当前焦点（多行原样）
 /// - `Control`：结构化控制动作（GUI 点击/按钮）——复刻对应命令的非文本逻辑，
 ///   不经命令文本解析（名字歧义/注入问题在类型层根除）；CLI/e2e 永不产出
+/// - `AskAnswer`：GUI 系统消息卡片的答案——**类型层分流**（答案≠输入行），
+///   专道驱动待决确认 phase2；CLI/e2e 永不产出
 pub enum InputMsg {
     Line(String),
     ChatText(String),
     Control(Control),
+    AskAnswer { text: String },
 }
 
 /// 结构化控制动作（GUI 原生操作 → 引擎；每个变体复刻一条命令的语义）
@@ -134,13 +138,14 @@ impl LineSource {
     }
 
     /// 交互提示场景的原始行读取（登录/确认；ChatText 亦取其文本）。
-    /// 控制动作不作为交互答案——继续等待文本行（防御：提示符阶段不应有 Control）。
+    /// 控制动作与卡片答案不作为交互答案——继续等待文本行（防御：提示符阶段
+    /// 不应有 Control/AskAnswer；卡片答案只属于待决确认专道）。
     pub async fn next_raw_line(&mut self) -> Option<String> {
         loop {
             match self.next_input().await {
                 Some(InputMsg::Line(s)) => return Some(s),
                 Some(InputMsg::ChatText(t)) => return Some(t),
-                Some(InputMsg::Control(_)) => continue,
+                Some(InputMsg::Control(_)) | Some(InputMsg::AskAnswer { .. }) => continue,
                 None => return None,
             }
         }

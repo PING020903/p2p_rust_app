@@ -59,13 +59,22 @@ fn collect_multiline(buf: &mut String, remaining: &mut usize, line: &str) -> Opt
 
 /// 发送文本到当前焦点（群或 1v1）。普通消息路径与 `/sendStrings` 多行路径共用，
 /// 信任门控/回显行为与交互终端一致（管道/脚本未互信自动放行）。
-async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
+///
+/// 返回 `Some((peer, text))` = Ask 模式未互信发送已发卡片、登记待决（两段式：答案
+/// 经 AskAnswer 专道到达后由调用方重发）；`None` = 已直接处理（含 CLI Interactive
+/// 内联 y/n 与 busy 拒绝）。
+/// `pending_busy`：已有待决确认挂起时，Ask 分支不再发卡（单槽模型，防交叉污染）。
+async fn send_focused_text(
+    ctx: &mut ChatCtx<'_>,
+    text: &str,
+    pending_busy: bool,
+) -> Option<(PeerId, String)> {
     if let Some(gid) = &ctx.focused_group {
         let g = match ctx.groups.get(gid) {
             Some(g) => g.clone(),
             None => {
                 eprintln!("{}", "当前群不存在".yellow());
-                return;
+                return None;
             }
         };
         let payload = serde_json::to_vec(&GroupPayload::Text {
@@ -82,13 +91,13 @@ async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
             })
             .await;
         display::outgoing_chat(&g.name, text, Some(&g.name));
-        return;
+        return None;
     }
     match *ctx.focused {
         Some(p) => {
             if !ctx.connected.contains(&p) {
                 eprintln!("{}", "当前会话未连接，请用 /chat 重连".yellow());
-                return;
+                return None;
             }
             let name = ctx
                 .conversations
@@ -100,7 +109,8 @@ async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
             } else {
                 name
             };
-            // D3：未互信联系人发送确认（三态：Interactive 终端 y/n / **Ask 系统消息卡片** /
+            // D3：未互信联系人发送确认（三态：Interactive 终端 y/n（内联，终端串行固有）/
+            // **Ask 系统消息卡片（两段式：登记待决，答案经 AskAnswer 专道）** /
             // Auto 管道放行但文案如实——发出≠送达，对端未互信时会静默丢弃）
             if !ctx.identity.effective_trusted(&p) {
                 match ctx.mode {
@@ -115,12 +125,20 @@ async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
                         };
                         if !ans.eq_ignore_ascii_case("y") {
                             println!("{}", "已取消发送".dimmed());
-                            return;
+                            return None;
                         }
                         ctx.conversations.get_mut(&p).unwrap().send_confirmed = true;
                     }
                     ConfirmMode::Ask if !ctx.conversations[&p].send_confirmed => {
-                        // GUI：发系统消息卡片（答案经 InputMsg::Line 回程，同 CLI 交互）
+                        if pending_busy {
+                            eprintln!(
+                                "{}",
+                                "已有确认挂起，消息未发送（先处理上方请求卡片）".yellow()
+                            );
+                            return None;
+                        }
+                        // GUI 两段式：发系统消息卡片（答案经 InputMsg::AskAnswer 专道），
+                        // 原文随待决登记——y 后重发（send_confirmed 置位，D3 复查自然通过）
                         crate::sink::ask(crate::uievent::AskRequest {
                             id: crate::uievent::next_ask_id(),
                             kind: crate::uievent::AskKind::UntrustedSend {
@@ -128,15 +146,7 @@ async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
                             },
                             secret: false,
                         });
-                        let ans = match ctx.input.next_raw_line().await {
-                            Some(l) => l.trim().to_string(),
-                            None => String::new(),
-                        };
-                        if !ans.eq_ignore_ascii_case("y") {
-                            println!("{}", "已取消发送".dimmed());
-                            return;
-                        }
-                        ctx.conversations.get_mut(&p).unwrap().send_confirmed = true;
+                        return Some((p, text.to_string()));
                     }
                     ConfirmMode::Auto => {
                         println!(
@@ -161,11 +171,15 @@ async fn send_focused_text(ctx: &mut ChatCtx<'_>, text: &str) {
                 })
                 .await;
             display::outgoing_chat(&who, text, None);
+            None
         }
-        None => eprintln!(
-            "{}",
-            "尚未选择会话，无法发送（先 /chat <角色> 或 /group <群名>）".yellow()
-        ),
+        None => {
+            eprintln!(
+                "{}",
+                "尚未选择会话，无法发送（先 /chat <角色> 或 /group <群名>）".yellow()
+            );
+            None
+        }
     }
 }
 
@@ -218,6 +232,8 @@ enum PendingConfirm {
         at: std::time::Instant,
         via_window: bool,
     },
+    /// 未互信发送挂起（仅 Ask/GUI 两段式：原文随待决暂存，y 后重发；CLI Interactive 走内联 y/n）
+    UntrustedSend { peer: PeerId, text: String },
 }
 
 impl PendingConfirm {
@@ -227,6 +243,8 @@ impl PendingConfirm {
             PendingConfirm::Tofu { via_window, .. }
             | PendingConfirm::Backup { via_window, .. }
             | PendingConfirm::FileReceive { via_window, .. } => *via_window,
+            // 未互信发送仅 Ask/GUI 登记（答案走 AskAnswer 专道，不经子窗口也不经行劫持）
+            PendingConfirm::UntrustedSend { .. } => false,
         }
     }
 }
@@ -400,6 +418,100 @@ impl SessionTrace {
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
             let _ = writeln!(f, "{ts} {msg}");
+        }
+    }
+}
+
+/// 确认第二阶段执行器（Line 路由与 AskAnswer 专道共用）：按待决变体落账。
+/// 传入的 `pc` 已被调用方 take（pending_confirm 此时为 None）；
+/// `answer` 为答案文本（y/n/密码原文——BOM 剥离在各分支内做）。
+#[allow(clippy::too_many_arguments)]
+async fn execute_confirm(
+    pc: PendingConfirm,
+    answer: &str,
+    identity: &mut IdentityService,
+    conversations: &mut HashMap<PeerId, Conversation>,
+    groups: &mut HashMap<String, Group>,
+    focused: &mut Option<PeerId>,
+    focused_group: &mut Option<String>,
+    connected: &HashSet<PeerId>,
+    registered: &mut HashMap<PeerId, Vec<Multiaddr>>,
+    input: &mut LineSource,
+    mode: ConfirmMode,
+    cmd_tx: &tokio::sync::mpsc::Sender<seam::Cmd>,
+    file_state: &mut crate::p2p_app::file_transfer::FileTransferState,
+) {
+    match pc {
+        PendingConfirm::Tofu { peer, name, .. } => {
+            let trusted = answer.trim().eq_ignore_ascii_case("y");
+            identity.complete_tofu(&peer, &name, trusted);
+            // 补跑 hello 钩子：会话名更新 + 上线提示
+            if let Some(conv) = conversations.get_mut(&peer) {
+                if conv.name.is_empty() {
+                    conv.name = name.clone();
+                }
+            }
+            println!("{}", format!("对方已上线: {name}").green());
+            // 信任重报（自愈）：落账后向对方重报当前信任态
+            let my_name = identity.my_name().to_string();
+            let trust_tag = if identity.is_verified(&peer) {
+                TextTag::TrustConfirm.as_str()
+            } else {
+                TextTag::TrustRevoke.as_str()
+            };
+            let _ = cmd_tx
+                .send(seam::Cmd::Send {
+                    peer,
+                    tag: trust_tag.to_string(),
+                    payload: Some(serde_cbor::to_vec(&my_name).unwrap_or_default()),
+                })
+                .await;
+            push_sidebar(identity, groups, connected, focused, focused_group, registered);
+        }
+        PendingConfirm::Backup { .. } => {
+            identity.backup_complete(answer.trim(), mode);
+        }
+        PendingConfirm::FileReceive {
+            from,
+            file_id,
+            name,
+            size,
+            ..
+        } => {
+            // 主窗口作答路径（非 Windows 退化；GUI 卡片答案走 AskAnswer 专道）
+            let accept =
+                answer.trim_start_matches('\u{feff}').trim().eq_ignore_ascii_case("y");
+            let mut actx = AppCtx {
+                identity,
+                conversations,
+                groups,
+                focused,
+                mode,
+                hello_pending: None,
+                file_pending: None,
+                cmd_tx,
+                file: file_state,
+            };
+            crate::p2p_app::file_transfer::complete_file_receive(
+                &mut actx, &from, file_id, name, size, accept,
+            )
+            .await;
+        }
+        PendingConfirm::UntrustedSend { peer, text } => {
+            let confirmed = answer.trim().eq_ignore_ascii_case("y");
+            if !confirmed {
+                println!("{}", "已取消发送".dimmed());
+                return;
+            }
+            if let Some(conv) = conversations.get_mut(&peer) {
+                conv.send_confirmed = true;
+            }
+            // 复用发送路径：send_confirmed 已置位，D3 复查自然通过（pending_busy=false）
+            let mut ctx = make_chat_ctx(
+                identity, cmd_tx, input, mode, conversations, groups, focused, focused_group,
+                connected, registered, file_state,
+            );
+            send_focused_text(&mut ctx, &text, false).await;
         }
     }
 }
@@ -713,74 +825,52 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                             "in: {}",
                             l.trim().chars().take(40).collect::<String>()
                         ));
-                        if matches!(&pending_confirm, Some(pc) if !pc.via_window()) {
+                        // 待决确认路由（stdin 行作答）：仅 Interactive 非 Windows 退化与
+                        // Auto e2e 密码行——Ask（GUI）下 Line 一律是命令（卡片答案走
+                        // AskAnswer 专道）；via_window（子窗口）时主窗口行照常流转
+                        if matches!(&pending_confirm, Some(pc) if !pc.via_window())
+                            && mode != ConfirmMode::Ask
+                        {
                             if let Some(pc) = pending_confirm.take() {
-                                match pc {
-                                    PendingConfirm::Tofu { peer, name, .. } => {
-                                    let trusted = l.trim().eq_ignore_ascii_case("y");
-                                    identity.complete_tofu(&peer, &name, trusted);
-                                    // 补跑 hello 钩子：会话名更新 + 上线提示
-                                    if let Some(conv) = conversations.get_mut(&peer) {
-                                        if conv.name.is_empty() {
-                                            conv.name = name.clone();
-                                        }
-                                    }
-                                    println!(
-                                        "{}",
-                                        format!("对方已上线: {name}").green()
-                                    );
-                                    // 信任重报（自愈）：落账后向对方重报当前信任态
-                                    let my_name = identity.my_name().to_string();
-                                    let trust_tag = if identity.is_verified(&peer) {
-                                        TextTag::TrustConfirm.as_str()
-                                    } else {
-                                        TextTag::TrustRevoke.as_str()
-                                    };
-                                    let _ = cmd_tx
-                                        .send(seam::Cmd::Send {
-                                            peer,
-                                            tag: trust_tag.to_string(),
-                                            payload: Some(
-                                                serde_cbor::to_vec(&my_name).unwrap_or_default(),
-                                            ),
-                                        })
-                                        .await;
-                                    push_sidebar(
-                                        &identity, &groups, &connected, &focused,
-                                        &focused_group, &registered,
-                                    );
-                                    continue;
-                                }
-                                PendingConfirm::Backup { .. } => {
-                                    identity.backup_complete(l.trim(), mode);
-                                    continue;
-                                }
-                                PendingConfirm::FileReceive { from, file_id, name, size, .. } => {
-                                    // 主窗口作答路径（Ask 卡片回程 / 非 Windows 退化）
-                                    let accept =
-                                        l.trim_start_matches('\u{feff}').trim().eq_ignore_ascii_case("y");
-                                    let mut actx = AppCtx {
-                                        identity: &mut identity,
-                                        conversations: &mut conversations,
-                                        groups: &mut groups,
-                                        focused: &mut focused,
-                                        mode,
-                                        hello_pending: None,
-                                        file_pending: None,
-                                        cmd_tx: &cmd_tx,
-                                        file: &mut file_state,
-                                    };
-                                    ft::complete_file_receive(
-                                        &mut actx, &from, file_id, name, size, accept,
-                                    )
-                                    .await;
-                                    continue;
-                                }
+                                execute_confirm(
+                                    pc,
+                                    &l,
+                                    &mut identity, &mut conversations, &mut groups,
+                                    &mut focused, &mut focused_group, &connected,
+                                    &mut registered, &mut input, mode, &cmd_tx, &mut file_state,
+                                )
+                                .await;
+                                continue;
                             }
                         }
+                        l
                     }
-                    l
-                }
+                    // 卡片答案专道（GUI Ask）：类型层分流——答案≠输入行。
+                    // 无对应待决（已超时/已被消费）= 迟到答案，丢弃并提示
+                    Some(InputMsg::AskAnswer { text }) => {
+                        trace.log(&format!(
+                            "ask-answer: {}",
+                            text.trim().chars().take(20).collect::<String>()
+                        ));
+                        if matches!(&pending_confirm, Some(pc) if !pc.via_window()) {
+                            if let Some(pc) = pending_confirm.take() {
+                                execute_confirm(
+                                    pc,
+                                    &text,
+                                    &mut identity, &mut conversations, &mut groups,
+                                    &mut focused, &mut focused_group, &connected,
+                                    &mut registered, &mut input, mode, &cmd_tx, &mut file_state,
+                                )
+                                .await;
+                            }
+                        } else {
+                            eprintln!(
+                                "{}",
+                                "确认答案已失效（无对应待决项），已忽略".dimmed()
+                            );
+                        }
+                        continue;
+                    }
                     // 结构化控制动作（GUI 点击/按钮）：不经命令文本解析，复刻对应命令逻辑
                     Some(InputMsg::Control(c)) => {
                         trace.log(&format!("ctl: {}", c.describe()));
@@ -820,7 +910,15 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                                 &mut conversations, &mut groups, &mut focused, &mut focused_group,
                                 &connected, &mut registered, &mut file_state,
                             );
-                            send_focused_text(&mut ctx, &text).await;
+                            // Ask 未互信发送两段式：返回 Some = 已发卡片，登记待决（原文随存）
+                            if let Some((peer, text)) =
+                                send_focused_text(&mut ctx, &text, pending_confirm.is_some()).await
+                            {
+                                pending_confirm = Some(PendingConfirm::UntrustedSend {
+                                    peer,
+                                    text,
+                                });
+                            }
                         }
                         continue;
                     }
@@ -843,7 +941,11 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                             &mut conversations, &mut groups, &mut focused, &mut focused_group,
                             &connected, &mut registered, &mut file_state,
                         );
-                        send_focused_text(&mut ctx, &content).await;
+                        if let Some((peer, text)) =
+                            send_focused_text(&mut ctx, &content, pending_confirm.is_some()).await
+                        {
+                            pending_confirm = Some(PendingConfirm::UntrustedSend { peer, text });
+                        }
                     } else {
                         sendstrings = Some((buf, remaining));
                     }
@@ -939,7 +1041,11 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                     &connected, &mut registered, &mut file_state,
                 );
                 trace.log("chat begin");
-                send_focused_text(&mut ctx, line).await;
+                if let Some((peer, text)) =
+                    send_focused_text(&mut ctx, line, pending_confirm.is_some()).await
+                {
+                    pending_confirm = Some(PendingConfirm::UntrustedSend { peer, text });
+                }
                 trace.log("chat done");
             }
             // trace tick 臂（仅 trace 开启时启用）：每秒一行，判循环死活
