@@ -153,6 +153,8 @@ pub struct GuiApp {
     ask_input: String,
     /// 文件传输卡片状态（键 (对端, 文件id)；FileTransfer 事件整体替换——进度/终态同键覆盖）
     transfers: HashMap<(String, u64), crate::uievent::FileTransferView>,
+    /// 设置页快照（Settings 事件整体替换；登录后 + 每次变更后重推）
+    settings_view: Option<crate::uievent::SettingsView>,
     /// 助记词展示卡片（MnemonicShow 事件；[我已保存] 关闭）
     mnemonic_show: Option<String>,
     /// 信任操作确认卡片（两段式：按钮先出卡片，确认后才发 Control::Trust）
@@ -172,6 +174,8 @@ pub struct GuiApp {
     pending_interact: Vec<logging::Entry>,
     /// 日志面板状态
     show_log: bool,
+    /// 设置视图开关（中央区切换：时间线 ↔ 设置面板）
+    show_settings: bool,
     log_view: LogView,
     log_follow: bool,
     log_level: Level,
@@ -231,6 +235,7 @@ impl GuiApp {
             pending_ask: None,
             ask_input: String::new(),
             transfers: HashMap::new(),
+            settings_view: None,
             mnemonic_show: None,
             pending_trust: None,
             first_frame: true,
@@ -241,6 +246,7 @@ impl GuiApp {
             pending_runtime: Vec::new(),
             pending_interact: Vec::new(),
             show_log: true,
+            show_settings: false,
             log_view: LogView::Runtime,
             log_follow: true,
             log_level: Level::Debug,
@@ -436,6 +442,11 @@ impl eframe::App for GuiApp {
                             self.timeline.push(TimelineItem::transfer(v.peer.clone(), v.file_id));
                         }
                         self.transfers.insert(key, v);
+                    }
+                    // 设置页快照：整体替换（登录后 + 每次变更后重推）
+                    crate::uievent::EngineOut::Event(crate::uievent::UiEvent::Settings(s)) => {
+                        self.ui_trace("event=settings");
+                        self.settings_view = Some(s);
                     }
                 }
                 ctx.request_repaint();
@@ -702,6 +713,12 @@ impl eframe::App for GuiApp {
                 if ui.toggle_value(&mut self.show_log, "日志").changed() {
                     self.ui_trace(format!("event=panel name=log open={}", self.show_log));
                 }
+                if ui.toggle_value(&mut self.show_settings, "设置").changed() {
+                    self.ui_trace(format!(
+                        "event=panel name=settings open={}",
+                        self.show_settings
+                    ));
+                }
             });
             ui.horizontal(|ui| {
                 let state_color = match self.child_state {
@@ -948,29 +965,34 @@ impl eframe::App for GuiApp {
                 ui.add_space(2.0);
             }
 
-            // 滚动输出区（最新自动滚底）：系统行 + 聊天气泡混排
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    if self.timeline.is_empty() {
-                        ui.weak("（暂无输出）");
-                    } else {
-                        for item in &self.timeline {
-                            match item {
-                                TimelineItem::Line(s) => {
-                                    ui.label(s);
-                                }
-                                TimelineItem::Chat { msg, at } => {
-                                    render_bubble(ui, msg, at);
-                                }
-                                TimelineItem::Transfer { peer, file_id, at } => {
-                                    render_transfer_card(ui, self, peer, *file_id, at);
+            // 中央区切换：设置面板 ↔ 时间线（系统消息卡片始终在上方可见）
+            if self.show_settings {
+                render_settings_panel(ui, self);
+            } else {
+                // 滚动输出区（最新自动滚底）：系统行 + 聊天气泡混排
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if self.timeline.is_empty() {
+                            ui.weak("（暂无输出）");
+                        } else {
+                            for item in &self.timeline {
+                                match item {
+                                    TimelineItem::Line(s) => {
+                                        ui.label(s);
+                                    }
+                                    TimelineItem::Chat { msg, at } => {
+                                        render_bubble(ui, msg, at);
+                                    }
+                                    TimelineItem::Transfer { peer, file_id, at } => {
+                                        render_transfer_card(ui, self, peer, *file_id, at);
+                                    }
                                 }
                             }
                         }
-                    }
-                });
+                    });
+            }
         });
 
         frame_timer.stop_and_record("frame.ui", &self.stats);
@@ -1006,6 +1028,61 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// 设置面板（中央区，标题行「设置」toggle 切换）：下载目录/接收确认开关/发现模式。
+/// 数据自 settings_view 快照（引擎权威态）；操作发 Control/命令行，变更后引擎回推新快照。
+fn render_settings_panel(ui: &mut egui::Ui, app: &mut GuiApp) {
+    ui.heading("设置");
+    ui.separator();
+    let Some(sv) = app.settings_view.clone() else {
+        ui.weak("设置加载中…（引擎快照未到达）");
+        return;
+    };
+    // 下载目录：立即生效（引擎 set_downloads_dir + settings 落账）
+    ui.horizontal(|ui| {
+        ui.label("下载目录:");
+        ui.monospace(&sv.download_dir);
+        if ui.button("更改…").clicked() {
+            if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                app.send_input(InputMsg::Control(Control::SetDownloadDir {
+                    path: p.display().to_string(),
+                }));
+            }
+        }
+    });
+    ui.separator();
+    // 文件接收前确认开关：仅影响 GUI/Ask 模式（关=收到文件自动接收不弹卡片）
+    let mut confirm = sv.confirm_file_receive;
+    if ui
+        .toggle_value(&mut confirm, "文件接收前确认")
+        .on_hover_text("开启：GUI 收到文件弹卡片人工确认（默认）；关闭：自动接收落盘。仅影响 GUI")
+        .changed()
+    {
+        app.send_input(InputMsg::Control(Control::SetConfirmFileReceive { enabled: confirm }));
+    }
+    ui.separator();
+    // 发现模式：下拉切换走 /discover 命令（复刻命令语义；下次进入聊天生效）
+    ui.horizontal(|ui| {
+        ui.label("发现模式:");
+        let mut selected = sv.discovery_mode.clone();
+        egui::ComboBox::from_id_salt("discovery_mode")
+            .selected_text(selected.clone())
+            .show_ui(ui, |ui| {
+                for m in ["advertise", "stealth", "off"] {
+                    ui.selectable_value(&mut selected, m.to_string(), m);
+                }
+            });
+        if selected != sv.discovery_mode {
+            app.interact
+                .log(Level::Info, "user", format!("/cmd: /discover {selected}"));
+            app.input_sent_at = Some(Instant::now());
+            app.send_input(InputMsg::Line(format!("/discover {selected}")));
+        }
+    });
+    ui.weak("发现模式切换下次进入聊天生效（mDNS 广播/隐身/关闭）");
+    ui.separator();
+    ui.weak("维护（清缓存/清日志入口后续批次提供；CLI 可用主菜单 5/6）");
+}
+/// 内容自 transfers 拉最新态（FileTransfer 事件持续覆盖同键）——占位条目只插入一次。
 /// 文件传输卡片：方向/对端/文件名 + 实时进度条；完成态显示保存路径（打开目录）或失败原因。
 /// 内容自 transfers 拉最新态（FileTransfer 事件持续覆盖同键）——占位条目只插入一次。
 fn render_transfer_card(ui: &mut egui::Ui, app: &GuiApp, peer: &str, file_id: u64, at: &str) {

@@ -13,6 +13,14 @@ use crate::p2p_app::chat::dial::{parse_dial_addr, print_dial_template};
 use crate::p2p_app::chat::group::dial_group_members;
 use crate::p2p_app::chat::sidebar::trust_badge;
 
+/// 设置快照推送（变更后/登录后调用；CLI no-op）
+pub(crate) fn push_settings_snapshot(ctx: &ChatCtx<'_>) {
+    crate::p2p_app::chat::display::push_settings(
+        ctx.identity.my_id(),
+        ctx.file.downloads_dir(),
+    );
+}
+
 pub(crate) async fn handle_control(ctx: &mut ChatCtx<'_>, c: Control) {
     match c {
         Control::FocusPeer { peer, name } => {
@@ -134,6 +142,35 @@ pub(crate) async fn handle_control(ctx: &mut ChatCtx<'_>, c: Control) {
             ) {
                 eprintln!("{}", format!("发送启动失败: {e}").yellow());
             }
+        }
+        Control::SetDownloadDir { path } => {
+            // 复刻 /download-dir：settings 落账 + file_state 运行时立即生效
+            match crate::p2p::settings::save_download_dir(ctx.identity.my_id(), &path) {
+                Ok(()) => {
+                    ctx.file.set_downloads_dir(std::path::PathBuf::from(&path));
+                    println!(
+                        "{}",
+                        format!("下载目录已设为 {path}（立即生效）").green()
+                    );
+                }
+                Err(e) => eprintln!("{}", format!("保存失败: {e}").yellow()),
+            }
+            push_settings_snapshot(ctx);
+        }
+        Control::SetConfirmFileReceive { enabled } => {
+            // 复刻 /auto-receive：settings 落账；仅影响 GUI/Ask 模式
+            match crate::p2p::settings::save_confirm_file_receive(ctx.identity.my_id(), enabled) {
+                Ok(()) => println!(
+                    "{}",
+                    format!(
+                        "文件接收前确认已{}（仅影响 GUI；关闭后收到文件自动接收）",
+                        if enabled { "开启" } else { "关闭" }
+                    )
+                    .green()
+                ),
+                Err(e) => eprintln!("{}", format!("保存失败: {e}").yellow()),
+            }
+            push_settings_snapshot(ctx);
         }
         Control::Trust { peer, trusted } => {
             let name = peer_name(&peer, ctx.conversations, ctx.identity);

@@ -550,6 +550,11 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
         "{}",
         format!("下载目录: {}", file_state.downloads_dir().display()).dimmed()
     );
+    // 设置页快照（GUI 数据源；CLI no-op）
+    crate::p2p_app::chat::display::push_settings(
+        identity.my_id(),
+        file_state.downloads_dir(),
+    );
 
     // L3 群注册表（登录后先读本地持久化）
     let mut groups: HashMap<String, Group> = load_groups(identity.my_id());

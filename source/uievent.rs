@@ -149,6 +149,17 @@ pub struct FileTransferView {
     pub error: Option<String>,
 }
 
+/// 设置页快照（引擎侧权威态；变更后整体重推，GUI 只渲染）
+#[derive(Debug, Clone)]
+pub struct SettingsView {
+    /// 当前下载目录（接收落盘位置）
+    pub download_dir: String,
+    /// 文件接收前确认开关（true=每次弹卡片；false=自动接收；仅影响 GUI/Ask 模式）
+    pub confirm_file_receive: bool,
+    /// mDNS 发现模式名（advertise/stealth/off；切换下次进入聊天生效）
+    pub discovery_mode: String,
+}
+
 /// 结构化显示事件（随界面功能扩展；文本行永远走 Line，事件只承载结构化语义）
 #[derive(Debug, Clone)]
 pub enum UiEvent {
@@ -156,12 +167,14 @@ pub enum UiEvent {
     Sidebar(SidebarState),
     /// 本机新增一条可分享监听地址（GUI 去重累积、"我的地址"点击复制）
     ListenAddr(String),
-    /// 引擎等待 GUI 作答（系统消息区域渲染卡片；答案经 InputMsg::Line 回程）
+    /// 引擎等待 GUI 作答（系统消息区域渲染卡片；答案经 InputMsg::AskAnswer 回程）
     Ask(AskRequest),
     /// 助记词展示（/backup 解锁成功后；系统消息区域大字卡片 + 复制按钮）
     MnemonicShow { phrase: String },
     /// 文件传输进度/终态（GUI 传输卡片；CLI 静默——文本照旧由调用方按需打印）
     FileTransfer(FileTransferView),
+    /// 设置页快照（登录后 + 每次变更后整体重推）
+    Settings(SettingsView),
 }
 
 /// 引擎输出统一项：单通道 FIFO 保证 Line 与 Event 的相对顺序

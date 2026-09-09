@@ -71,6 +71,10 @@ pub enum Control {
     /// 发送文件（复刻 /send：信任校验 + start_send；path 由 GUI 原生文件选择器产出，
     /// 结构化直传——不经命令文本解析，文件名带空格无引号问题）
     SendFile { peer: PeerId, path: String },
+    /// 设置下载目录（复刻 /download-dir：settings 落账 + file_state 立即生效）
+    SetDownloadDir { path: String },
+    /// 文件接收前确认开关（settings 落账；仅影响 GUI/Ask 模式——开=每次弹卡片，关=自动接收）
+    SetConfirmFileReceive { enabled: bool },
 }
 
 impl Control {
@@ -95,6 +99,11 @@ impl Control {
             }
             Control::Backup => "备份助记词".to_string(),
             Control::SendFile { path, .. } => format!("发送文件: {path}"),
+            Control::SetDownloadDir { path } => format!("设置下载目录: {path}"),
+            Control::SetConfirmFileReceive { enabled } => format!(
+                "文件接收前确认: {}",
+                if *enabled { "开" } else { "关（自动接收）" }
+            ),
         }
     }
 
@@ -115,6 +124,10 @@ impl Control {
             Control::Backup => "action=backup".to_string(),
             Control::SendFile { peer, path } => {
                 format!("action=send_file peer={peer} path={path}")
+            }
+            Control::SetDownloadDir { path } => format!("action=set_download_dir path={path}"),
+            Control::SetConfirmFileReceive { enabled } => {
+                format!("action=set_confirm_file_receive enabled={enabled}")
             }
         }
     }

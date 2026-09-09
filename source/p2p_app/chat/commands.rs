@@ -385,10 +385,14 @@ pub(crate) fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
         match args.first() {
             Some(path) => {
                 match save_download_dir(ctx.identity.my_id(), path) {
-                    Ok(()) => println!(
-                        "{}",
-                        format!("下载目录已设为 {}（下次进入聊天生效）", path).green()
-                    ),
+                    Ok(()) => {
+                        // 运行时立即生效（与 GUI 设置页一致；进行中传输落旧目录）
+                        ctx.file.set_downloads_dir(std::path::PathBuf::from(path));
+                        println!(
+                            "{}",
+                            format!("下载目录已设为 {path}（立即生效）").green()
+                        );
+                    }
                     Err(e) => {
                         eprintln!("{}", format!("保存失败: {e}").yellow())
                     }
@@ -403,6 +407,41 @@ pub(crate) fn build_tree<'a>() -> CmdTree<ChatCtx<'a>> {
         }
     });
     tree.set_help(download_dir, "设置文件下载目录（缺省为下载到用户 Downloads，/download-dir <路径> 配置）");
+    let auto_receive = tree.register(ROOT, "auto-receive", |ctx, args| {
+        // 文件接收前确认开关：仅影响 GUI/Ask 模式（CLI Interactive 逐次 y/n 不受控）
+        match args.first().map(|s| s.to_ascii_lowercase()) {
+            Some(v) if v == "on" || v == "off" => {
+                let enabled = v == "on";
+                match crate::p2p::settings::save_confirm_file_receive(
+                    ctx.identity.my_id(),
+                    enabled,
+                ) {
+                    Ok(()) => println!(
+                        "{}",
+                        format!(
+                            "文件接收前确认已{}（仅影响 GUI；{}）",
+                            if enabled { "开启" } else { "关闭" },
+                            if enabled { "GUI 收到文件弹卡片确认" } else { "GUI 收到文件自动接收" }
+                        )
+                        .green()
+                    ),
+                    Err(e) => eprintln!("{}", format!("保存失败: {e}").yellow()),
+                }
+            }
+            _ => {
+                let cur = crate::p2p::settings::load_confirm_file_receive(ctx.identity.my_id());
+                println!(
+                    "{}",
+                    format!(
+                        "文件接收前确认: {}（用法: /auto-receive <on|off>，仅影响 GUI）",
+                        if cur { "on" } else { "off" }
+                    )
+                    .dimmed()
+                );
+            }
+        }
+    });
+    tree.set_help(auto_receive, "文件接收前确认开关（仅影响 GUI）：/auto-receive <on|off>；off=GUI 收到文件自动接收不弹卡片");
     let listen = tree.register(ROOT, "listen", |ctx, _| {
         ctx.ops.push_back(AsyncOp::Listen);
     });

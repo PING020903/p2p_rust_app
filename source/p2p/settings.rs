@@ -51,3 +51,13 @@ pub fn load_download_dir(peer_id: &PeerId) -> Option<String> {
 pub fn save_download_dir(peer_id: &PeerId, dir: &str) -> Result<(), String> {
     save_setting(peer_id, "download_dir", dir)
 }
+
+/// 读取文件接收前确认开关（缺失默认 true=每次弹卡片确认；仅影响 GUI/Ask 模式）
+pub fn load_confirm_file_receive(peer_id: &PeerId) -> bool {
+    load_str(peer_id, "confirm_file_receive").map(|s| s != "0").unwrap_or(true)
+}
+
+/// 保存文件接收前确认开关（"1"=确认 / "0"=自动接收）
+pub fn save_confirm_file_receive(peer_id: &PeerId, enabled: bool) -> Result<(), String> {
+    save_setting(peer_id, "confirm_file_receive", if enabled { "1" } else { "0" })
+}

@@ -142,6 +142,13 @@ impl FileTransferState {
         &self.downloads_dir
     }
 
+    /// 运行时更新下载目录（设置页/命令落账后调用；立即生效——后续接收建临时文件用新目录，
+    /// 进行中传输的改名仍用接收时目录）。尽量提前创建，失败不致命（接收时会再试并报错）。
+    pub fn set_downloads_dir(&mut self, dir: PathBuf) {
+        let _ = std::fs::create_dir_all(&dir);
+        self.downloads_dir = dir;
+    }
+
     /// 最近的未确认 offer 过期时刻（sent==0；无等待中的 offer 返回 None）
     /// —— 会话主循环定时臂据此 sleep_until
     pub fn next_offer_expiry(&self) -> Option<std::time::Instant> {
@@ -277,7 +284,13 @@ pub async fn on_file_offer(ctx: &mut AppCtx<'_>, from: &PeerId, payload: Option<
             });
         }
         crate::lineio::ConfirmMode::Ask => {
-            // GUI：发系统消息卡片（答案经 InputMsg::Line 回程，同 CLI 交互）
+            // 设置开关：confirm_file_receive=off → 自动接收（信任伙伴免每次点卡片）；
+            // on（默认）→ 系统消息卡片。CLI Interactive 逐次 y/n 与 Auto 自动接受不受此开关控制。
+            if !crate::p2p::settings::load_confirm_file_receive(ctx.identity.my_id()) {
+                complete_file_receive(ctx, from, p.file_id, name, p.size, true).await;
+                return true;
+            }
+            // GUI：发系统消息卡片（答案经 InputMsg::AskAnswer 专道）
             crate::sink::ask(crate::uievent::AskRequest {
                 id: crate::uievent::next_ask_id(),
                 kind: crate::uievent::AskKind::FileReceive {

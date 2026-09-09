@@ -9,7 +9,8 @@ use colored::Colorize;
 
 use crate::sink;
 use crate::uievent::{
-    ChatMessage, ContactView, DiscoveredView, FileTransferView, GroupView, SidebarState, UiEvent,
+    ChatMessage, ContactView, DiscoveredView, FileTransferView, GroupView, SettingsView,
+    SidebarState, UiEvent,
 };
 
 /// 收到聊天消息（1v1 与群共用）
@@ -101,4 +102,18 @@ pub fn file_transfer(view: FileTransferView, cli_text: Option<String>) {
     if let Some(text) = cli_text {
         sink::line(text);
     }
+}
+
+/// 设置页快照推送（GUI 设置面板数据源；CLI no-op——文本提示由调用方照旧打印）。
+/// 内部读取 confirm_file_receive/discovery_mode 权威态，调用方只给 my_id 与下载目录。
+pub fn push_settings(my_id: &libp2p::PeerId, download_dir: &std::path::Path) {
+    if !sink::event_mode() {
+        return;
+    }
+    let view = SettingsView {
+        download_dir: download_dir.display().to_string(),
+        confirm_file_receive: crate::p2p::settings::load_confirm_file_receive(my_id),
+        discovery_mode: crate::p2p::load_discovery_mode(my_id).name().to_string(),
+    };
+    sink::event(UiEvent::Settings(view));
 }
