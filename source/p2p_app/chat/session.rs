@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io::IsTerminal;
+#[cfg(windows)]
 use std::process::Stdio;
 use tokio::io::AsyncBufReadExt;
 
@@ -230,7 +231,9 @@ impl PendingConfirm {
     }
 }
 
-/// 确认答案（CLI 确认子窗口任务回传；GUI 卡片答案经 input 路由到达同一第二阶段）
+/// 确认答案（CLI 确认子窗口任务回传；GUI 卡片答案经 input 路由到达同一第二阶段）。
+/// 构造点全部在 cfg(windows) 子窗口任务——非 Windows 编译下仅模式匹配消费。
+#[cfg_attr(not(windows), allow(dead_code))]
 enum ConfirmAnswer {
     Tofu { peer: PeerId, trusted: bool },
     Backup { password: String },
@@ -412,6 +415,9 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
     }
     // 确认应答通道：CLI 确认子窗口任务经此回传答案（GUI 卡片答案走 input 路由）
     let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::unbounded_channel::<ConfirmAnswer>();
+    // 非 Windows：确认子窗口不存在，confirm_tx 无生产者（抑制未用告警）
+    #[cfg(not(windows))]
+    let _ = &confirm_tx;
     // 待决确认状态机：登记后由 input 行（CLI/GUI 答案）或 confirm 臂（CLI 子窗口）驱动第二阶段
     let mut pending_confirm: Option<PendingConfirm> = None;
 
@@ -789,12 +795,14 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                             pending_confirm = Some(PendingConfirm::Backup {
                                 via_window: cfg!(windows) && mode == ConfirmMode::Interactive,
                             });
+                            #[cfg(windows)]
                             if mode == ConfirmMode::Interactive {
                                 spawn_secret_window(
                                     confirm_tx.clone(),
                                     "备份助记词：输入解锁密码".to_string(),
                                 );
                             }
+                            // 非 Windows：无密码子窗口——pending 走主窗口行作答（known boundary）
                         }
                         push_sidebar(ctx.identity, ctx.groups, ctx.connected, ctx.focused, &ctx.focused_group, ctx.registered);
                         continue;
@@ -898,12 +906,14 @@ pub async fn run_node(mut input: LineSource, pre: Option<LoginOutcome>) -> Resul
                         pending_confirm = Some(PendingConfirm::Backup {
                             via_window: cfg!(windows) && mode == ConfirmMode::Interactive,
                         });
+                        #[cfg(windows)]
                         if mode == ConfirmMode::Interactive {
                             spawn_secret_window(
                                 confirm_tx.clone(),
                                 "备份助记词：输入解锁密码".to_string(),
                             );
                         }
+                        // 非 Windows：无密码子窗口——pending 走主窗口行作答（known boundary）
                     }
                     if ctx.quit {
                         // 等 Bye 帧送达（传输任务独立处理），再关闭传输任务
