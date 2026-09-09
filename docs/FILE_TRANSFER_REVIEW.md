@@ -62,8 +62,8 @@ abort：双侧状态清理（发送态移除/临时文件删除）
 - `on_file_finish` 尾部 `let _ = file;`（保持句柄至 rename 后关闭的惯用法）补一行注释
 - `ReceivingFile` 注释的 sha256 宣称随 H1 决策修正
 
-### L2. 下载目录设置入口
-- /download-dir 命令可用；GUI 设置页（P2.6 步 5）承载——非本文件改动
+### L2. 下载目录设置入口（✅ 已实施——P2.6 步 5 设置页）
+- /download-dir 命令 + GUI 设置页（rfd pick_folder）；两者均**立即生效**（settings 落账 + file_state 运行时更新）；接收确认开关 /auto-receive 同批实施
 
 ## 四、实施批次建议
 

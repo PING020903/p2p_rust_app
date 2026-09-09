@@ -173,8 +173,8 @@ GUI：tokio 后台线程跑核心，UI 主线程每帧 drain 事件通道
 - [x] **左栏**：联系人（信任徽标/在线点/信任按钮）+ 已发现节点（未握手分段）+ 添加联系人表单 + 我的地址（点击复制）+ 群列表（✅ P2.2c/P2.3b/c）
 - [x] **中区**：会话气泡（手工测量手绘，对侧左/我侧右，未信任黄）+ 系统行混排时间线；消息结构化（`ChatMessage` 事件经 sink 单通道保序，CLI 文本格式与 GUI 渲染分流）（✅ P2.2a/b/b2）
 - [x] **底部**：输入框（ChatText 直发）+ 命令框（guard 拦穿透）+ `/list` `/q` 快捷按钮（登录期隐藏）（✅ P2.1/P2.2）
-- [ ] **弹窗**：TOFU 指纹确认、`/backup` 助记词、未信任发送确认、文件接收均已由 **Ask 系统消息卡片**实现（✅ P2.6）；剩下载目录选择（随步 5 设置页）
-- [ ] **状态栏**：发现模式、下载目录、本机节点 ID
+- [ ] **弹窗**：TOFU 指纹确认、`/backup` 助记词、未信任发送确认、文件接收均已由 **Ask 系统消息卡片**实现（✅ P2.6）；~~下载目录选择~~ ✅ 步 5 设置页（rfd pick_folder）
+- [ ] **状态栏**：发现模式、下载目录、本机节点 ID（部分能力已被设置页承载）
 
 ### P2.5 应用层结构（chat.rs 2483 行 → p2p_app/chat/ 12 模块，✅ 纯搬家）
 
@@ -204,6 +204,7 @@ p2p_app/chat/
 - QuickEdit 禁用（✅ 实测修正）：CLI Interactive 启动即关控制台快速编辑——子窗口抢焦点后用户点击拖选会冻结 conhost 输入（无回显/读不到输入/消息不上屏，Enter 清选中恢复）；kernel32 extern 零依赖实现，仅 Interactive（e2e 零影响）
 - spawn stdio 隔离（✅ 实测修正）：确认子窗口 spawn 必带 `Stdio::null()` 三件套 + 子入口 `attach_console_stdio` 自挂 CONIN$/CONOUT$——裸 inherit 时子进程继承主窗口控制台句柄，存活期间主窗口键盘输入被扣、子窗口退出才涌出（trace 实证 7.6s 空窗）；三层修复链（输入路由劫持→QuickEdit 冻结→spawn inherit）详见 pitfalls SKILL 5.5；子窗口类功能 Auto e2e 不覆盖，须 Interactive 手测
 - AskAnswer 答案专道（✅ 实测修正）：GUI 卡片答案 `InputMsg::AskAnswer{text}` 类型层分流——原走 Line 与命令框同类型，引擎待决路由把命令行当答案，历史对策=挂起期间锁死整个输入区（文本框无辜连坐）；现 pending Ask 期间输入区**保持可用**（命令框/文本框/快捷按钮/发送文件按钮），Line 劫持收窄 `mode!=Ask`（stdin 场景保留：非 Windows 退化/Auto e2e 密码行，e2e 实证）；UntrustedSend 两段化补完（原文随待决暂存，y 后 send_confirmed 置位重发）——**GUI 侧内联 await 清零**；迟到答案丢弃+提示
+- 设置页（✅ P2.6 步 5）：中央区标题行「设置」toggle 切换设置面板（数据源 `UiEvent::Settings` 快照，登录后+变更后重推）——下载目录（rfd pick_folder 更改，**立即生效**：settings 落账+file_state 运行时更新）/ 文件接收前确认开关（settings 新键 confirm_file_receive 默认开；关=GUI 收到文件自动接收不弹卡片；CLI 对称命令 /auto-receive <on|off>；仅影响 GUI/Ask）/ 发现模式下拉（走 /discover 命令行复用命令树，下次进入聊天生效）；/download-dir 同步立即生效；清缓存（联系人/日志）后续单批
 
 ### 应用层结构（P2.1 起生效，架构纪律）
 
